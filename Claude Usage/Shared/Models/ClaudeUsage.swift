@@ -13,6 +13,17 @@ struct ClaudeUsage: Codable, Equatable {
         sessionResetTime < Date() ? 0.0 : sessionPercentage
     }
 
+    /// Returns 0% if the weekly window has expired, otherwise the raw percentage.
+    var effectiveWeeklyPercentage: Double {
+        weeklyResetTime < Date() ? 0.0 : weeklyPercentage
+    }
+
+    /// True when either the 5-hour session or the weekly quota is exhausted.
+    /// Claude Code refuses requests in both cases, so auto-switch treats them alike.
+    var isLimitReached: Bool {
+        effectiveSessionPercentage >= 100.0 || effectiveWeeklyPercentage >= 100.0
+    }
+
     // Weekly data (all models)
     var weeklyTokensUsed: Int
     var weeklyLimit: Int

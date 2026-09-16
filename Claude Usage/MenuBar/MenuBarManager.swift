@@ -1391,14 +1391,12 @@ class MenuBarManager: NSObject, ObservableObject {
 
         let profileId = currentProfile.id
 
-        // If usage dropped below 100%, clear the flag (session reset)
-        if usage.effectiveSessionPercentage < 100.0 {
+        // If neither the session nor the weekly limit is reached, clear the
+        // flag (a window reset) and stay put.
+        guard usage.isLimitReached else {
             autoSwitchedProfileIds.remove(profileId)
             return
         }
-
-        // Guard: usage must be >= 100%
-        guard usage.effectiveSessionPercentage >= 100.0 else { return }
 
         // Guard: don't re-trigger for this profile
         guard !autoSwitchedProfileIds.contains(profileId) else { return }
@@ -1407,12 +1405,13 @@ class MenuBarManager: NSObject, ObservableObject {
         autoSwitchedProfileIds.insert(profileId)
 
         // Find the next available profile
-        guard let nextProfile = findNextAvailableProfile(after: currentProfile) else {
-            LoggingService.shared.log("AutoSwitch: All profiles at 100% or unavailable, staying on '\(currentProfile.name)'")
+        guard let nextProfile = AutoSwitchPolicy.nextAvailableProfile(in: profiles, after: currentProfile) else {
+            LoggingService.shared.log("AutoSwitch: All profiles at session/weekly limit or unavailable, staying on '\(currentProfile.name)'")
             return
         }
 
-        LoggingService.shared.log("AutoSwitch: Switching from '\(currentProfile.name)' to '\(nextProfile.name)'")
+        let reason = usage.effectiveSessionPercentage >= 100.0 ? "session" : "weekly"
+        LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit \(reason) limit, switching to '\(nextProfile.name)'")
 
         // Activate the next profile
         let fromName = currentProfile.name
@@ -1433,31 +1432,6 @@ class MenuBarManager: NSObject, ObservableObject {
                 NotificationCenter.default.post(name: .autoSwitchProfileTriggered, object: nil)
             }
         }
-    }
-
-    /// Finds the next profile with available session capacity, wrapping around
-    private func findNextAvailableProfile(after currentProfile: Profile) -> Profile? {
-        let profiles = profileManager.profiles
-        guard let currentIndex = profiles.firstIndex(where: { $0.id == currentProfile.id }) else { return nil }
-
-        let count = profiles.count
-        for offset in 1..<count {
-            let index = (currentIndex + offset) % count
-            let candidate = profiles[index]
-
-            // Must have usage credentials
-            guard candidate.hasUsageCredentials else { continue }
-
-            // If no saved usage data, treat as available
-            guard let candidateUsage = candidate.claudeUsage else { return candidate }
-
-            // Must be below 100%
-            if candidateUsage.effectiveSessionPercentage < 100.0 {
-                return candidate
-            }
-        }
-
-        return nil
     }
 
     // MARK: - Reset Detection for History Recording

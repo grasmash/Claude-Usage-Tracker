@@ -1,0 +1,154 @@
+import XCTest
+@testable import Claude_Usage
+
+final class AutoSwitchPolicyTests: XCTestCase {
+
+    // MARK: - ClaudeUsage limit helpers
+
+    func testEffectiveWeeklyPercentageReturnsRawWhenWindowActive() {
+        let usage = makeUsage(session: 10, weekly: 100, weeklyResetIn: 3600)
+        XCTAssertEqual(usage.effectiveWeeklyPercentage, 100)
+    }
+
+    func testEffectiveWeeklyPercentageReturnsZeroWhenWindowExpired() {
+        let usage = makeUsage(session: 10, weekly: 100, weeklyResetIn: -60)
+        XCTAssertEqual(usage.effectiveWeeklyPercentage, 0)
+    }
+
+    func testIsLimitReachedWhenSessionExhausted() {
+        XCTAssertTrue(makeUsage(session: 100, weekly: 20).isLimitReached)
+    }
+
+    func testIsLimitReachedWhenWeeklyExhausted() {
+        XCTAssertTrue(makeUsage(session: 0, weekly: 100).isLimitReached)
+    }
+
+    func testIsLimitNotReachedWhenBothBelow100() {
+        XCTAssertFalse(makeUsage(session: 99, weekly: 99).isLimitReached)
+    }
+
+    func testIsLimitNotReachedWhenExhaustedWindowsExpired() {
+        let usage = makeUsage(session: 100, weekly: 100, sessionResetIn: -60, weeklyResetIn: -60)
+        XCTAssertFalse(usage.isLimitReached)
+    }
+
+    // MARK: - Next profile selection
+
+    func testSkipsProfilesWithWeeklyLimitReached() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 50))
+        let weeklyDead = makeProfile("b", usage: makeUsage(session: 0, weekly: 100))
+        let healthy = makeProfile("c", usage: makeUsage(session: 0, weekly: 68))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, weeklyDead, healthy], after: current)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testSkipsProfilesWithSessionLimitReached() {
+        let current = makeProfile("a", usage: makeUsage(session: 0, weekly: 100))
+        let sessionDead = makeProfile("b", usage: makeUsage(session: 100, weekly: 10))
+        let healthy = makeProfile("c", usage: makeUsage(session: 40, weekly: 40))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, sessionDead, healthy], after: current)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testWrapsAroundToEarlierProfiles() {
+        let healthy = makeProfile("a", usage: makeUsage(session: 0, weekly: 0))
+        let dead = makeProfile("b", usage: makeUsage(session: 0, weekly: 100))
+        let current = makeProfile("c", usage: makeUsage(session: 100, weekly: 100))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [healthy, dead, current], after: current)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testReturnsNilWhenEveryOtherProfileExhausted() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
+        let b = makeProfile("b", usage: makeUsage(session: 0, weekly: 100))
+        let c = makeProfile("c", usage: makeUsage(session: 100, weekly: 0))
+
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, b, c], after: current))
+    }
+
+    func testProfileWithoutUsageDataIsTreatedAsAvailable() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
+        let unknown = makeProfile("b", usage: nil)
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, unknown], after: current)
+        XCTAssertEqual(next?.id, unknown.id)
+    }
+
+    func testSkipsProfilesWithoutAnyCredentials() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
+        let noCreds = Profile(name: "b", claudeUsage: makeUsage(session: 0, weekly: 0))
+        let healthy = makeProfile("c", usage: makeUsage(session: 0, weekly: 0))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, noCreds, healthy], after: current)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testProfileWithExpiredCLITokenIsStillACandidate() {
+        // An idle profile's CLI OAuth token is usually expired; activateProfile
+        // refreshes it on switch, so it must not be filtered out here.
+        let expiredMillis = Int((Date().timeIntervalSince1970 - 3600) * 1000)
+        let expiredJSON = """
+        {"claudeAiOauth":{"accessToken":"old","refreshToken":"r","expiresAt":\(expiredMillis)}}
+        """
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
+        let expiredCLI = Profile(name: "b", cliCredentialsJSON: expiredJSON, claudeUsage: makeUsage(session: 0, weekly: 68))
+
+        XCTAssertFalse(expiredCLI.hasUsageCredentials, "precondition: token is expired")
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, expiredCLI], after: current)
+        XCTAssertEqual(next?.id, expiredCLI.id)
+    }
+
+    func testReturnsNilWhenCurrentNotInList() {
+        let current = makeProfile("a", usage: nil)
+        let other = makeProfile("b", usage: nil)
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [other], after: current))
+    }
+
+    // MARK: - Helpers
+
+    private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {
+        Profile(
+            name: name,
+            claudeSessionKey: "sk-ant-test",
+            organizationId: "org-test",
+            claudeUsage: usage
+        )
+    }
+
+    private func makeUsage(
+        session: Double,
+        weekly: Double,
+        sessionResetIn: TimeInterval = 3600,
+        weeklyResetIn: TimeInterval = 86400
+    ) -> ClaudeUsage {
+        ClaudeUsage(
+            sessionTokensUsed: Int(session * 1000),
+            sessionLimit: 100000,
+            sessionPercentage: session,
+            sessionResetTime: Date().addingTimeInterval(sessionResetIn),
+            weeklyTokensUsed: Int(weekly * 10000),
+            weeklyLimit: 1000000,
+            weeklyPercentage: weekly,
+            weeklyResetTime: Date().addingTimeInterval(weeklyResetIn),
+            opusWeeklyTokensUsed: 0,
+            opusWeeklyPercentage: 0,
+            sonnetWeeklyTokensUsed: 0,
+            sonnetWeeklyPercentage: 0,
+            sonnetWeeklyResetTime: nil,
+            designWeeklyTokensUsed: 0,
+            designWeeklyPercentage: 0,
+            designWeeklyResetTime: nil,
+            fableWeeklyTokensUsed: 0,
+            fableWeeklyPercentage: 0,
+            fableWeeklyResetTime: nil,
+            costUsed: nil,
+            costLimit: nil,
+            costCurrency: nil,
+            lastUpdated: Date(),
+            userTimezone: .current
+        )
+    }
+}
