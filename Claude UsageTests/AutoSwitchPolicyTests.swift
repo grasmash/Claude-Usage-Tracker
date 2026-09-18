@@ -69,12 +69,53 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, b, c], after: current))
     }
 
-    func testProfileWithoutUsageDataIsTreatedAsAvailable() {
+    func testProfileWithoutUsageDataIsSkipped() {
+        // Never observed by the tracker: no evidence it has capacity, and its
+        // credentials may be dead. Do not hand Claude Code an unknown account.
         let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
         let unknown = makeProfile("b", usage: nil)
+        let healthy = makeProfile("c", usage: makeUsage(session: 0, weekly: 0))
 
-        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, unknown], after: current)
-        XCTAssertEqual(next?.id, unknown.id)
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, unknown, healthy], after: current)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testProfileWithStaleUsageIsSkipped() {
+        // Regression: a profile whose refresh has been failing keeps a stale
+        // snapshot whose reset windows have passed, so its effective usage reads
+        // 0% and it looks like the best target. It must be skipped.
+        let now = Date()
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
+        let stale = makeProfile("b", usage: makeUsage(
+            session: 100, weekly: 100,
+            sessionResetIn: -3 * 86400, weeklyResetIn: -2 * 86400,   // windows long expired
+            updatedAt: now.addingTimeInterval(-3 * 86400)             // last seen 3 days ago
+        ))
+        let healthy = makeProfile("c", usage: makeUsage(session: 0, weekly: 0, updatedAt: now))
+
+        XCTAssertFalse(stale.claudeUsage!.isLimitReached, "precondition: stale data looks available")
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, stale, healthy], after: current, now: now)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testUsageJustInsideFreshnessWindowIsACandidate() {
+        let now = Date()
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
+        let recent = makeProfile("b", usage: makeUsage(
+            session: 0, weekly: 0,
+            updatedAt: now.addingTimeInterval(-(AutoSwitchPolicy.maxUsageAge - 1))
+        ))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, recent], after: current, now: now)
+        XCTAssertEqual(next?.id, recent.id)
+    }
+
+    func testReturnsNilWhenOnlyOtherProfileIsStale() {
+        let now = Date()
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
+        let stale = makeProfile("b", usage: makeUsage(session: 0, weekly: 0, updatedAt: now.addingTimeInterval(-3600)))
+
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, stale], after: current, now: now))
     }
 
     func testSkipsProfilesWithoutAnyCredentials() {
@@ -122,7 +163,8 @@ final class AutoSwitchPolicyTests: XCTestCase {
         session: Double,
         weekly: Double,
         sessionResetIn: TimeInterval = 3600,
-        weeklyResetIn: TimeInterval = 86400
+        weeklyResetIn: TimeInterval = 86400,
+        updatedAt: Date = Date()
     ) -> ClaudeUsage {
         ClaudeUsage(
             sessionTokensUsed: Int(session * 1000),
@@ -147,7 +189,7 @@ final class AutoSwitchPolicyTests: XCTestCase {
             costUsed: nil,
             costLimit: nil,
             costCurrency: nil,
-            lastUpdated: Date(),
+            lastUpdated: updatedAt,
             userTimezone: .current
         )
     }
