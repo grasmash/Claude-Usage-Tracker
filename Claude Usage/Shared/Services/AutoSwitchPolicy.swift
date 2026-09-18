@@ -12,7 +12,7 @@ enum AutoSwitchPolicy {
     /// freshest account on the machine — while in reality we know nothing about
     /// it. Switching to such a profile hands Claude Code credentials we cannot
     /// vouch for. So a candidate must have been observed recently.
-    static let maxUsageAge: TimeInterval = 10 * 60
+    static let maxUsageAge: TimeInterval = Constants.usageStaleAfter
 
     /// Finds the next profile (wrapping around) that has credentials, has been
     /// observed recently, and has neither its 5-hour session nor its weekly
@@ -45,7 +45,7 @@ enum AutoSwitchPolicy {
 
             guard let usage = candidate.claudeUsage else { continue }
 
-            guard now.timeIntervalSince(usage.lastUpdated) <= maxUsageAge else { continue }
+            guard !usage.isStale(now: now) else { continue }
 
             if !usage.isLimitReached {
                 return candidate

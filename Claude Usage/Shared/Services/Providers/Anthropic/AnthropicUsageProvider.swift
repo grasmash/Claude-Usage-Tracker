@@ -38,7 +38,18 @@ final class AnthropicUsageProvider: UsageProviderService {
         // Priority 1: claude.ai session key (cookie-based)
         if let sessionKey = profile.claudeSessionKey,
            let orgId = profile.organizationId {
-            return try await apiService.fetchUsageData(sessionKey: sessionKey, organizationId: orgId)
+            do {
+                return try await apiService.fetchUsageData(sessionKey: sessionKey, organizationId: orgId)
+            } catch let error as AppError where error.code == .apiUnauthorized {
+                // The session key is dead (they expire). If this profile also has
+                // CLI OAuth credentials, fall through to them instead of freezing
+                // the profile on its last snapshot. This is what makes "Re-sync"
+                // on a profile with an expired session key actually rescue it.
+                guard profile.cliCredentialsJSON != nil || profile.customKeychainServiceName != nil else {
+                    throw error
+                }
+                LoggingService.shared.log("AnthropicUsageProvider: session key rejected for '\(profile.name)'; falling back to CLI OAuth credentials")
+            }
         }
 
         // Priority 2: CLI OAuth credentials.

@@ -27,6 +27,25 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(makeUsage(session: 99, weekly: 99).isLimitReached)
     }
 
+    func testIsStaleWhenOlderThanThreshold() {
+        let now = Date()
+        let old = makeUsage(session: 0, weekly: 0, updatedAt: now.addingTimeInterval(-(Constants.usageStaleAfter + 1)))
+        XCTAssertTrue(old.isStale(now: now))
+    }
+
+    func testIsNotStaleWithinThreshold() {
+        let now = Date()
+        let recent = makeUsage(session: 0, weekly: 0, updatedAt: now.addingTimeInterval(-(Constants.usageStaleAfter - 1)))
+        XCTAssertFalse(recent.isStale(now: now))
+    }
+
+    func testAgeDescriptionFormats() {
+        let now = Date()
+        XCTAssertEqual(MenuBarManager.ageDescription(since: now.addingTimeInterval(-90), now: now), "1m")
+        XCTAssertEqual(MenuBarManager.ageDescription(since: now.addingTimeInterval(-7200), now: now), "2h")
+        XCTAssertEqual(MenuBarManager.ageDescription(since: now.addingTimeInterval(-(86400 + 3 * 3600)), now: now), "1d 3h")
+    }
+
     func testIsLimitNotReachedWhenExhaustedWindowsExpired() {
         let usage = makeUsage(session: 100, weekly: 100, sessionResetIn: -60, weeklyResetIn: -60)
         XCTAssertFalse(usage.isLimitReached)

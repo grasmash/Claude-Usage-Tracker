@@ -1443,4 +1443,33 @@ final class MenuBarIconRenderer {
 
         return "\(formatSingleValue(used))/\(formatSingleValue(limit))"
     }
+
+    // MARK: - Stale Badge
+
+    /// Overlays a small orange warning dot in the top-right corner. Used for
+    /// profiles whose usage data has stopped updating, so the menu bar does not
+    /// present a dead reading as live.
+    func addStaleBadge(to image: NSImage) -> NSImage {
+        let size = image.size
+        let badged = NSImage(size: size)
+        badged.lockFocus()
+        image.draw(in: NSRect(origin: .zero, size: size))
+
+        let diameter: CGFloat = max(4, min(size.height * 0.34, 6))
+        let rect = NSRect(
+            x: size.width - diameter - 0.5,
+            y: size.height - diameter - 0.5,
+            width: diameter,
+            height: diameter
+        )
+        // Thin dark ring so the dot reads on both light and dark menu bars.
+        NSColor.black.withAlphaComponent(0.55).setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: -0.75, dy: -0.75)).fill()
+        NSColor.systemOrange.setFill()
+        NSBezierPath(ovalIn: rect).fill()
+
+        badged.unlockFocus()
+        badged.isTemplate = false
+        return badged
+    }
 }

@@ -152,6 +152,12 @@ enum Constants {
     // Weekly window (7 days in seconds)
     static let weeklyWindow: TimeInterval = 7 * 24 * 60 * 60
 
+    /// Usage data older than this is considered stale: the tracker has not
+    /// managed to refresh the profile recently (expired session key, OAuth-only
+    /// profile that is not active, network). Stale data is flagged in the UI and
+    /// never used for auto-switch decisions.
+    static let usageStaleAfter: TimeInterval = 10 * 60
+
     // Weekly limit (tokens)
     static let weeklyLimit = 1_000_000
 

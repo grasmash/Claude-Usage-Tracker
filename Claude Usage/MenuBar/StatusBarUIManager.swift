@@ -501,7 +501,7 @@ final class StatusBarUIManager {
                 )
             }
 
-            let finalImage: NSImage
+            var finalImage: NSImage
             if profile.id == activeProfileId && config.showActiveProfileIndicator {
                 let underlinedImage = addGreenUnderline(to: image)
                 underlinedImage.isTemplate = false
@@ -509,6 +509,13 @@ final class StatusBarUIManager {
             } else {
                 image.isTemplate = useMonochrome && !config.showPaceMarker
                 finalImage = image
+            }
+
+            // A profile whose data stopped updating shows dead numbers that look
+            // live. Badge it so the menu bar itself says "don't trust this".
+            if profile.claudeUsage?.isStale() ?? true {
+                finalImage = renderer.addStaleBadge(to: finalImage)
+                finalImage.isTemplate = false
             }
 
             // macOS 26 (Tahoe) crash fix: with NSStatusItem.variableLength, AppKit

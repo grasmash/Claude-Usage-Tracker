@@ -323,6 +323,29 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// Tells the user a profile has silently stopped updating and why.
+    func sendProfileStaleNotification(profileName: String, reason: String, settings: NotificationSettings) {
+        guard settings.enabled else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "notification.profile_stale.title".localized(with: profileName)
+        content.body = reason
+        content.sound = .default
+        content.categoryIdentifier = "INFO_ALERT"
+
+        let request = UNNotificationRequest(
+            identifier: "profile_stale_\(profileName)_\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send stale-profile notification: \(error)")
+            }
+        }
+    }
+
     /// Clears notification tracking state for a specific profile
     func clearNotificationsForProfile(_ profileName: String) {
         sentNotifications = sentNotifications.filter { !$0.hasPrefix(profileName) }

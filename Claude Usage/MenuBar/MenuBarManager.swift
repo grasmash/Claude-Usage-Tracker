@@ -15,6 +15,12 @@ class MenuBarManager: NSObject, ObservableObject {
     @Published private(set) var hasCredentialError: Bool = false
     @Published private(set) var consecutiveRefreshFailures: Int = 0
     @Published private(set) var lastRefreshError: String? = nil
+    /// Last refresh failure per profile (multi-profile refresh path). Cleared on
+    /// the next successful refresh. Drives the per-profile stale/error banner.
+    @Published private(set) var profileRefreshErrors: [UUID: String] = [:]
+    /// Profiles we have already told the user about being stale. Reset when the
+    /// profile refreshes successfully again, so each stale episode notifies once.
+    private var notifiedStaleProfileIds: Set<UUID> = []
     @Published private(set) var lastSuccessfulRefreshTime: Date? = nil
 
     // Multi-profile mode: track which profile's icon was clicked
@@ -1061,6 +1067,7 @@ class MenuBarManager: NSObject, ObservableObject {
                         // Save to profile
                         self.profileManager.saveClaudeUsage(newUsage, for: profile.id)
                         LoggingService.shared.log("MenuBarManager: Saved usage for profile '\(profile.name)' - session: \(newUsage.sessionPercentage)%")
+                        self.profileRefreshErrors.removeValue(forKey: profile.id)
 
                         // If this is the active profile, also update the manager's usage
                         if profile.id == self.profileManager.activeProfile?.id {
@@ -1078,6 +1085,8 @@ class MenuBarManager: NSObject, ObservableObject {
                     }
                 } catch {
                     LoggingService.shared.logError("Failed to refresh profile '\(profile.name)': \(error.localizedDescription)")
+                    let message = AppError.wrap(error).message
+                    await MainActor.run { self.profileRefreshErrors[profile.id] = message }
                 }
 
                 // Fetch API usage if this profile's provider has console billing
@@ -1118,6 +1127,9 @@ class MenuBarManager: NSObject, ObservableObject {
                 self.hasCredentialError = false
                 self.lastSuccessfulRefreshTime = Date()
                 self.isRefreshing = false
+
+                // Tell the user (once per episode) about profiles that stopped updating
+                self.notifyStaleProfilesIfNeeded()
 
                 // Check auto-switch for the active profile
                 if let activeProfile = self.profileManager.activeProfile,
@@ -1376,6 +1388,62 @@ class MenuBarManager: NSObject, ObservableObject {
     /// Shows a brief success notification for user-triggered refreshes
     private func showSuccessNotification() {
         NotificationManager.shared.sendSuccessNotification()
+    }
+
+    // MARK: - Stale Profile Detection
+
+    /// Why a profile's usage is not updating, in user-facing terms, or nil if fresh.
+    ///
+    /// Two distinct causes, two distinct remedies:
+    /// - the last refresh failed (typically an expired claude.ai session key) →
+    ///   re-sign in;
+    /// - the profile has no session key and is not the active one, so its CLI
+    ///   OAuth token is never refreshed (rotating it could break a live Claude
+    ///   Code session) → add a session key so it is tracked independently.
+    func staleReason(for profile: Profile, now: Date = Date()) -> String? {
+        if let error = profileRefreshErrors[profile.id] {
+            return "popover.stale.refresh_failed".localized(with: error)
+        }
+        guard let usage = profile.claudeUsage else {
+            return "popover.stale.never_updated".localized
+        }
+        guard usage.isStale(now: now) else { return nil }
+        if profile.claudeSessionKey == nil,
+           profile.id != profileManager.activeProfile?.id {
+            return "popover.stale.no_session_key".localized(with: Self.ageDescription(since: usage.lastUpdated, now: now))
+        }
+        return "popover.stale.generic".localized(with: Self.ageDescription(since: usage.lastUpdated, now: now))
+    }
+
+    /// True if the profile's data is stale or its last refresh failed.
+    func isProfileStale(_ profile: Profile, now: Date = Date()) -> Bool {
+        staleReason(for: profile, now: now) != nil
+    }
+
+    static func ageDescription(since date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(date)))
+        if seconds < 3600 { return "\(seconds / 60)m" }
+        if seconds < 86400 { return "\(seconds / 3600)h" }
+        return "\(seconds / 86400)d \((seconds % 86400) / 3600)h"
+    }
+
+    /// Sends one notification per stale episode per profile, so the user learns
+    /// that a profile silently stopped updating instead of trusting dead numbers.
+    private func notifyStaleProfilesIfNeeded() {
+        for profile in profileManager.profiles where profile.isSelectedForDisplay {
+            if let reason = staleReason(for: profile) {
+                guard !notifiedStaleProfileIds.contains(profile.id) else { continue }
+                notifiedStaleProfileIds.insert(profile.id)
+                LoggingService.shared.log("Stale profile '\(profile.name)': \(reason)")
+                NotificationManager.shared.sendProfileStaleNotification(
+                    profileName: profile.name,
+                    reason: reason,
+                    settings: profile.notificationSettings
+                )
+            } else {
+                notifiedStaleProfileIds.remove(profile.id)
+            }
+        }
     }
 
     // MARK: - Auto-Switch Profile on Session Limit

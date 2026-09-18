@@ -961,6 +961,12 @@
 "popover.banner.credentials_expired" = "Credentials expired. Update in Settings.";
 "popover.banner.refresh_failed" = "Refresh failed %d times";
 "popover.banner.updated_ago" = "Updated %dm ago";
+"popover.stale.refresh_failed" = "Not updating: %@ — re-sign in to this profile in Settings";
+"popover.stale.no_session_key" = "Not updated for %@: no session key, so it only refreshes while active. Add one in Settings";
+"popover.stale.never_updated" = "Never updated — check this profile's credentials in Settings";
+"popover.stale.generic" = "Not updated for %@ — check this profile's credentials in Settings";
+"popover.stale.row_help" = "Usage data is stale — this profile has stopped updating";
+"notification.profile_stale.title" = "%@ stopped updating";
 
 // MARK: - Overage Balance
 "popover.overage_balance" = "Balance";

@@ -127,8 +127,22 @@ struct PopoverContentView: View {
 
             PopoverDivider()
 
-            // Error / stale data banners
-            if manager.hasCredentialError {
+            // Per-profile stale / failing banner for the profile being viewed.
+            // Says WHY the numbers stopped moving and what to do; tapping opens
+            // Settings. Shown before the generic banners because a dead session
+            // key is the most common reason a profile silently goes stale.
+            if let viewed = manager.clickedProfileId.flatMap({ id in
+                   profileManager.profiles.first(where: { $0.id == id })
+               }) ?? profileManager.activeProfile,
+               let reason = manager.staleReason(for: viewed) {
+                StatusBannerView(
+                    icon: "exclamationmark.triangle.fill",
+                    message: reason,
+                    color: .orange
+                ) {
+                    onPreferences()
+                }
+            } else if manager.hasCredentialError {
                 StatusBannerView(
                     icon: "exclamationmark.triangle.fill",
                     message: "popover.banner.credentials_expired".localized,
@@ -283,6 +297,13 @@ struct ProfileSwitcherCompact: View {
                                     .foregroundColor(.blue)
                             }
 
+                            if profile.claudeUsage?.isStale() ?? true {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.orange)
+                                    .help("popover.stale.row_help".localized)
+                            }
+
                             if profile.id == profileManager.activeProfile?.id {
                                 Image(systemName: "checkmark")
                                     .font(.system(size: 10, weight: .semibold))
@@ -357,6 +378,13 @@ struct ProfileSwitcherBar: View {
                                 Image(systemName: "checkmark.circle.fill")
                                     .font(.system(size: 9))
                                     .foregroundColor(.blue)
+                            }
+
+                            if profile.claudeUsage?.isStale() ?? true {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.orange)
+                                    .help("popover.stale.row_help".localized)
                             }
 
                             if profile.id == profileManager.activeProfile?.id {

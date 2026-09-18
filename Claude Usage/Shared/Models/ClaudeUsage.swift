@@ -24,6 +24,14 @@ struct ClaudeUsage: Codable, Equatable {
         effectiveSessionPercentage >= 100.0 || effectiveWeeklyPercentage >= 100.0
     }
 
+    /// True when this snapshot has not been refreshed within
+    /// `Constants.usageStaleAfter`. Stale snapshots are misleading: once their
+    /// reset windows pass, the effective percentages read 0% even though nothing
+    /// is known about the account any more.
+    func isStale(now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastUpdated) > Constants.usageStaleAfter
+    }
+
     // Weekly data (all models)
     var weeklyTokensUsed: Int
     var weeklyLimit: Int
