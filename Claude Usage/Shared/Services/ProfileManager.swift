@@ -299,6 +299,75 @@ class ProfileManager: ObservableObject {
         LoggingService.shared.log("Successfully activated profile: \(updatedProfile.name)")
     }
 
+    // MARK: - External Login Adoption
+
+    /// Follows a `/login` done directly in Claude Code.
+    ///
+    /// Claude Code's `/login` rewrites the system keychain and `.claude.json`
+    /// without telling us. Until now the tracker only noticed a new account when
+    /// the user clicked a profile here, so after a CLI-side login it kept
+    /// polling and switching on behalf of the wrong profile — and the profile
+    /// that was actually logged in went stale because it was "not active".
+    ///
+    /// Each refresh cycle, compare the keychain's account identity with the
+    /// active profile's. If the keychain now belongs to a *different* known
+    /// profile, snapshot its credentials into that profile and make it active,
+    /// WITHOUT rewriting the keychain (it is already right). Unknown accounts
+    /// are left alone and only logged.
+    ///
+    /// Returns the adopted profile, or nil if nothing changed.
+    @discardableResult
+    func adoptExternalLoginIfNeeded() -> Profile? {
+        guard !switchingSemaphore else { return nil }
+
+        let sync = ClaudeCodeSyncService.shared
+        guard let systemAccount = sync.readOAuthAccount(),
+              let systemIdentity = sync.accountIdentity(fromOAuthAccountJSON: systemAccount) else {
+            return nil
+        }
+
+        let activeIdentity = activeProfile.flatMap { sync.accountIdentity(fromOAuthAccountJSON: $0.oauthAccountJSON) }
+        guard systemIdentity != activeIdentity else { return nil }
+
+        // Match by stored account identity first, then by profile name == email
+        // (profiles created before oauthAccount capture only have the name).
+        let systemEmail: String? = {
+            guard let data = systemAccount.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return obj["emailAddress"] as? String
+        }()
+        guard let index = profiles.firstIndex(where: { profile in
+            guard profile.provider.descriptor.capabilities.cliAccountSync else { return false }
+            if let stored = sync.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) {
+                return stored == systemIdentity
+            }
+            if let email = systemEmail {
+                return profile.name.caseInsensitiveCompare(email) == .orderedSame
+            }
+            return false
+        }) else {
+            LoggingService.shared.log("adoptExternalLogin: keychain account \(systemEmail ?? systemIdentity) is not a known profile; ignoring")
+            return nil
+        }
+
+        guard let systemJSON = try? sync.readSystemCredentials() else { return nil }
+
+        var adopted = profiles[index]
+        adopted.cliCredentialsJSON = systemJSON
+        adopted.oauthAccountJSON = systemAccount
+        adopted.cliAccountSyncedAt = Date()
+        adopted.lastUsedAt = Date()
+        profiles[index] = adopted
+
+        let previous = activeProfile?.name ?? "none"
+        activeProfile = adopted
+        profileStore.saveActiveProfileId(adopted.id)
+        profileStore.saveProfiles(profiles)
+
+        LoggingService.shared.log("adoptExternalLogin: Claude Code is logged into '\(adopted.name)' (was '\(previous)'); adopted as active without touching the keychain")
+        return adopted
+    }
+
     // MARK: - Credentials
 
     func loadCredentials(for profileId: UUID) throws -> ProfileCredentials {

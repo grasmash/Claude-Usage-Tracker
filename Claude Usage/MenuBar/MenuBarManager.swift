@@ -1181,6 +1181,10 @@ class MenuBarManager: NSObject, ObservableObject {
     }
 
     func refreshUsage() {
+        // Follow a `/login` done in Claude Code itself, so the profile that is
+        // really logged in is the one we poll live and switch away from.
+        profileManager.adoptExternalLoginIfNeeded()
+
         // In multi-profile mode, refresh ALL selected profiles
         if profileManager.displayMode == .multi {
             refreshAllSelectedProfiles()
@@ -1401,13 +1405,15 @@ class MenuBarManager: NSObject, ObservableObject {
     ///   OAuth token is never refreshed (rotating it could break a live Claude
     ///   Code session) → add a session key so it is tracked independently.
     func staleReason(for profile: Profile, now: Date = Date()) -> String? {
-        if let error = profileRefreshErrors[profile.id] {
-            return "popover.stale.refresh_failed".localized(with: error)
-        }
         guard let usage = profile.claudeUsage else {
             return "popover.stale.never_updated".localized
         }
+        // A single failed refresh on otherwise-fresh data is noise (transient
+        // 429s, blips). Only call it out once the data has actually gone stale.
         guard usage.isStale(now: now) else { return nil }
+        if let error = profileRefreshErrors[profile.id] {
+            return "popover.stale.refresh_failed".localized(with: error)
+        }
         if profile.claudeSessionKey == nil,
            profile.id != profileManager.activeProfile?.id {
             return "popover.stale.no_session_key".localized(with: Self.ageDescription(since: usage.lastUpdated, now: now))
