@@ -23,6 +23,13 @@ class ProfileManager: ObservableObject {
 
     private var switchingSemaphore = false
 
+    /// When the tracker last switched profiles (whether or not the keychain
+    /// write succeeded). `adoptExternalLoginIfNeeded` stays quiet for a grace
+    /// period after this, so it never mistakes the tracker's own switch — or a
+    /// switch that could not be applied — for a user `/login`.
+    private var lastProfileSwitchAt: Date?
+    private static let adoptionGracePeriod: TimeInterval = 90
+
     private init() {}
 
     // MARK: - Initialization
@@ -205,6 +212,7 @@ class ProfileManager: ObservableObject {
 
         switchingSemaphore = true
         isSwitchingProfile = true
+        lastProfileSwitchAt = Date()
 
         LoggingService.shared.log("Switching to profile: \(profile.name)")
 
@@ -257,9 +265,23 @@ class ProfileManager: ObservableObject {
                 LoggingService.shared.log("✓ Applied CLI credentials for: \(updatedProfile.name)")
             } catch {
                 LoggingService.shared.logError("Failed to apply CLI credentials (non-fatal)", error: error)
+                NotificationManager.shared.sendSwitchNotAppliedNotification(
+                    profileName: updatedProfile.name,
+                    reason: "notification.switch_not_applied.apply_failed".localized,
+                    settings: updatedProfile.notificationSettings
+                )
             }
-        } else {
-            LoggingService.shared.log("⚠️ Profile '\(updatedProfile.name)' has no CLI credentials JSON")
+        } else if updatedProfile.provider.descriptor.capabilities.cliAccountSync {
+            // The tracker will show this profile as active, but Claude Code is
+            // still on the previous account. Say so — silently "succeeding" here
+            // is how a user ends up hitting a limit on an account the tracker
+            // claims it left.
+            LoggingService.shared.log("⚠️ Profile '\(updatedProfile.name)' has no CLI credentials JSON — Claude Code NOT switched")
+            NotificationManager.shared.sendSwitchNotAppliedNotification(
+                profileName: updatedProfile.name,
+                reason: "notification.switch_not_applied.no_cli_creds".localized,
+                settings: updatedProfile.notificationSettings
+            )
         }
 
         // Update last used timestamp
@@ -319,6 +341,16 @@ class ProfileManager: ObservableObject {
     @discardableResult
     func adoptExternalLoginIfNeeded() -> Profile? {
         guard !switchingSemaphore else { return nil }
+
+        // Right after the tracker itself wrote the keychain, the keychain is by
+        // definition not a user `/login`. Also covers the failure mode where a
+        // switch could NOT be applied (target had no CLI creds): the keychain
+        // still holds the old account, and adopting it would silently revert
+        // the user's switch — which is exactly the loop observed 2026-09-22.
+        if let switched = lastProfileSwitchAt,
+           Date().timeIntervalSince(switched) < Self.adoptionGracePeriod {
+            return nil
+        }
 
         let sync = ClaudeCodeSyncService.shared
         guard let systemAccount = sync.readOAuthAccount(),

@@ -323,6 +323,30 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// Tells the user a profile switch did NOT reach Claude Code (the keychain
+    /// still holds the previous account) and what to do about it.
+    func sendSwitchNotAppliedNotification(profileName: String, reason: String, settings: NotificationSettings) {
+        guard settings.enabled else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "notification.switch_not_applied.title".localized(with: profileName)
+        content.body = reason
+        content.sound = .default
+        content.categoryIdentifier = "INFO_ALERT"
+
+        let request = UNNotificationRequest(
+            identifier: "switch_not_applied_\(profileName)_\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send switch-not-applied notification: \(error)")
+            }
+        }
+    }
+
     /// Tells the user a profile has silently stopped updating and why.
     func sendProfileStaleNotification(profileName: String, reason: String, settings: NotificationSettings) {
         guard settings.enabled else { return }

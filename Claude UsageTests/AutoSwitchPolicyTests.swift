@@ -146,6 +146,41 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(next?.id, healthy.id)
     }
 
+    func testSkipsSessionKeyOnlyProfileBecauseItCannotBeApplied() {
+        // Regression 2026-09-22: a profile with a claude.ai session key but no
+        // CLI credentials is trackable but NOT switchable — activating it
+        // leaves the keychain on the exhausted account. It must be skipped.
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
+        let sessionKeyOnly = Profile(
+            name: "b",
+            claudeSessionKey: "sk-ant-test",
+            organizationId: "org-test",
+            claudeUsage: makeUsage(session: 0, weekly: 0)
+        )
+        let applicable = makeProfile("c", usage: makeUsage(session: 0, weekly: 0))
+
+        XCTAssertTrue(sessionKeyOnly.hasAnyCredentials, "precondition: it IS trackable")
+        XCTAssertFalse(AutoSwitchPolicy.canBeApplied(sessionKeyOnly))
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, sessionKeyOnly, applicable], after: current)
+        XCTAssertEqual(next?.id, applicable.id)
+    }
+
+    func testPinnedKeychainProfileCanBeApplied() {
+        let pinned = Profile(name: "p", customKeychainServiceName: "Claude Code-credentials-p")
+        XCTAssertTrue(AutoSwitchPolicy.canBeApplied(pinned))
+    }
+
+    func testReturnsNilWhenOnlyOtherProfileIsSessionKeyOnly() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10))
+        let sessionKeyOnly = Profile(
+            name: "b",
+            claudeSessionKey: "sk-ant-test",
+            organizationId: "org-test",
+            claudeUsage: makeUsage(session: 0, weekly: 0)
+        )
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, sessionKeyOnly], after: current))
+    }
+
     func testProfileWithExpiredCLITokenIsStillACandidate() {
         // An idle profile's CLI OAuth token is usually expired; activateProfile
         // refreshes it on switch, so it must not be filtered out here.
@@ -169,11 +204,14 @@ final class AutoSwitchPolicyTests: XCTestCase {
 
     // MARK: - Helpers
 
+    /// A profile that is a valid switch target: it has CLI credentials the
+    /// tracker can write into the keychain.
     private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {
         Profile(
             name: name,
             claudeSessionKey: "sk-ant-test",
             organizationId: "org-test",
+            cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r"}}"#,
             claudeUsage: usage
         )
     }

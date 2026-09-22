@@ -18,12 +18,19 @@ enum AutoSwitchPolicy {
     /// observed recently, and has neither its 5-hour session nor its weekly
     /// quota exhausted.
     ///
-    /// Candidates are filtered on `hasAnyCredentials`, not `hasUsageCredentials`:
-    /// the latter drops profiles whose CLI OAuth access token has expired, but
-    /// `ProfileManager.activateProfile` refreshes expired tokens (with rotation)
-    /// before applying them, so such profiles are perfectly switchable. Idle
-    /// profiles almost always hold an expired token (~8h lifetime), so the
-    /// stricter check made the best rotation targets invisible.
+    /// A switch only helps Claude Code if we can actually write the target's
+    /// CLI credentials into the system keychain. A profile with no stored CLI
+    /// credentials (never linked, or session-key-only) "activates" in the
+    /// tracker while the keychain stays on the exhausted account — the user
+    /// sees a switch that changed nothing. Such profiles are not switch
+    /// targets. Expired tokens are fine: `activateProfile` refreshes them.
+    static func canBeApplied(_ profile: Profile) -> Bool {
+        profile.provider.descriptor.capabilities.cliAccountSync
+            && (profile.cliCredentialsJSON != nil || profile.customKeychainServiceName != nil)
+    }
+
+    /// Candidates must be applicable (see `canBeApplied`), observed recently,
+    /// and under both limits.
     ///
     /// Profiles with no usage data, or data older than `maxUsageAge`, are
     /// skipped: the tracker cannot currently see them, so there is no evidence
@@ -41,7 +48,7 @@ enum AutoSwitchPolicy {
         for offset in 1..<count {
             let candidate = profiles[(currentIndex + offset) % count]
 
-            guard candidate.hasAnyCredentials else { continue }
+            guard canBeApplied(candidate) else { continue }
 
             guard let usage = candidate.claudeUsage else { continue }
 
