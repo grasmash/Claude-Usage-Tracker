@@ -185,7 +185,9 @@ struct Profile: Codable, Identifiable, Equatable {
         // profile decode and wipe the profile list.
         claudeUsage = (try? c.decodeIfPresent(ClaudeUsage.self, forKey: .claudeUsage)) ?? nil
         apiUsage = (try? c.decodeIfPresent(APIUsage.self, forKey: .apiUsage)) ?? nil
-        iconConfig = try c.decodeIfPresent(MenuBarIconConfiguration.self, forKey: .iconConfig) ?? .default
+        // Display preference only — a config this build can't read resets to the
+        // default rather than failing the decode and wiping every profile.
+        iconConfig = (try? c.decodeIfPresent(MenuBarIconConfiguration.self, forKey: .iconConfig)) ?? .default
         refreshInterval = try c.decodeIfPresent(TimeInterval.self, forKey: .refreshInterval) ?? 30.0
         autoStartSessionEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoStartSessionEnabled) ?? false
         checkOverageLimitEnabled = try c.decodeIfPresent(Bool.self, forKey: .checkOverageLimitEnabled) ?? true

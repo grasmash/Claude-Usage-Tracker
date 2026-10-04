@@ -24,6 +24,19 @@ struct ClaudeUsage: Codable, Equatable {
         effectiveSessionPercentage >= 100.0 || effectiveWeeklyPercentage >= 100.0
     }
 
+    /// Returns 0% if the Fable weekly window has expired, otherwise the raw percentage.
+    var effectiveFableWeeklyPercentage: Double {
+        if let reset = fableWeeklyResetTime, reset < Date() { return 0.0 }
+        return fableWeeklyPercentage
+    }
+
+    /// Like `isLimitReached`, but when Claude Code is set to Fable the Fable
+    /// weekly quota counts too: Claude Code refuses Fable requests once it is
+    /// exhausted even though the session and weekly quotas still have room.
+    func isLimitReached(usingFable: Bool) -> Bool {
+        isLimitReached || (usingFable && effectiveFableWeeklyPercentage >= 100.0)
+    }
+
     /// True when this snapshot has not been refreshed within
     /// `Constants.usageStaleAfter`. Stale snapshots are misleading: once their
     /// reset windows pass, the effective percentages read 0% even though nothing

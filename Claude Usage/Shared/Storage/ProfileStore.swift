@@ -16,6 +16,7 @@ class ProfileStore {
 
     private enum Keys {
         static let profiles = "profiles_v3"
+        static let undecodableProfiles = "profiles_v3.undecodable"
         static let activeProfileId = "activeProfileId"
         static let displayMode = "profileDisplayMode"
         static let multiProfileConfig = "multiProfileDisplayConfig"
@@ -26,8 +27,8 @@ class ProfileStore {
     private static var loggedNoKeychainStoreOnce = false
 
     init() {
-        // Use standard UserDefaults (app container)
-        self.defaults = UserDefaults.standard
+        // Standard UserDefaults (app container); an isolated suite under tests
+        self.defaults = AppEnvironment.userDefaults
         LoggingService.shared.log("ProfileStore: Using standard app container storage")
     }
 
@@ -69,19 +70,33 @@ class ProfileStore {
             } else {
                 LoggingService.shared.logError("ProfileStore: Failed to verify save!")
             }
+
+            writeBackup(of: profiles)
         } catch {
             LoggingService.shared.logStorageError("saveProfiles", error: error)
         }
     }
 
     func loadProfiles() -> [Profile] {
-        guard let data = defaults.data(forKey: Keys.profiles) else {
+        var profiles: [Profile] = []
+        if let data = defaults.data(forKey: Keys.profiles) {
+            do {
+                profiles = try JSONDecoder().decode([Profile].self, from: data)
+            } catch {
+                // Keep the raw bytes: the save that follows an empty load would
+                // otherwise destroy the only copy.
+                defaults.set(data, forKey: Keys.undecodableProfiles)
+                LoggingService.shared.logStorageError("loadProfiles", error: error)
+                LoggingService.shared.logError("ProfileStore: Failed to decode profiles; raw data kept under \(Keys.undecodableProfiles)")
+            }
+        } else {
             LoggingService.shared.log("ProfileStore: No profiles found in storage")
-            return []
         }
 
+        let restored = restoreFromBackupIfWiped(&profiles)
+        guard !profiles.isEmpty else { return [] }
+
         do {
-            var profiles = try JSONDecoder().decode([Profile].self, from: data)
 
             // Hydrate credential fields from the Keychain. A value still present in
             // the plist wins (it is either pre-migration, or was written by an older
@@ -115,15 +130,63 @@ class ProfileStore {
             if plistHadSecrets {
                 LoggingService.shared.log("ProfileStore: migrating plaintext credentials from plist to Keychain (#267)")
                 saveProfiles(profiles)  // writes Keychain + scrubbed plist (or keeps plist on failure)
+            } else if restored {
+                saveProfiles(profiles)
             }
 
             LoggingService.shared.log("ProfileStore: Loaded \(profiles.count) profiles from storage")
             return profiles
-        } catch {
-            LoggingService.shared.logStorageError("loadProfiles", error: error)
-            LoggingService.shared.logError("ProfileStore: Failed to decode profiles, returning empty array")
-            return []
         }
+    }
+
+    // MARK: - Backup
+
+    /// Last known-good profile list, outside UserDefaults. Another build sharing
+    /// this bundle id (e.g. the upstream release) reads the same defaults; if it
+    /// can't decode them it starts over with a fresh profile and saves, wiping
+    /// every profile. The backup lets us notice and undo that on next launch.
+    /// Secrets are not in it — they stay in the Keychain under the profile id.
+    private var backupURL: URL? {
+        guard !AppEnvironment.isRunningTests,
+              let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return support.appendingPathComponent("Claude Usage/profiles-backup.json")
+    }
+
+    private var lastBackupData: Data?
+
+    private func writeBackup(of profiles: [Profile]) {
+        // Never back up an empty list over a real one.
+        guard !profiles.isEmpty, let url = backupURL,
+              let data = try? JSONEncoder().encode(profiles),  // default encoding excludes secrets
+              data != lastBackupData else { return }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url, options: [.atomic])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            lastBackupData = data
+        } catch {
+            LoggingService.shared.logStorageError("writeProfilesBackup", error: error)
+        }
+    }
+
+    /// Restores backed-up profiles when the stored list looks wiped: empty,
+    /// undecodable, or sharing no profile with the backup. Our own saves keep
+    /// the backup in step with the list, so no overlap means something else
+    /// replaced it. Profiles found only in the current list are kept.
+    private func restoreFromBackupIfWiped(_ profiles: inout [Profile]) -> Bool {
+        guard let url = backupURL,
+              let data = try? Data(contentsOf: url),
+              let backup = try? JSONDecoder().decode([Profile].self, from: data),
+              !backup.isEmpty else { return false }
+
+        let currentIds = Set(profiles.map(\.id))
+        guard !backup.contains(where: { currentIds.contains($0.id) }) else { return false }
+
+        LoggingService.shared.logError("ProfileStore: stored profiles replaced by another build — restoring \(backup.count) from backup")
+        profiles = backup + profiles
+        return true
     }
 
     /// Writes a profile's credential fields to the Keychain (nil deletes the item so a

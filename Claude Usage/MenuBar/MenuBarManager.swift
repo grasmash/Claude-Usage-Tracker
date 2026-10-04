@@ -92,6 +92,8 @@ class MenuBarManager: NSObject, ObservableObject {
 
     // Track which profiles have already triggered auto-switch (prevents repeated firing)
     private var autoSwitchedProfileIds: Set<UUID> = []
+    /// Profiles already auto-switched away from because their login died.
+    private var deadLoginSwitchedProfileIds: Set<UUID> = []
 
     // Observer for refresh interval changes
     private var refreshIntervalObserver: NSKeyValueObservation?
@@ -1136,6 +1138,7 @@ class MenuBarManager: NSObject, ObservableObject {
                    let activeUsage = activeProfile.claudeUsage {
                     self.checkAutoSwitchIfNeeded(usage: activeUsage, currentProfile: activeProfile)
                 }
+                self.checkAutoSwitchForDeadLogin()
             }
         }
     }
@@ -1311,6 +1314,7 @@ class MenuBarManager: NSObject, ObservableObject {
                 await MainActor.run {
                     self.consecutiveRefreshFailures += 1
                     self.lastRefreshError = appError.message
+                    self.checkAutoSwitchForDeadLogin()
 
                     // Track credential errors specifically
                     if appError.code == .apiUnauthorized || appError.code == .sessionKeyExpired {
@@ -1452,7 +1456,7 @@ class MenuBarManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Auto-Switch Profile on Session Limit
+    // MARK: - Auto-Switch Profile on Usage Limit
 
     /// Checks if the current profile hit 100% and switches to the next available one
     private func checkAutoSwitchIfNeeded(usage: ClaudeUsage, currentProfile: Profile) {
@@ -1465,9 +1469,9 @@ class MenuBarManager: NSObject, ObservableObject {
 
         let profileId = currentProfile.id
 
-        // If neither the session nor the weekly limit is reached, clear the
-        // flag (a window reset) and stay put.
-        guard usage.isLimitReached else {
+        // If no limit is reached, clear the flag (a window reset) and stay put.
+        let fableSpent = usage.effectiveFableWeeklyPercentage >= 100.0
+        guard usage.isLimitReached || fableSpent else {
             autoSwitchedProfileIds.remove(profileId)
             return
         }
@@ -1475,19 +1479,70 @@ class MenuBarManager: NSObject, ObservableObject {
         // Guard: don't re-trigger for this profile
         guard !autoSwitchedProfileIds.contains(profileId) else { return }
 
+        // When Claude Code is running on Fable, an exhausted Fable weekly quota
+        // blocks it just like the session or weekly quota does. Otherwise a
+        // spent Fable quota alone is no reason to switch.
+        let usingFable = AutoSwitchPolicy.isClaudeCodeUsingFable()
+        guard usage.isLimitReached(usingFable: usingFable) else { return }
+
         // Mark as triggered
         autoSwitchedProfileIds.insert(profileId)
 
         // Find the next available profile
-        guard let nextProfile = AutoSwitchPolicy.nextAvailableProfile(in: profiles, after: currentProfile) else {
-            LoggingService.shared.log("AutoSwitch: All profiles at session/weekly limit or unavailable, staying on '\(currentProfile.name)'")
+        guard let nextProfile = AutoSwitchPolicy.nextAvailableProfile(
+            in: profiles, after: currentProfile, usingFable: usingFable,
+            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+        ) else {
+            let limits = usingFable ? "session/weekly/Fable" : "session/weekly"
+            LoggingService.shared.log("AutoSwitch: All profiles at \(limits) limit or unavailable, staying on '\(currentProfile.name)'")
             return
         }
 
-        let reason = usage.effectiveSessionPercentage >= 100.0 ? "session" : "weekly"
+        let reason: String
+        if usage.effectiveSessionPercentage >= 100.0 {
+            reason = "session"
+        } else if usage.effectiveWeeklyPercentage >= 100.0 {
+            reason = "weekly"
+        } else {
+            reason = "Fable weekly"
+        }
         LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit \(reason) limit, switching to '\(nextProfile.name)'")
 
-        // Activate the next profile
+        performAutoSwitch(from: currentProfile, to: nextProfile)
+    }
+
+    /// Switches away from the active profile when its login is dead: Claude
+    /// Code is stuck on "Login expired · Please run /login" exactly as it would
+    /// be stuck on a spent quota, but no usage arrives to trip the limit check.
+    private func checkAutoSwitchForDeadLogin() {
+        guard SharedDataStore.shared.loadAutoSwitchProfileEnabled() else { return }
+
+        let profiles = profileManager.profiles
+        guard profiles.count > 1, let currentProfile = profileManager.activeProfile else { return }
+
+        guard ClaudeCodeSyncService.shared.isLoginDead(for: currentProfile) else {
+            deadLoginSwitchedProfileIds.remove(currentProfile.id)
+            return
+        }
+
+        // Guard: don't re-trigger for this profile
+        guard !deadLoginSwitchedProfileIds.contains(currentProfile.id) else { return }
+        deadLoginSwitchedProfileIds.insert(currentProfile.id)
+
+        guard let nextProfile = AutoSwitchPolicy.nextAvailableProfile(
+            in: profiles, after: currentProfile,
+            usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(),
+            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+        ) else {
+            LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead but no other profile is available, staying put")
+            return
+        }
+
+        LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead, switching to '\(nextProfile.name)'")
+        performAutoSwitch(from: currentProfile, to: nextProfile)
+    }
+
+    private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile) {
         let fromName = currentProfile.name
         let toName = nextProfile.name
         let notificationSettings = currentProfile.notificationSettings

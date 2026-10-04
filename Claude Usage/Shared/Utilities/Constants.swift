@@ -105,9 +105,12 @@ enum Constants {
         }
 
         static var claudeDirectory: URL {
-            if let configDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] {
-                return URL(fileURLWithPath: configDir)
-            }
+            // Deliberately NOT CLAUDE_CONFIG_DIR: the app only inherits it when
+            // launched from a terminal running Claude Code under another config
+            // dir (e.g. a claude-rotate account). Honoring it pointed profile
+            // switches at that account's login instead of the default one that
+            // Claude Code sessions use. Per-account dirs are reached via
+            // `customKeychainServiceName` instead.
             return homeDirectory.appendingPathComponent(".claude")
         }
 
@@ -126,10 +129,7 @@ enum Constants {
         /// We probe both locations to be resilient to either layout.
         static var claudeConfigCandidates: [URL] {
             var candidates: [URL] = []
-            // Respect CLAUDE_CONFIG_DIR first if set
-            if let configDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] {
-                candidates.append(URL(fileURLWithPath: configDir).appendingPathComponent(".claude.json"))
-            }
+            // CLAUDE_CONFIG_DIR is ignored on purpose — see `claudeDirectory`.
             // Default location: ~/.claude.json
             candidates.append(homeDirectory.appendingPathComponent(".claude.json"))
             // Some setups place it inside ~/.claude/

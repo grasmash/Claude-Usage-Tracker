@@ -196,13 +196,153 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(next?.id, expiredCLI.id)
     }
 
+    func testSkipsProfilesWhoseLoginIsDead() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 50))
+        let loggedOut = makeProfile("b", usage: makeUsage(session: 0, weekly: 0))
+        let healthy = makeProfile("c", usage: makeUsage(session: 40, weekly: 40))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(
+            in: [current, loggedOut, healthy], after: current,
+            isLoginDead: { $0.id == loggedOut.id }
+        )
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testReturnsNilWhenOnlyOtherProfileHasDeadLogin() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 50))
+        let loggedOut = makeProfile("b", usage: makeUsage(session: 0, weekly: 0))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(
+            in: [current, loggedOut], after: current,
+            isLoginDead: { $0.id == loggedOut.id }
+        )
+        XCTAssertNil(next)
+    }
+
     func testReturnsNilWhenCurrentNotInList() {
         let current = makeProfile("a", usage: nil)
         let other = makeProfile("b", usage: nil)
         XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [other], after: current))
     }
 
+    // MARK: - Fable model limit
+
+    func testFableLimitCountsOnlyWhenFableSelected() {
+        let usage = makeUsage(session: 10, weekly: 40, fable: 100)
+        XCTAssertFalse(usage.isLimitReached, "base limits are untouched")
+        XCTAssertFalse(usage.isLimitReached(usingFable: false))
+        XCTAssertTrue(usage.isLimitReached(usingFable: true))
+    }
+
+    func testFableLimitIgnoredAfterItsWindowResets() {
+        let usage = makeUsage(session: 10, weekly: 40, fable: 100, fableResetIn: -60)
+        XCTAssertEqual(usage.effectiveFableWeeklyPercentage, 0)
+        XCTAssertFalse(usage.isLimitReached(usingFable: true))
+    }
+
+    func testFableSelectedSkipsProfilesWithFableExhausted() {
+        let current = makeProfile("a", usage: makeUsage(session: 10, weekly: 40, fable: 100))
+        let fableDead = makeProfile("b", usage: makeUsage(session: 0, weekly: 0, fable: 100))
+        let fableOK = makeProfile("c", usage: makeUsage(session: 20, weekly: 50, fable: 30))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(
+            in: [current, fableDead, fableOK], after: current, usingFable: true)
+        XCTAssertEqual(next?.id, fableOK.id)
+    }
+
+    func testFableExhaustedProfileIsFineWhenFableNotSelected() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 40))
+        let fableDead = makeProfile("b", usage: makeUsage(session: 0, weekly: 0, fable: 100))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, fableDead], after: current)
+        XCTAssertEqual(next?.id, fableDead.id)
+    }
+
+    func testReturnsNilWhenEveryOtherProfileHasFableExhausted() {
+        let current = makeProfile("a", usage: makeUsage(session: 10, weekly: 40, fable: 100))
+        let b = makeProfile("b", usage: makeUsage(session: 0, weekly: 0, fable: 100))
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, b], after: current, usingFable: true))
+    }
+
+    func testIsFableModelRecognisesAliasesAndIds() {
+        XCTAssertTrue(AutoSwitchPolicy.isFableModel("fable"))
+        XCTAssertTrue(AutoSwitchPolicy.isFableModel("claude-fable-5-1"))
+        XCTAssertTrue(AutoSwitchPolicy.isFableModel("claude-fable-5-1[1m]"))
+        XCTAssertTrue(AutoSwitchPolicy.isFableModel("Mythos"))
+        XCTAssertFalse(AutoSwitchPolicy.isFableModel("opus"))
+        XCTAssertFalse(AutoSwitchPolicy.isFableModel("claude-opus-5-5"))
+        XCTAssertFalse(AutoSwitchPolicy.isFableModel(nil))
+    }
+
+    func testSelectedModelReadFromSettingsFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("settings.json")
+
+        XCTAssertNil(AutoSwitchPolicy.selectedClaudeCodeModel(settingsURL: url), "missing file")
+
+        try #"{"model":"fable"}"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(AutoSwitchPolicy.selectedClaudeCodeModel(settingsURL: url), "fable")
+
+        try #"{"env":{"ANTHROPIC_MODEL":"claude-fable-5-1"}}"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(AutoSwitchPolicy.selectedClaudeCodeModel(settingsURL: url), "claude-fable-5-1")
+
+        try #"{"statusLine":{}}"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertNil(AutoSwitchPolicy.selectedClaudeCodeModel(settingsURL: url), "default model")
+    }
+
+    func testFableDetectedFromActiveSessionTranscriptWithoutSettings() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projects = root.appendingPathComponent("projects")
+        let settings = root.appendingPathComponent("settings.json")
+        try writeTranscript(in: projects, models: ["claude-opus-5-5", "claude-fable-5-1", "<synthetic>"])
+
+        XCTAssertTrue(AutoSwitchPolicy.isClaudeCodeUsingFable(projectsURL: projects, settingsURL: settings),
+                      "latest real reply was Fable; the synthetic rate-limit notice is skipped")
+    }
+
+    func testIdleTranscriptsAndOtherModelsDoNotCountAsFable() throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projects = root.appendingPathComponent("projects")
+        let settings = root.appendingPathComponent("settings.json")
+        try writeTranscript(in: projects, models: ["claude-opus-5-5"])
+        let old = try writeTranscript(in: projects, models: ["claude-fable-5-1"])
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-2 * AutoSwitchPolicy.activeSessionWindow)],
+            ofItemAtPath: old.path
+        )
+
+        XCTAssertFalse(AutoSwitchPolicy.isClaudeCodeUsingFable(projectsURL: projects, settingsURL: settings))
+
+        try #"{"model":"fable"}"#.write(to: settings, atomically: true, encoding: .utf8)
+        XCTAssertTrue(AutoSwitchPolicy.isClaudeCodeUsingFable(projectsURL: projects, settingsURL: settings),
+                      "settings file is the fallback")
+    }
+
     // MARK: - Helpers
+
+    private func makeTempDir() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Writes a session transcript whose assistant replies came from `models`, in order.
+    @discardableResult
+    private func writeTranscript(in projects: URL, models: [String]) throws -> URL {
+        let project = projects.appendingPathComponent("-Users-me-project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let lines = models.flatMap { model in [
+            #"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            #"{"type":"assistant","message":{"role":"assistant","model":"\#(model)","content":[]}}"#,
+        ] }
+        let url = project.appendingPathComponent("\(UUID().uuidString).jsonl")
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
 
     /// A profile that is a valid switch target: it has CLI credentials the
     /// tracker can write into the keychain.
@@ -221,6 +361,8 @@ final class AutoSwitchPolicyTests: XCTestCase {
         weekly: Double,
         sessionResetIn: TimeInterval = 3600,
         weeklyResetIn: TimeInterval = 86400,
+        fable: Double = 0,
+        fableResetIn: TimeInterval = 86400,
         updatedAt: Date = Date()
     ) -> ClaudeUsage {
         ClaudeUsage(
@@ -240,9 +382,9 @@ final class AutoSwitchPolicyTests: XCTestCase {
             designWeeklyTokensUsed: 0,
             designWeeklyPercentage: 0,
             designWeeklyResetTime: nil,
-            fableWeeklyTokensUsed: 0,
-            fableWeeklyPercentage: 0,
-            fableWeeklyResetTime: nil,
+            fableWeeklyTokensUsed: Int(fable * 10000),
+            fableWeeklyPercentage: fable,
+            fableWeeklyResetTime: Date().addingTimeInterval(fableResetIn),
             costUsed: nil,
             costLimit: nil,
             costCurrency: nil,

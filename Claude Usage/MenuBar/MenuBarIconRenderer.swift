@@ -222,6 +222,32 @@ final class MenuBarIconRenderer {
                 sessionResetTime: nil
             )
 
+        case .fable:
+            let usedPercentage = usage.effectiveFableWeeklyPercentage
+            let displayPercentage = UsageStatusCalculator.getDisplayPercentage(
+                usedPercentage: usedPercentage,
+                showRemaining: showRemaining
+            )
+            let fableElapsed: Double? = usePaceColoring
+                ? UsageStatusCalculator.elapsedFraction(
+                    resetTime: usage.fableWeeklyResetTime,
+                    duration: Constants.weeklyWindow,
+                    showRemaining: false
+                )
+                : nil
+            let statusLevel = UsageStatusCalculator.calculateStatus(
+                usedPercentage: usedPercentage,
+                showRemaining: showRemaining,
+                elapsedFraction: fableElapsed
+            )
+
+            return MetricData(
+                percentage: displayPercentage,
+                displayText: "\(Int(displayPercentage))%",
+                statusLevel: statusLevel,
+                sessionResetTime: nil
+            )
+
         case .api:
             guard let apiUsage = apiUsage else {
                 return MetricData(
@@ -1406,6 +1432,9 @@ final class MenuBarIconRenderer {
             duration = Constants.sessionWindow
         case .week:
             resetTime = usage.weeklyResetTime
+            duration = Constants.weeklyWindow
+        case .fable:
+            resetTime = usage.fableWeeklyResetTime
             duration = Constants.weeklyWindow
         case .api:
             return nil

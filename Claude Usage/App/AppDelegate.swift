@@ -7,6 +7,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var setupWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Hosting unit tests: do nothing. A full startup would be a second
+        // tracker refreshing the user's real Claude Code logins (see AppEnvironment).
+        guard !AppEnvironment.isRunningTests else { return }
+
         // Disable window restoration for menu bar app
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
 
@@ -17,6 +21,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Hide dock icon (menu bar app only)
         NSApp.setActivationPolicy(.accessory)
+
+        warnAboutOtherInstalledCopies()
 
         // Load profiles into ProfileManager (synchronously)
         ProfileManager.shared.loadProfiles()
@@ -234,7 +240,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Every copy of this bundle id shares one UserDefaults domain. A different
+    /// build (e.g. the upstream release from Homebrew) that can't read this
+    /// build's profiles starts over and saves, replacing all of them — so ask
+    /// to remove any other copy before it gets launched by mistake.
+    private func warnAboutOtherInstalledCopies() {
+        guard let bundleId = Bundle.main.bundleIdentifier else { return }
+        let me = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+        let others = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleId)
+            .map { $0.resolvingSymlinksInPath().standardizedFileURL }
+            .filter { $0 != me && !$0.path.contains("/.Trash/") && FileManager.default.fileExists(atPath: $0.path) }
+        guard !others.isEmpty else { return }
+
+        LoggingService.shared.logError("Other installed copies of \(bundleId): \(others.map(\.path))")
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Another copy of Claude Usage is installed"
+            alert.informativeText = """
+            \(others.map(\.path).joined(separator: "\n"))
+
+            It shares this app's settings. If it's a different version and gets launched, it can replace all of your profiles. Move it to the Trash?
+            """
+            alert.addButton(withTitle: "Move to Trash")
+            alert.addButton(withTitle: "Keep")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            NSWorkspace.shared.recycle(others) { _, error in
+                if let error { LoggingService.shared.logError("Couldn't trash other copies: \(error.localizedDescription)") }
+            }
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        guard !AppEnvironment.isRunningTests else { return }
         // Cleanup
         NotchHookServer.shared.stop()
         NotchHUDController.shared.stop()
