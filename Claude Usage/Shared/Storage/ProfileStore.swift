@@ -32,6 +32,7 @@ class ProfileStore {
         // Standard UserDefaults (app container); an isolated suite under tests
         self.defaults = defaults
         self.backupURLOverride = backupURL
+        scrubExistingQuarantine()
         LoggingService.shared.log("ProfileStore: Using standard app container storage")
     }
 
@@ -179,6 +180,17 @@ class ProfileStore {
             entry.filter { !secretFieldNames.contains($0.key) }
         }
         return try? JSONSerialization.data(withJSONObject: scrubbed)
+    }
+
+    /// An earlier build quarantined the raw bytes, credentials included.
+    /// Scrub (or drop) whatever it left behind.
+    private func scrubExistingQuarantine() {
+        guard let existing = defaults.data(forKey: Keys.undecodableProfiles) else { return }
+        if let scrubbed = Self.scrubbedForQuarantine(existing) {
+            defaults.set(scrubbed, forKey: Keys.undecodableProfiles)
+        } else {
+            defaults.removeObject(forKey: Keys.undecodableProfiles)
+        }
     }
 
     private func writeBackup(of profiles: [Profile]) {

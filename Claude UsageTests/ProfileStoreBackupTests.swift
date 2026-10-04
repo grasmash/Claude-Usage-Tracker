@@ -93,4 +93,25 @@ final class ProfileStoreBackupTests: XCTestCase {
         let kept = try XCTUnwrap(defaults.data(forKey: "profiles_v3.undecodable"))
         XCTAssertFalse(String(decoding: kept, as: UTF8.self).contains("sk-ant-secret"))
     }
+
+    func testQuarantineLeftByAnEarlierBuildIsScrubbedOnStartup() throws {
+        // An earlier build copied the raw bytes, credentials included.
+        let raw = Data(#"[{"name":"a","organizationId":"org-1","claudeSessionKey":"sk-ant-secret"}]"#.utf8)
+        defaults.set(raw, forKey: "profiles_v3.undecodable")
+
+        _ = ProfileStore(defaults: defaults, backupURL: backupURL)
+
+        let kept = try XCTUnwrap(defaults.data(forKey: "profiles_v3.undecodable"))
+        let text = String(decoding: kept, as: UTF8.self)
+        XCTAssertFalse(text.contains("sk-ant-secret"))
+        XCTAssertTrue(text.contains("org-1"))
+    }
+
+    func testUnparseableQuarantineLeftByAnEarlierBuildIsRemovedOnStartup() {
+        defaults.set(Data("sk-ant-secret not json".utf8), forKey: "profiles_v3.undecodable")
+
+        _ = ProfileStore(defaults: defaults, backupURL: backupURL)
+
+        XCTAssertNil(defaults.data(forKey: "profiles_v3.undecodable"))
+    }
 }
