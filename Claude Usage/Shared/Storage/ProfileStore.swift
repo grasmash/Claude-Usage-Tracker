@@ -26,9 +26,12 @@ class ProfileStore {
     /// builds is logged once, not on every save cycle.
     private static var loggedNoKeychainStoreOnce = false
 
-    init() {
+    /// `backupURL` overrides where the profile backup lives; nil uses the
+    /// default location (and no backup at all under tests).
+    init(defaults: UserDefaults = AppEnvironment.userDefaults, backupURL: URL? = nil) {
         // Standard UserDefaults (app container); an isolated suite under tests
-        self.defaults = AppEnvironment.userDefaults
+        self.defaults = defaults
+        self.backupURLOverride = backupURL
         LoggingService.shared.log("ProfileStore: Using standard app container storage")
     }
 
@@ -83,11 +86,17 @@ class ProfileStore {
             do {
                 profiles = try JSONDecoder().decode([Profile].self, from: data)
             } catch {
-                // Keep the raw bytes: the save that follows an empty load would
-                // otherwise destroy the only copy.
-                defaults.set(data, forKey: Keys.undecodableProfiles)
+                // Keep a copy: the save that follows an empty load would
+                // otherwise destroy the only one. Credentials are stripped
+                // first — nothing ever scrubs this key again, so cleartext
+                // secrets kept here would sit in the plist for good (#267).
+                if let scrubbed = Self.scrubbedForQuarantine(data) {
+                    defaults.set(scrubbed, forKey: Keys.undecodableProfiles)
+                } else {
+                    defaults.removeObject(forKey: Keys.undecodableProfiles)
+                }
                 LoggingService.shared.logStorageError("loadProfiles", error: error)
-                LoggingService.shared.logError("ProfileStore: Failed to decode profiles; raw data kept under \(Keys.undecodableProfiles)")
+                LoggingService.shared.logError("ProfileStore: Failed to decode profiles; credential-free copy kept under \(Keys.undecodableProfiles)")
             }
         } else {
             LoggingService.shared.log("ProfileStore: No profiles found in storage")
@@ -147,6 +156,7 @@ class ProfileStore {
     /// every profile. The backup lets us notice and undo that on next launch.
     /// Secrets are not in it — they stay in the Keychain under the profile id.
     private var backupURL: URL? {
+        if let backupURLOverride { return backupURLOverride }
         guard !AppEnvironment.isRunningTests,
               let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil
@@ -154,11 +164,34 @@ class ProfileStore {
         return support.appendingPathComponent("Claude Usage/profiles-backup.json")
     }
 
+    private let backupURLOverride: URL?
     private var lastBackupData: Data?
 
+    /// Credential fields a profile's stored JSON may carry (legacy plists, or
+    /// the Keychain-unavailable fallback encoding).
+    private static let secretFieldNames = ["claudeSessionKey", "apiSessionKey", "cliCredentialsJSON", "codexCredentialsJSON"]
+
+    /// Stored profile data with every credential field removed, or nil when the
+    /// bytes cannot be parsed well enough to be sure nothing secret remains.
+    static func scrubbedForQuarantine(_ data: Data) -> Data? {
+        guard let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+        let scrubbed = entries.map { entry in
+            entry.filter { !secretFieldNames.contains($0.key) }
+        }
+        return try? JSONSerialization.data(withJSONObject: scrubbed)
+    }
+
     private func writeBackup(of profiles: [Profile]) {
-        // Never back up an empty list over a real one.
-        guard !profiles.isEmpty, let url = backupURL,
+        // An empty list saved by this build means the profiles were removed on
+        // purpose. Drop the backup too: keeping it would restore them on the
+        // next load and leave their account details on disk. (A wipe by
+        // another build never comes through here, so it is still undone.)
+        if profiles.isEmpty {
+            if let url = backupURL { try? FileManager.default.removeItem(at: url) }
+            lastBackupData = nil
+            return
+        }
+        guard let url = backupURL,
               let data = try? JSONEncoder().encode(profiles),  // default encoding excludes secrets
               data != lastBackupData else { return }
         do {
