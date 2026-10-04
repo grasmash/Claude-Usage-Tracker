@@ -111,6 +111,17 @@ final class ProfileKeychainMigrationTests: XCTestCase {
         XCTAssertNil(profile.claudeUsage)
     }
 
+    func testProfileStoredBeforeOwnMainLoginFlagDecodesAsNotHavingOne() throws {
+        let json = Data(#"{"id":"\#(UUID().uuidString)","name":"old"}"#.utf8)
+        XCTAssertFalse(try JSONDecoder().decode(Profile.self, from: json).hasOwnMainLogin)
+    }
+
+    func testOwnMainLoginFlagSurvivesEncoding() throws {
+        let profile = Profile(name: "p", hasOwnMainLogin: true)
+        let decoded = try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(profile))
+        XCTAssertTrue(decoded.hasOwnMainLogin)
+    }
+
     func testDecodeMinimalLegacyProfileAppliesDefaults() throws {
         // Very old / partial plist entries must not fail to decode.
         let minimalJSON = """

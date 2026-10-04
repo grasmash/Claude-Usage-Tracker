@@ -165,9 +165,48 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(next?.id, applicable.id)
     }
 
-    func testPinnedKeychainProfileCanBeApplied() {
-        let pinned = Profile(name: "p", customKeychainServiceName: "Claude Code-credentials-p")
+    // A pinned profile's keychain entry belongs to another Claude Code config
+    // dir. Copying that login into the main one puts a single-use refresh
+    // token in two places, and whichever side refreshes second is logged out.
+
+    func testPinnedProfileWithoutItsOwnMainLoginCannotBeApplied() {
+        let pinned = Profile(
+            name: "p",
+            cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r"}}"#,
+            customKeychainServiceName: "Claude Code-credentials-p"
+        )
+        XCTAssertFalse(AutoSwitchPolicy.canBeApplied(pinned))
+    }
+
+    func testPinnedProfileWithItsOwnMainLoginCanBeApplied() {
+        let pinned = Profile(
+            name: "p",
+            cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r"}}"#,
+            customKeychainServiceName: "Claude Code-credentials-p",
+            hasOwnMainLogin: true
+        )
         XCTAssertTrue(AutoSwitchPolicy.canBeApplied(pinned))
+    }
+
+    func testPinnedProfileWithNoStoredLoginCannotBeApplied() {
+        let pinned = Profile(name: "p", customKeychainServiceName: "Claude Code-credentials-p", hasOwnMainLogin: true)
+        XCTAssertFalse(AutoSwitchPolicy.canBeApplied(pinned))
+    }
+
+    func testMainLoginIsItsOwnWhenItsTokenDiffersFromThePinnedEntry() {
+        XCTAssertTrue(AutoSwitchPolicy.isOwnMainLogin(mainRefreshToken: "main", pinnedRefreshToken: "pinned"))
+    }
+
+    func testMainLoginIsNotItsOwnWhenItIsACopyOfThePinnedEntry() {
+        XCTAssertFalse(AutoSwitchPolicy.isOwnMainLogin(mainRefreshToken: "same", pinnedRefreshToken: "same"))
+    }
+
+    func testMainLoginWithoutARefreshTokenIsNotItsOwn() {
+        XCTAssertFalse(AutoSwitchPolicy.isOwnMainLogin(mainRefreshToken: nil, pinnedRefreshToken: "pinned"))
+    }
+
+    func testMainLoginIsItsOwnWhenThePinnedEntryIsUnreadable() {
+        XCTAssertTrue(AutoSwitchPolicy.isOwnMainLogin(mainRefreshToken: "main", pinnedRefreshToken: nil))
     }
 
     func testReturnsNilWhenOnlyOtherProfileIsSessionKeyOnly() {

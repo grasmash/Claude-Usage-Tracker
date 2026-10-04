@@ -220,7 +220,7 @@ class ProfileManager: ObservableObject {
         // without CLI account sync never touch the Claude Code keychain)
         if let currentProfile = activeProfile,
            currentProfile.provider.descriptor.capabilities.cliAccountSync,
-           currentProfile.cliCredentialsJSON != nil {
+           currentProfile.cliCredentialsJSON != nil || currentProfile.customKeychainServiceName != nil {
             do {
                 try cliSyncService.resyncBeforeSwitching(for: currentProfile.id)
                 // Reload profiles to get the updated data in memory
@@ -247,14 +247,13 @@ class ProfileManager: ObservableObject {
         // or the Claude Code keychain entry)
         LoggingService.shared.log("Checking CLI credentials for profile '\(updatedProfile.name)': hasJSON=\(updatedProfile.cliCredentialsJSON != nil)")
 
-        if updatedProfile.provider.descriptor.capabilities.cliAccountSync,
-           updatedProfile.cliCredentialsJSON != nil {
+        if AutoSwitchPolicy.canBeApplied(updatedProfile) {
             // Refresh the OAuth token before applying. Stored tokens expire (~8h),
             // so applying a stale snapshot would write a dead access token to the
             // keychain and Claude Code would 401 ("Please run /login"). This refreshes
             // via the refresh_token grant and persists the rotated tokens back to the
             // profile, so applyProfileCredentials below writes a valid token.
-            if let refreshed = await cliSyncService.ensureFreshCredentials(for: updatedProfile.id, allowRotation: true) {
+            if let refreshed = await cliSyncService.ensureFreshMainLogin(for: updatedProfile.id) {
                 LoggingService.shared.log("✓ Ensured fresh credentials before apply for: \(updatedProfile.name)")
                 _ = refreshed
                 // Reload so applyProfileCredentials picks up the refreshed token.
@@ -276,10 +275,15 @@ class ProfileManager: ObservableObject {
             // still on the previous account. Say so — silently "succeeding" here
             // is how a user ends up hitting a limit on an account the tracker
             // claims it left.
-            LoggingService.shared.log("⚠️ Profile '\(updatedProfile.name)' has no CLI credentials JSON — Claude Code NOT switched")
+            // A pinned profile's keychain entry belongs to another config dir
+            // and is never copied here; it needs its own /login in Claude Code.
+            let needsMainLogin = updatedProfile.customKeychainServiceName != nil
+            LoggingService.shared.log("⚠️ Profile '\(updatedProfile.name)' has no \(needsMainLogin ? "main login of its own" : "CLI credentials JSON") — Claude Code NOT switched")
             NotificationManager.shared.sendSwitchNotAppliedNotification(
                 profileName: updatedProfile.name,
-                reason: "notification.switch_not_applied.no_cli_creds".localized,
+                reason: (needsMainLogin
+                    ? "notification.switch_not_applied.needs_main_login"
+                    : "notification.switch_not_applied.no_cli_creds").localized,
                 settings: updatedProfile.notificationSettings
             )
         }
@@ -386,6 +390,7 @@ class ProfileManager: ObservableObject {
 
         var adopted = profiles[index]
         adopted.cliCredentialsJSON = systemJSON
+        adopted.hasOwnMainLogin = sync.isOwnMainLogin(systemJSON, for: adopted)
         adopted.oauthAccountJSON = systemAccount
         adopted.cliAccountSyncedAt = Date()
         adopted.lastUsedAt = Date()

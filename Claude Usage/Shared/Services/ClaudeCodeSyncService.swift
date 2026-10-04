@@ -783,6 +783,7 @@ class ClaudeCodeSyncService {
         }
 
         profiles[index].cliCredentialsJSON = jsonData
+        profiles[index].hasOwnMainLogin = isOwnMainLogin(jsonData, for: profiles[index])
         if let capturedOAuthAccount = capturedOAuthAccount {
             profiles[index].oauthAccountJSON = capturedOAuthAccount
         }
@@ -802,6 +803,12 @@ class ClaudeCodeSyncService {
         guard let profile = profiles.first(where: { $0.id == profileId }),
               let jsonData = profile.cliCredentialsJSON else {
             LoggingService.shared.log("❌ No CLI credentials found for profile: \(profileId)")
+            throw ClaudeCodeError.noProfileCredentials
+        }
+        // Never copy a pinned entry's login into the main keychain: that puts
+        // one single-use refresh token in two config dirs.
+        guard AutoSwitchPolicy.canBeApplied(profile) else {
+            LoggingService.shared.log("❌ Profile '\(profile.name)' has no main login of its own; not applying its pinned entry")
             throw ClaudeCodeError.noProfileCredentials
         }
 
@@ -1032,11 +1039,29 @@ class ClaudeCodeSyncService {
         // its next refresh fail with invalid_grant ("Please run /login"). Instead,
         // READ the system credentials (Claude keeps them fresh) and mirror them into
         // the profile when they belong to the same account.
-        if customSvc == nil || pinIsDead, ProfileStore.shared.loadActiveProfileId() == profileId {
+        let isActive = ProfileStore.shared.loadActiveProfileId() == profileId
+
+        // ACTIVE profile with a working pin: usage is read from the pinned
+        // entry below, but Claude Code's main sessions run on a separate login
+        // in the system keychain. Keep the profile's copy of that login current
+        // (it is what a later switch back applies) and notice when it dies.
+        if customSvc != nil, !pinIsDead, isActive,
+           let systemJSON = try? readSystemCredentials(),
+           systemCredentials(systemJSON, belongTo: profile) {
+            let own = isOwnMainLogin(systemJSON, for: profile)
+            if !isTokenExpired(systemJSON) {
+                persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
+            } else if own, let updatedJSON = await refreshIdleSystemLogin(systemJSON, profileName: profile.name) {
+                persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON, ownMainLogin: own)
+            }
+        }
+
+        if customSvc == nil || pinIsDead, isActive {
             if let systemJSON = try? readSystemCredentials() {
                 if systemCredentials(systemJSON, belongTo: profile) {
+                    let own = isOwnMainLogin(systemJSON, for: profile)
                     if !isTokenExpired(systemJSON) {
-                        persistProfileCredentialsJSON(profileId: profileId, json: systemJSON)
+                        persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
                         return systemJSON
                     }
                     // System token EXPIRED: Claude Code refreshes ~60s BEFORE expiry
@@ -1045,26 +1070,9 @@ class ClaudeCodeSyncService {
                     // ONCE — but the rotated lineage MUST be handed back to the system
                     // keychain (+ mirror file), or the CLI would be left holding a
                     // consumed refresh token and forced to /login.
-                    if let refreshToken = extractRefreshToken(from: systemJSON), !deadLogins.isDead(refreshToken) {
-                        do {
-                            let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
-                            if let updatedJSON = mergeRefreshedCredentials(into: systemJSON, refreshed: refreshed) {
-                                do {
-                                    try writeSystemCredentials(updatedJSON)
-                                    writeCredentialsFile(updatedJSON)
-                                } catch {
-                                    LoggingService.shared.logError("ensureFreshCredentials: refreshed active-profile tokens but keychain writeback failed — CLI may need /login", error: error)
-                                }
-                                persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
-                                LoggingService.shared.log("✓ ensureFreshCredentials: refreshed idle active-profile token and wrote back to system keychain")
-                                return updatedJSON
-                            }
-                        } catch let ClaudeCodeError.refreshFailed(status, body) where DeadLoginTracker.isInvalidGrant(status: status, body: body) {
-                            deadLogins.markDead(refreshToken)
-                            LoggingService.shared.logError("ensureFreshCredentials: Claude Code login for '\(profile.name)' is dead (invalid_grant) — not retrying until /login")
-                        } catch {
-                            LoggingService.shared.logError("ensureFreshCredentials: idle active-profile refresh failed (non-fatal)", error: error)
-                        }
+                    if let updatedJSON = await refreshIdleSystemLogin(systemJSON, profileName: profile.name) {
+                        persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON, ownMainLogin: own)
+                        return updatedJSON
                     }
                     // Refresh unavailable/failed — return the expired snapshot without
                     // rotating anything; the CLI recovers it on next use.
@@ -1099,11 +1107,8 @@ class ClaudeCodeSyncService {
         // Fast path: token still valid beyond the leeway window.
         if let expiryDate = extractTokenExpiry(from: cliJSON),
            expiryDate.timeIntervalSinceNow > Self.refreshLeewaySeconds {
-            // If we sourced from a custom keychain entry, mirror its current contents into the
-            // profile cache so display code (menu bar, popover) sees the up-to-date tokens.
-            if customSvc != nil {
-                persistProfileCredentialsJSON(profileId: profileId, json: cliJSON)
-            }
+            // A pinned entry is NOT mirrored into the profile cache: the cache holds the
+            // account's separate main login, which is what a switch applies.
             return cliJSON
         }
 
@@ -1166,9 +1171,11 @@ class ClaudeCodeSyncService {
             return nil
         }
 
-        // Write back: always update the profile cache; if we sourced from a custom keychain
-        // entry, also persist the rotated tokens there so Claude Code's next read picks them up.
-        persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
+        // Write back to where the tokens came from: the pinned keychain entry (so Claude
+        // Code's next read there picks them up), or the profile cache when unpinned.
+        if customSvc == nil {
+            persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
+        }
         if let svc = customSvc {
             do {
                 try writeKeychainCredentials(serviceName: svc, jsonData: updatedJSON)
@@ -1189,39 +1196,115 @@ class ClaudeCodeSyncService {
             || extractRefreshToken(from: systemJSON) == profile.cliCredentialsJSON.flatMap(extractRefreshToken)
     }
 
-    /// True when every refresh token this profile could use has been rejected
-    /// by the OAuth server, i.e. the account needs a fresh `/login`.
+    /// True when `mainJSON` (a login from the main keychain) is this profile's
+    /// own main login rather than a copy of its pinned entry.
+    func isOwnMainLogin(_ mainJSON: String, for profile: Profile) -> Bool {
+        guard let svc = profile.customKeychainServiceName else { return true }
+        return AutoSwitchPolicy.isOwnMainLogin(
+            mainRefreshToken: extractRefreshToken(from: mainJSON),
+            pinnedRefreshToken: readKeychainCredentials(serviceName: svc).flatMap { extractRefreshToken(from: $0) }
+        )
+    }
+
+    /// Refreshes an EXPIRED system login once and hands the rotated tokens
+    /// back to the system keychain (+ mirror file), so Claude Code is not left
+    /// holding a consumed refresh token. Returns the updated credentials, or
+    /// nil if nothing was refreshed. A rejected refresh token is remembered as
+    /// dead and not retried.
+    private func refreshIdleSystemLogin(_ systemJSON: String, profileName: String) async -> String? {
+        guard let refreshToken = extractRefreshToken(from: systemJSON), !deadLogins.isDead(refreshToken) else {
+            return nil
+        }
+        do {
+            let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
+            guard let updatedJSON = mergeRefreshedCredentials(into: systemJSON, refreshed: refreshed) else { return nil }
+            do {
+                try writeSystemCredentials(updatedJSON)
+                writeCredentialsFile(updatedJSON)
+            } catch {
+                LoggingService.shared.logError("ensureFreshCredentials: refreshed active-profile tokens but keychain writeback failed — CLI may need /login", error: error)
+            }
+            LoggingService.shared.log("✓ ensureFreshCredentials: refreshed idle active-profile token and wrote back to system keychain")
+            return updatedJSON
+        } catch let ClaudeCodeError.refreshFailed(status, body) where DeadLoginTracker.isInvalidGrant(status: status, body: body) {
+            deadLogins.markDead(refreshToken)
+            LoggingService.shared.logError("ensureFreshCredentials: Claude Code login for '\(profileName)' is dead (invalid_grant) — not retrying until /login")
+        } catch {
+            LoggingService.shared.logError("ensureFreshCredentials: idle active-profile refresh failed (non-fatal)", error: error)
+        }
+        return nil
+    }
+
+    /// Returns the login to write to the main keychain when switching to this
+    /// profile, refreshed if it has expired. For a pinned profile that is its
+    /// own main login — never the pinned entry. While the profile is inactive
+    /// nothing else holds that login, so refreshing it here is safe.
+    func ensureFreshMainLogin(for profileId: UUID) async -> String? {
+        guard let profile = ProfileStore.shared.loadProfiles().first(where: { $0.id == profileId }) else {
+            return nil
+        }
+        guard profile.customKeychainServiceName != nil else {
+            return await ensureFreshCredentials(for: profileId, allowRotation: true)
+        }
+        guard profile.hasOwnMainLogin, let mainJSON = profile.cliCredentialsJSON else { return nil }
+
+        if let expiryDate = extractTokenExpiry(from: mainJSON),
+           expiryDate.timeIntervalSinceNow > Self.refreshLeewaySeconds {
+            return mainJSON
+        }
+        guard let refreshToken = extractRefreshToken(from: mainJSON), !deadLogins.isDead(refreshToken) else {
+            return nil
+        }
+        do {
+            let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
+            guard let updatedJSON = mergeRefreshedCredentials(into: mainJSON, refreshed: refreshed) else { return nil }
+            persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
+            LoggingService.shared.log("✓ ensureFreshMainLogin: refreshed main login for '\(profile.name)'")
+            return updatedJSON
+        } catch let ClaudeCodeError.refreshFailed(status, body) {
+            LoggingService.shared.logError("ensureFreshMainLogin: refresh failed for '\(profile.name)' (HTTP \(status)) body=\(body)")
+            if DeadLoginTracker.isInvalidGrant(status: status, body: body) {
+                deadLogins.markDead(refreshToken)
+            }
+        } catch {
+            LoggingService.shared.logError("ensureFreshMainLogin: refresh failed for '\(profile.name)'", error: error)
+        }
+        return nil
+    }
+
+    /// True when the login Claude Code's main sessions use (or would use after
+    /// a switch) for this profile has been rejected by the OAuth server, i.e.
+    /// the account needs a fresh `/login`.
     ///
-    /// The active profile may also use Claude Code's own login, so a dead
-    /// pinned entry alone does not make it dead while that login still works.
+    /// For the active profile that is the system keychain login; for any other
+    /// profile it is the stored login a switch would apply.
     func isLoginDead(for profile: Profile) -> Bool {
         guard !deadLogins.isEmpty else { return false }
 
-        var tokens: [String] = []
-        let ownJSON = profile.customKeychainServiceName.flatMap { readKeychainCredentials(serviceName: $0) }
-            ?? profile.cliCredentialsJSON
-        if let token = ownJSON.flatMap({ extractRefreshToken(from: $0) }) {
-            tokens.append(token)
+        let mainJSON: String?
+        if ProfileStore.shared.loadActiveProfileId() == profile.id {
+            mainJSON = (try? readSystemCredentials()).flatMap { systemCredentials($0, belongTo: profile) ? $0 : nil }
+        } else {
+            mainJSON = profile.cliCredentialsJSON
         }
-        if ProfileStore.shared.loadActiveProfileId() == profile.id,
-           let systemJSON = try? readSystemCredentials(),
-           systemCredentials(systemJSON, belongTo: profile),
-           let token = extractRefreshToken(from: systemJSON) {
-            tokens.append(token)
-        }
+        let tokens = [mainJSON.flatMap { extractRefreshToken(from: $0) }].compactMap { $0 }
         return deadLogins.isLoginDead(refreshTokens: tokens)
     }
 
     /// Re-loads profiles and writes `json` into the profile's `cliCredentialsJSON` if it
     /// differs from what's already stored. Re-loading inside the call minimizes the risk
     /// of clobbering concurrent edits to other profile fields.
-    private func persistProfileCredentialsJSON(profileId: UUID, json: String) {
+    /// `ownMainLogin`, when given, also records whether `json` is the profile's
+    /// own main login (see `Profile.hasOwnMainLogin`).
+    private func persistProfileCredentialsJSON(profileId: UUID, json: String, ownMainLogin: Bool? = nil) {
         var reloaded = ProfileStore.shared.loadProfiles()
-        guard let idx = reloaded.firstIndex(where: { $0.id == profileId }),
-              reloaded[idx].cliCredentialsJSON != json else {
+        guard let idx = reloaded.firstIndex(where: { $0.id == profileId }) else { return }
+        let own = ownMainLogin ?? reloaded[idx].hasOwnMainLogin
+        guard reloaded[idx].cliCredentialsJSON != json || reloaded[idx].hasOwnMainLogin != own else {
             return
         }
         reloaded[idx].cliCredentialsJSON = json
+        reloaded[idx].hasOwnMainLogin = own
         ProfileStore.shared.saveProfiles(reloaded)
     }
 
@@ -1327,6 +1410,7 @@ class ClaudeCodeSyncService {
         }
 
         profiles[index].cliCredentialsJSON = freshJSON
+        profiles[index].hasOwnMainLogin = isOwnMainLogin(freshJSON, for: profiles[index])
         if let freshOAuthAccount = freshOAuthAccount {
             profiles[index].oauthAccountJSON = freshOAuthAccount
         }

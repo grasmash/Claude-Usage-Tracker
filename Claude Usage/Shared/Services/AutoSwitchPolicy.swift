@@ -24,9 +24,22 @@ enum AutoSwitchPolicy {
     /// tracker while the keychain stays on the exhausted account — the user
     /// sees a switch that changed nothing. Such profiles are not switch
     /// targets. Expired tokens are fine: `activateProfile` refreshes them.
+    ///
+    /// A pinned profile additionally needs its own main login (see
+    /// `Profile.hasOwnMainLogin`): its pinned keychain entry is never copied
+    /// into the main keychain.
     static func canBeApplied(_ profile: Profile) -> Bool {
-        profile.provider.descriptor.capabilities.cliAccountSync
-            && (profile.cliCredentialsJSON != nil || profile.customKeychainServiceName != nil)
+        guard profile.provider.descriptor.capabilities.cliAccountSync,
+              profile.cliCredentialsJSON != nil else { return false }
+        return profile.customKeychainServiceName == nil || profile.hasOwnMainLogin
+    }
+
+    /// True when a login found in the main keychain is separate from a
+    /// profile's pinned entry rather than a copy of it. An unreadable pinned
+    /// entry cannot be the source of a copy.
+    static func isOwnMainLogin(mainRefreshToken: String?, pinnedRefreshToken: String?) -> Bool {
+        guard let mainRefreshToken else { return false }
+        return mainRefreshToken != pinnedRefreshToken
     }
 
     /// Candidates must be applicable (see `canBeApplied`), observed recently,

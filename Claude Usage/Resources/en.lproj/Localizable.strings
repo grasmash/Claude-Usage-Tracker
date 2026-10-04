@@ -969,6 +969,7 @@
 "notification.profile_stale.title" = "%@ stopped updating";
 "notification.switch_not_applied.title" = "Claude Code NOT switched to %@";
 "notification.switch_not_applied.no_cli_creds" = "This profile has no Claude Code login linked, so the terminal is still on the previous account. Run /login in Claude Code, or link it in Settings.";
+"notification.switch_not_applied.needs_main_login" = "This account has no login of its own in Claude Code yet, so the terminal is still on the previous account. Run /login in Claude Code as this account once; the tracker remembers it.";
 "notification.switch_not_applied.apply_failed" = "Writing this profile's login to the keychain failed. The terminal is still on the previous account.";
 
 // MARK: - Overage Balance
