@@ -1187,6 +1187,7 @@ class MenuBarManager: NSObject, ObservableObject {
         // Follow a `/login` done in Claude Code itself, so the profile that is
         // really logged in is the one we poll live and switch away from.
         profileManager.adoptExternalLoginIfNeeded()
+        profileManager.captureActiveMainLogin()
 
         // In multi-profile mode, refresh ALL selected profiles
         if profileManager.displayMode == .multi {

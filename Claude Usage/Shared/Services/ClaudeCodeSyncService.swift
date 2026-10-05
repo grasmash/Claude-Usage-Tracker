@@ -1045,13 +1045,14 @@ class ClaudeCodeSyncService {
         // entry below, but Claude Code's main sessions run on a separate login
         // in the system keychain. Keep the profile's copy of that login current
         // (it is what a later switch back applies) and notice when it dies.
+        // (Capturing an unexpired one is `captureMainLogin`; only the refresh
+        // of an expired one happens here.)
         if customSvc != nil, !pinIsDead, isActive,
            let systemJSON = try? readSystemCredentials(),
-           systemCredentials(systemJSON, belongTo: profile) {
+           systemCredentials(systemJSON, belongTo: profile),
+           isTokenExpired(systemJSON) {
             let own = isOwnMainLogin(systemJSON, for: profile)
-            if !isTokenExpired(systemJSON) {
-                persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
-            } else if own, let updatedJSON = await refreshIdleSystemLogin(systemJSON, profileName: profile.name) {
+            if own, let updatedJSON = await refreshIdleSystemLogin(systemJSON, profileName: profile.name) {
                 persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON, ownMainLogin: own)
             }
         }
@@ -1204,6 +1205,22 @@ class ClaudeCodeSyncService {
             mainRefreshToken: extractRefreshToken(from: mainJSON),
             pinnedRefreshToken: readKeychainCredentials(serviceName: svc).flatMap { extractRefreshToken(from: $0) }
         )
+    }
+
+    /// Stores the system (main) login into the profile when it belongs to the
+    /// profile's account, flagging whether it is the profile's own main login.
+    /// Returns true when anything changed. Never refreshes or writes the
+    /// keychain.
+    @discardableResult
+    func captureMainLogin(for profileId: UUID) -> Bool {
+        guard let profile = ProfileStore.shared.loadProfiles().first(where: { $0.id == profileId }),
+              let systemJSON = try? readSystemCredentials(),
+              extractRefreshToken(from: systemJSON) != nil,
+              systemCredentials(systemJSON, belongTo: profile) else { return false }
+        let own = isOwnMainLogin(systemJSON, for: profile)
+        guard profile.cliCredentialsJSON != systemJSON || profile.hasOwnMainLogin != own else { return false }
+        persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
+        return true
     }
 
     /// Refreshes an EXPIRED system login once and hands the rotated tokens

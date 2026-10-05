@@ -342,6 +342,35 @@ class ProfileManager: ObservableObject {
     /// are left alone and only logged.
     ///
     /// Returns the adopted profile, or nil if nothing changed.
+    /// Saves made from the in-memory list must not undo credential updates
+    /// `ClaudeCodeSyncService` wrote straight to the store (rotated tokens, a
+    /// captured main login). Pull those fields in before such a save.
+    private func reloadStoredCredentialState() {
+        let stored = profileStore.loadProfiles()
+        for index in profiles.indices {
+            guard let fresh = stored.first(where: { $0.id == profiles[index].id }) else { continue }
+            profiles[index].cliCredentialsJSON = fresh.cliCredentialsJSON
+            profiles[index].hasOwnMainLogin = fresh.hasOwnMainLogin
+            profiles[index].oauthAccountJSON = fresh.oauthAccountJSON
+            profiles[index].cliAccountSyncedAt = fresh.cliAccountSyncedAt
+        }
+        if let id = activeProfile?.id, let index = profiles.firstIndex(where: { $0.id == id }) {
+            activeProfile = profiles[index]
+        }
+    }
+
+    /// Records the active profile's main login (the one Claude Code's main
+    /// sessions use) as its own, so a later switch back can apply it. Runs
+    /// every cycle: `adoptExternalLoginIfNeeded` only fires when the account
+    /// changes, and the usage fetch may never touch CLI credentials.
+    func captureActiveMainLogin() {
+        guard !switchingSemaphore, let active = activeProfile,
+              active.provider.descriptor.capabilities.cliAccountSync,
+              ClaudeCodeSyncService.shared.captureMainLogin(for: active.id) else { return }
+        reloadStoredCredentialState()
+        LoggingService.shared.log("captureActiveMainLogin: saved main login for '\(active.name)'")
+    }
+
     @discardableResult
     func adoptExternalLoginIfNeeded() -> Profile? {
         guard !switchingSemaphore else { return nil }
@@ -486,6 +515,7 @@ class ProfileManager: ObservableObject {
 
     /// Saves Claude usage data for a specific profile
     func saveClaudeUsage(_ usage: ClaudeUsage, for profileId: UUID) {
+        reloadStoredCredentialState()
         guard let index = profiles.firstIndex(where: { $0.id == profileId }) else {
             LoggingService.shared.logError("saveClaudeUsage: Profile not found with ID: \(profileId)")
             return
@@ -510,6 +540,7 @@ class ProfileManager: ObservableObject {
 
     /// Saves API usage data for a specific profile
     func saveAPIUsage(_ usage: APIUsage, for profileId: UUID) {
+        reloadStoredCredentialState()
         guard let index = profiles.firstIndex(where: { $0.id == profileId }) else {
             LoggingService.shared.logError("saveAPIUsage: Profile not found with ID: \(profileId)")
             return
