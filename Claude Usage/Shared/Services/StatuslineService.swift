@@ -1013,22 +1013,30 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
     }
 
     /// Updates only the profile name in the statusline config file.
-    /// Called during profile switches to keep the config in sync.
+    /// Called during profile switches, and on every usage-cache write so a
+    /// switch the tracker merely followed (a /login in Claude Code) is shown too.
     func updateProfileNameInConfig(_ profileName: String) throws {
         let configPath = Constants.ClaudePaths.claudeDirectory
             .appendingPathComponent("statusline-config.txt")
 
         guard FileManager.default.fileExists(atPath: configPath.path) else { return }
 
-        var content = try String(contentsOf: configPath, encoding: .utf8)
+        let content = try String(contentsOf: configPath, encoding: .utf8)
+        guard let updated = Self.config(content, withProfileName: profileName) else { return }
+        try updated.write(to: configPath, atomically: true, encoding: .utf8)
+    }
 
+    /// `config` with its PROFILE_NAME set to `profileName`, or nil if it already is.
+    static func config(_ config: String, withProfileName profileName: String) -> String? {
+        let line = "PROFILE_NAME=\"\(profileName)\""
+        var content = config
         if let range = content.range(of: #"PROFILE_NAME="[^"]*""#, options: .regularExpression) {
-            content.replaceSubrange(range, with: "PROFILE_NAME=\"\(profileName)\"")
+            guard content[range] != line else { return nil }
+            content.replaceSubrange(range, with: line)
         } else {
-            content += "\nPROFILE_NAME=\"\(profileName)\"\n"
+            content += "\n\(line)\n"
         }
-
-        try content.write(to: configPath, atomically: true, encoding: .utf8)
+        return content
     }
 
     /// Enables or disables statusline in Claude Code settings.json
@@ -1106,6 +1114,9 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
 
         if let name = profileName {
             cacheContent += "\nPROFILE_NAME=\(name)"
+            // The status line takes the name from its config file and the
+            // numbers from this cache; keep them on the same account.
+            try? updateProfileNameInConfig(name)
         }
 
         let weeklyPct = Int(usage.weeklyPercentage)
