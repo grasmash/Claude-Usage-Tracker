@@ -1225,6 +1225,32 @@ class ClaudeCodeSyncService {
         return true
     }
 
+    // MARK: - Credentials file as a reload signal
+
+    /// True when the credentials file does not hold the keychain's login.
+    func credentialsFileIsOutOfDate(keychainJSON: String, fileJSON: String?) -> Bool {
+        guard let keychainToken = extractRefreshToken(from: keychainJSON) else { return false }
+        return fileJSON.flatMap { extractRefreshToken(from: $0) } != keychainToken
+    }
+
+    /// Brings `~/.claude/.credentials.json` in line with the keychain.
+    ///
+    /// Open Claude Code sessions cache their login and reload it only when
+    /// this file's modification time changes. The tracker rewrites it on its
+    /// own switches, but a `/login` in one session (or Claude Code rotating
+    /// its tokens) changes the keychain alone — leaving every other session
+    /// on its old account, where it can sit at a limit the tracker cannot see.
+    /// Returns true when the file was rewritten.
+    @discardableResult
+    func syncCredentialsFileWithKeychain() -> Bool {
+        guard let raw = try? readKeychainCredentials(),
+              raw.data(using: .utf8).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) != nil,
+              credentialsFileIsOutOfDate(keychainJSON: raw, fileJSON: readCredentialsFile()) else { return false }
+        writeCredentialsFile(raw)
+        LoggingService.shared.log("syncCredentialsFileWithKeychain: keychain login changed; rewrote credentials file so open sessions reload")
+        return true
+    }
+
     // MARK: - Login import (claude-usage-login)
 
     /// Config dir `claude-usage-login` signs in through. Nothing else uses it.

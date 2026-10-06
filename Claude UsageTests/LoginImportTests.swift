@@ -26,6 +26,38 @@ final class LoginImportTests: XCTestCase {
             in: [other], oauthAccountJSON: #"{"accountUuid":"u-new","emailAddress":"new@x.com"}"#))
     }
 
+    // Open Claude Code sessions reload their login only when
+    // ~/.claude/.credentials.json changes. A /login in one session updates the
+    // keychain alone, so the file must be brought in line or every other
+    // session stays on its old account.
+
+    func testCredentialsFileIsRewrittenWhenTheKeychainHoldsAnotherLogin() {
+        let sync = ClaudeCodeSyncService.shared
+        XCTAssertTrue(sync.credentialsFileIsOutOfDate(
+            keychainJSON: #"{"claudeAiOauth":{"accessToken":"a2","refreshToken":"new"}}"#,
+            fileJSON: #"{"claudeAiOauth":{"accessToken":"a1","refreshToken":"old"}}"#))
+    }
+
+    func testCredentialsFileIsLeftAloneWhenItMatchesTheKeychain() {
+        let sync = ClaudeCodeSyncService.shared
+        let json = #"{"claudeAiOauth":{"accessToken":"a","refreshToken":"same"}}"#
+        XCTAssertFalse(sync.credentialsFileIsOutOfDate(keychainJSON: json, fileJSON: json))
+    }
+
+    func testMissingCredentialsFileIsOutOfDate() {
+        let sync = ClaudeCodeSyncService.shared
+        XCTAssertTrue(sync.credentialsFileIsOutOfDate(
+            keychainJSON: #"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#, fileJSON: nil))
+    }
+
+    func testKeychainWithoutARefreshTokenNeverOverwritesTheFile() {
+        // A truncated or regex-recovered keychain payload is not a full login.
+        let sync = ClaudeCodeSyncService.shared
+        XCTAssertFalse(sync.credentialsFileIsOutOfDate(
+            keychainJSON: #"{"claudeAiOauth":{"accessToken":"a"}}"#,
+            fileJSON: #"{"claudeAiOauth":{"accessToken":"a1","refreshToken":"old"}}"#))
+    }
+
     func testImportDirectoryKeychainEntryFollowsClaudeCodesNaming() {
         let sync = ClaudeCodeSyncService.shared
         let dir = ClaudeCodeSyncService.loginImportDirectory.path
