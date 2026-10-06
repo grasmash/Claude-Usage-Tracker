@@ -34,7 +34,9 @@ class ClaudeCodeSyncService {
     // MARK: - Cached Availability Check
 
     /// Refresh tokens the OAuth server has rejected with `invalid_grant`.
-    let deadLogins = DeadLoginTracker()
+    let deadLogins = DeadLoginTracker(storeURL: AppEnvironment.isRunningTests ? nil :
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Claude Usage/dead-logins.json"))
 
     /// Cached result of the "are usable system CLI credentials present?" check.
     /// Keychain access is a blocking XPC round-trip, and UI render paths
@@ -1221,6 +1223,38 @@ class ClaudeCodeSyncService {
         guard profile.cliCredentialsJSON != systemJSON || profile.hasOwnMainLogin != own else { return false }
         persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
         return true
+    }
+
+    // MARK: - Login import (claude-usage-login)
+
+    /// Config dir `claude-usage-login` signs in through. Nothing else uses it.
+    static var loginImportDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-import")
+    }
+
+    /// Keychain entry Claude Code writes for a login in `loginImportDirectory`.
+    var loginImportServiceName: String {
+        "Claude Code-credentials-\(sha256HexPrefix(Self.loginImportDirectory.path, length: 8))"
+    }
+
+    /// A login waiting in the import dir: its credentials and `oauthAccount`.
+    func readImportedLogin() -> (credentials: String, oauthAccount: String)? {
+        guard let credentials = readKeychainCredentials(serviceName: loginImportServiceName),
+              extractRefreshToken(from: credentials) != nil else { return nil }
+        let configFile = Self.loginImportDirectory.appendingPathComponent(".claude.json")
+        guard let data = try? Data(contentsOf: configFile),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = root["oauthAccount"] as? [String: Any],
+              let accountData = try? JSONSerialization.data(withJSONObject: account, options: [.sortedKeys]),
+              let oauthAccount = String(data: accountData, encoding: .utf8) else { return nil }
+        return (credentials, oauthAccount)
+    }
+
+    /// Deletes the import dir's keychain entry locally. This is NOT a logout:
+    /// nothing is revoked, the login lives on in the profile.
+    func clearImportedLogin() {
+        guard !AppEnvironment.isRunningTests else { return }
+        _ = runSecurityCommand(arguments: ["delete-generic-password", "-s", loginImportServiceName, "-a", NSUserName()])
     }
 
     /// Refreshes an EXPIRED system login once and hands the rotated tokens

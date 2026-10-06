@@ -193,6 +193,39 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(AutoSwitchPolicy.canBeApplied(pinned))
     }
 
+    // Idle accounts' saved logins are refreshed as they expire, so a dead one
+    // shows up before auto-switch needs it.
+
+    func testIdleSavedLoginIsRefreshedOnceExpired() {
+        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
+        let idle = Profile(name: "i", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
+                           customKeychainServiceName: "svc", hasOwnMainLogin: true)
+        XCTAssertTrue(AutoSwitchPolicy.shouldRefreshIdleLogin(idle, activeId: UUID()))
+    }
+
+    func testIdleSavedLoginIsLeftAloneWhileValid() {
+        let valid = Int((Date().timeIntervalSince1970 + 3600) * 1000)
+        let idle = Profile(name: "i", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(valid)}}"#,
+                           customKeychainServiceName: "svc", hasOwnMainLogin: true)
+        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(idle, activeId: UUID()))
+    }
+
+    func testActiveLoginIsNeverRefreshedAsIdle() {
+        // Claude Code owns the active login and refreshes it itself.
+        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
+        let active = Profile(name: "a", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
+                             customKeychainServiceName: "svc", hasOwnMainLogin: true)
+        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(active, activeId: active.id))
+    }
+
+    func testLoginThatIsACopyOfThePinnedEntryIsNotRefreshedAsIdle() {
+        // Not ours alone: the pinned config dir uses the same refresh token.
+        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
+        let copy = Profile(name: "c", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
+                           customKeychainServiceName: "svc", hasOwnMainLogin: false)
+        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(copy, activeId: UUID()))
+    }
+
     func testMainLoginIsItsOwnWhenItsTokenDiffersFromThePinnedEntry() {
         XCTAssertTrue(AutoSwitchPolicy.isOwnMainLogin(mainRefreshToken: "main", pinnedRefreshToken: "pinned"))
     }

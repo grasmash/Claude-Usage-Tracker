@@ -34,6 +34,22 @@ enum AutoSwitchPolicy {
         return profile.customKeychainServiceName == nil || profile.hasOwnMainLogin
     }
 
+    /// True when an idle account's saved main login has expired and should be
+    /// refreshed now. Doing it ahead of time keeps the login alive and, if the
+    /// server rejects it, reveals the dead login before auto-switch needs it.
+    ///
+    /// Only for pinned profiles' own main logins: the tracker is their only
+    /// holder while the profile is inactive. The active login belongs to
+    /// Claude Code, and an unpinned profile's lineage may be owned elsewhere.
+    static func shouldRefreshIdleLogin(_ profile: Profile, activeId: UUID?, now: Date = Date()) -> Bool {
+        guard profile.id != activeId,
+              profile.customKeychainServiceName != nil,
+              profile.hasOwnMainLogin,
+              let json = profile.cliCredentialsJSON,
+              let expiry = ClaudeCodeSyncService.shared.extractTokenExpiry(from: json) else { return false }
+        return expiry <= now
+    }
+
     /// True when a login found in the main keychain is separate from a
     /// profile's pinned entry rather than a copy of it. An unreadable pinned
     /// entry cannot be the source of a copy.

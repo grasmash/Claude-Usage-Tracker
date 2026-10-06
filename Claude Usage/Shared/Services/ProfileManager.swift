@@ -371,6 +371,101 @@ class ProfileManager: ObservableObject {
         LoggingService.shared.log("captureActiveMainLogin: saved main login for '\(active.name)'")
     }
 
+    /// The profile an `oauthAccount` belongs to: by stored account identity
+    /// first, then by profile name == email (profiles created before
+    /// oauthAccount capture only have the name).
+    nonisolated static func matchingProfileIndex(in profiles: [Profile], oauthAccountJSON: String) -> Int? {
+        let sync = ClaudeCodeSyncService.shared
+        guard let identity = sync.accountIdentity(fromOAuthAccountJSON: oauthAccountJSON) else { return nil }
+        let email = email(inOAuthAccountJSON: oauthAccountJSON)
+        return profiles.firstIndex { profile in
+            guard profile.provider.descriptor.capabilities.cliAccountSync else { return false }
+            if let stored = sync.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) {
+                return stored == identity
+            }
+            if let email {
+                return profile.name.caseInsensitiveCompare(email) == .orderedSame
+            }
+            return false
+        }
+    }
+
+    nonisolated static func email(inOAuthAccountJSON json: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj["emailAddress"] as? String
+    }
+
+    /// Picks up a login made with `claude-usage-login`, which signs in through
+    /// a dedicated config dir (`ClaudeCodeSyncService.loginImportDirectory`).
+    ///
+    /// Why a separate dir: `/login` in Claude Code's main config dir first logs
+    /// out the account already there, which revokes that account's refresh
+    /// token server-side — so saving accounts by logging in one after another
+    /// in the same place killed each previously saved login. A login in the
+    /// import dir replaces nothing that is in use.
+    ///
+    /// The login becomes the profile's own main login. Its keychain entry is
+    /// then deleted locally (no logout, so nothing is revoked), leaving the
+    /// tracker as the lineage's only holder. If the profile is the active one,
+    /// the login is applied to Claude Code right away.
+    @discardableResult
+    func importPendingLogin() -> Profile? {
+        guard !switchingSemaphore else { return nil }
+        let sync = ClaudeCodeSyncService.shared
+        guard let imported = sync.readImportedLogin() else { return nil }
+
+        guard let index = Self.matchingProfileIndex(in: profiles, oauthAccountJSON: imported.oauthAccount) else {
+            LoggingService.shared.log("importPendingLogin: \(Self.email(inOAuthAccountJSON: imported.oauthAccount) ?? "account") is not a known profile; leaving it in place")
+            return nil
+        }
+
+        var profile = profiles[index]
+        profile.cliCredentialsJSON = imported.credentials
+        profile.oauthAccountJSON = imported.oauthAccount
+        profile.hasOwnMainLogin = true
+        profile.cliAccountSyncedAt = Date()
+        profiles[index] = profile
+        if activeProfile?.id == profile.id { activeProfile = profile }
+        profileStore.saveProfiles(profiles)
+        sync.clearImportedLogin()
+        LoggingService.shared.log("importPendingLogin: saved login for '\(profile.name)'")
+
+        if activeProfile?.id == profile.id {
+            do {
+                try sync.applyProfileCredentials(profile.id)
+                lastProfileSwitchAt = Date()
+            } catch {
+                LoggingService.shared.logError("importPendingLogin: could not apply the new login for the active profile", error: error)
+            }
+        }
+        return profile
+    }
+
+    /// Refreshes idle accounts' saved logins once they expire (see
+    /// `AutoSwitchPolicy.shouldRefreshIdleLogin`), one refresh at a time.
+    private var isRefreshingIdleLogins = false
+
+    func refreshIdleLogins() {
+        guard !switchingSemaphore, !isRefreshingIdleLogins else { return }
+        let due = profiles.filter { AutoSwitchPolicy.shouldRefreshIdleLogin($0, activeId: activeProfile?.id) }
+            .filter { profile in
+                // Already known dead: wait for a new login instead of retrying.
+                !ClaudeCodeSyncService.shared.isLoginDead(for: profile)
+            }
+        guard !due.isEmpty else { return }
+        isRefreshingIdleLogins = true
+        Task {
+            for profile in due {
+                _ = await ClaudeCodeSyncService.shared.ensureFreshMainLogin(for: profile.id)
+            }
+            await MainActor.run {
+                self.reloadStoredCredentialState()
+                self.isRefreshingIdleLogins = false
+            }
+        }
+    }
+
     @discardableResult
     func adoptExternalLoginIfNeeded() -> Profile? {
         guard !switchingSemaphore else { return nil }
@@ -394,24 +489,8 @@ class ProfileManager: ObservableObject {
         let activeIdentity = activeProfile.flatMap { sync.accountIdentity(fromOAuthAccountJSON: $0.oauthAccountJSON) }
         guard systemIdentity != activeIdentity else { return nil }
 
-        // Match by stored account identity first, then by profile name == email
-        // (profiles created before oauthAccount capture only have the name).
-        let systemEmail: String? = {
-            guard let data = systemAccount.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            return obj["emailAddress"] as? String
-        }()
-        guard let index = profiles.firstIndex(where: { profile in
-            guard profile.provider.descriptor.capabilities.cliAccountSync else { return false }
-            if let stored = sync.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) {
-                return stored == systemIdentity
-            }
-            if let email = systemEmail {
-                return profile.name.caseInsensitiveCompare(email) == .orderedSame
-            }
-            return false
-        }) else {
-            LoggingService.shared.log("adoptExternalLogin: keychain account \(systemEmail ?? systemIdentity) is not a known profile; ignoring")
+        guard let index = Self.matchingProfileIndex(in: profiles, oauthAccountJSON: systemAccount) else {
+            LoggingService.shared.log("adoptExternalLogin: keychain account \(Self.email(inOAuthAccountJSON: systemAccount) ?? systemIdentity) is not a known profile; ignoring")
             return nil
         }
 

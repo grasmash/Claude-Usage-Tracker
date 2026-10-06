@@ -37,6 +37,27 @@ final class DeadLoginTrackerTests: XCTestCase {
         XCTAssertFalse(tracker.isDead("rt-new"))
     }
 
+    // MARK: - Surviving restarts
+
+    func testDeadTokensSurviveRestart() throws {
+        let store = FileManager.default.temporaryDirectory.appendingPathComponent("dead-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: store) }
+
+        DeadLoginTracker(storeURL: store).markDead("rt-old")
+
+        XCTAssertTrue(DeadLoginTracker(storeURL: store).isDead("rt-old"))
+    }
+
+    func testStoreNeverHoldsTheTokenItself() throws {
+        let store = FileManager.default.temporaryDirectory.appendingPathComponent("dead-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: store) }
+
+        DeadLoginTracker(storeURL: store).markDead("rt-secret-value")
+
+        let text = try String(contentsOf: store, encoding: .utf8)
+        XCTAssertFalse(text.contains("rt-secret-value"))
+    }
+
     // MARK: - Is a login dead?
 
     func testLoginIsDeadWhenEveryTokenItCouldUseIsDead() {

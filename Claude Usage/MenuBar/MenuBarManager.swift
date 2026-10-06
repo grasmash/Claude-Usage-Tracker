@@ -1139,6 +1139,7 @@ class MenuBarManager: NSObject, ObservableObject {
                     self.checkAutoSwitchIfNeeded(usage: activeUsage, currentProfile: activeProfile)
                 }
                 self.checkAutoSwitchForDeadLogin()
+                self.writeAutoSwitchStatus()
             }
         }
     }
@@ -1186,8 +1187,10 @@ class MenuBarManager: NSObject, ObservableObject {
     func refreshUsage() {
         // Follow a `/login` done in Claude Code itself, so the profile that is
         // really logged in is the one we poll live and switch away from.
+        profileManager.importPendingLogin()
         profileManager.adoptExternalLoginIfNeeded()
         profileManager.captureActiveMainLogin()
+        profileManager.refreshIdleLogins()
 
         // In multi-profile mode, refresh ALL selected profiles
         if profileManager.displayMode == .multi {
@@ -1316,6 +1319,7 @@ class MenuBarManager: NSObject, ObservableObject {
                     self.consecutiveRefreshFailures += 1
                     self.lastRefreshError = appError.message
                     self.checkAutoSwitchForDeadLogin()
+                    self.writeAutoSwitchStatus()
 
                     // Track credential errors specifically
                     if appError.code == .apiUnauthorized || appError.code == .sessionKeyExpired {
@@ -1510,6 +1514,27 @@ class MenuBarManager: NSObject, ObservableObject {
         LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit \(reason) limit, switching to '\(nextProfile.name)'")
 
         performAutoSwitch(from: currentProfile, to: nextProfile)
+    }
+
+    /// Tells the status line whether auto-switch is stuck and which accounts
+    /// need a login, via `~/.claude/.autoswitch-state` (read by the user's
+    /// status line script; KEY=value lines, see `AutoSwitchStatus`).
+    private func writeAutoSwitchStatus() {
+        guard !AppEnvironment.isRunningTests else { return }
+        let status = AutoSwitchStatus.build(
+            profiles: profileManager.profiles,
+            activeId: profileManager.activeProfile?.id,
+            usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(),
+            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+        )
+        let formatter = DateFormatter()
+        let contents = status.stateFileContents { date in
+            // Within a day the time alone is clear; further out, add the weekday.
+            formatter.dateFormat = date.timeIntervalSinceNow < 86400 ? "h:mma" : "EEE h:mma"
+            return formatter.string(from: date)
+        }
+        let url = Constants.ClaudePaths.claudeDirectory.appendingPathComponent(".autoswitch-state")
+        try? contents.write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// Switches away from the active profile when its login is dead: Claude
