@@ -364,7 +364,7 @@ class ProfileManager: ObservableObject {
     /// every cycle: `adoptExternalLoginIfNeeded` only fires when the account
     /// changes, and the usage fetch may never touch CLI credentials.
     func captureActiveMainLogin() {
-        if !switchingSemaphore { ClaudeCodeSyncService.shared.syncCredentialsFileWithKeychain() }
+        if !switchingSemaphore { ClaudeCodeSyncService.shared.signalSessionsIfKeychainLoginChanged() }
         guard !switchingSemaphore, let active = activeProfile,
               active.provider.descriptor.capabilities.cliAccountSync,
               ClaudeCodeSyncService.shared.captureMainLogin(for: active.id) else { return }

@@ -1227,27 +1227,44 @@ class ClaudeCodeSyncService {
 
     // MARK: - Credentials file as a reload signal
 
-    /// True when the credentials file does not hold the keychain's login.
-    func credentialsFileIsOutOfDate(keychainJSON: String, fileJSON: String?) -> Bool {
-        guard let keychainToken = extractRefreshToken(from: keychainJSON) else { return false }
-        return fileJSON.flatMap { extractRefreshToken(from: $0) } != keychainToken
+    /// A digest identifying the login in a keychain payload, or nil when the
+    /// payload is not a full login. Never contains the token.
+    func systemLoginFingerprint(_ keychainJSON: String) -> String? {
+        extractRefreshToken(from: keychainJSON).map { sha256HexPrefix($0, length: 64) }
     }
 
-    /// Brings `~/.claude/.credentials.json` in line with the keychain.
+    /// Bumps the file's modification time, leaving its contents alone. Returns
+    /// false (and creates nothing) when the file does not exist.
+    static func signalCredentialsReload(at fileURL: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        return (try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: fileURL.path)) != nil
+    }
+
+    private var lastSeenSystemLoginFingerprint: String?
+
+    /// Tells open Claude Code sessions to reload their login when the keychain
+    /// login has changed.
     ///
-    /// Open Claude Code sessions cache their login and reload it only when
-    /// this file's modification time changes. The tracker rewrites it on its
-    /// own switches, but a `/login` in one session (or Claude Code rotating
-    /// its tokens) changes the keychain alone — leaving every other session
-    /// on its old account, where it can sit at a limit the tracker cannot see.
-    /// Returns true when the file was rewritten.
+    /// Sessions cache their login and reload it only when the modification
+    /// time of `~/.claude/.credentials.json` changes. The tracker rewrites the
+    /// file on its own switches, but a `/login` in one session (or Claude Code
+    /// rotating its tokens) changes the keychain alone — leaving every other
+    /// session on its old account, where it can sit at a limit the tracker
+    /// cannot see.
+    ///
+    /// Only the modification time is touched: copying the keychain login into
+    /// the file would spread a keychain-protected secret to plaintext on disk
+    /// for no gain, since sessions re-read the keychain once signalled.
+    /// Returns true when a signal was sent.
     @discardableResult
-    func syncCredentialsFileWithKeychain() -> Bool {
-        guard let raw = try? readKeychainCredentials(),
-              raw.data(using: .utf8).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) != nil,
-              credentialsFileIsOutOfDate(keychainJSON: raw, fileJSON: readCredentialsFile()) else { return false }
-        writeCredentialsFile(raw)
-        LoggingService.shared.log("syncCredentialsFileWithKeychain: keychain login changed; rewrote credentials file so open sessions reload")
+    func signalSessionsIfKeychainLoginChanged() -> Bool {
+        guard !AppEnvironment.isRunningTests,
+              let raw = try? readKeychainCredentials(),
+              let fingerprint = systemLoginFingerprint(raw),
+              fingerprint != lastSeenSystemLoginFingerprint else { return false }
+        lastSeenSystemLoginFingerprint = fingerprint
+        guard Self.signalCredentialsReload(at: Constants.ClaudePaths.credentialsFile) else { return false }
+        LoggingService.shared.log("signalSessionsIfKeychainLoginChanged: keychain login changed; touched credentials file so open sessions reload")
         return true
     }
 

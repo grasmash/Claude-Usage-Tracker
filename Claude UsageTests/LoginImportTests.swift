@@ -26,36 +26,55 @@ final class LoginImportTests: XCTestCase {
             in: [other], oauthAccountJSON: #"{"accountUuid":"u-new","emailAddress":"new@x.com"}"#))
     }
 
-    // Open Claude Code sessions reload their login only when
-    // ~/.claude/.credentials.json changes. A /login in one session updates the
-    // keychain alone, so the file must be brought in line or every other
-    // session stays on its old account.
+    // Open Claude Code sessions reload their login only when the modification
+    // time of ~/.claude/.credentials.json changes. A /login in one session
+    // updates the keychain alone, so the tracker must signal the others. It
+    // does so by touching the file — never by copying keychain secrets into it.
 
-    func testCredentialsFileIsRewrittenWhenTheKeychainHoldsAnotherLogin() {
+    func testANewKeychainLoginIsAChange() {
         let sync = ClaudeCodeSyncService.shared
-        XCTAssertTrue(sync.credentialsFileIsOutOfDate(
-            keychainJSON: #"{"claudeAiOauth":{"accessToken":"a2","refreshToken":"new"}}"#,
-            fileJSON: #"{"claudeAiOauth":{"accessToken":"a1","refreshToken":"old"}}"#))
+        let seen = sync.systemLoginFingerprint(#"{"claudeAiOauth":{"accessToken":"a1","refreshToken":"old"}}"#)
+        let now = sync.systemLoginFingerprint(#"{"claudeAiOauth":{"accessToken":"a2","refreshToken":"new"}}"#)
+        XCTAssertNotNil(now)
+        XCTAssertNotEqual(seen, now)
     }
 
-    func testCredentialsFileIsLeftAloneWhenItMatchesTheKeychain() {
+    func testTheSameKeychainLoginIsNotAChange() {
         let sync = ClaudeCodeSyncService.shared
         let json = #"{"claudeAiOauth":{"accessToken":"a","refreshToken":"same"}}"#
-        XCTAssertFalse(sync.credentialsFileIsOutOfDate(keychainJSON: json, fileJSON: json))
+        XCTAssertEqual(sync.systemLoginFingerprint(json), sync.systemLoginFingerprint(json))
     }
 
-    func testMissingCredentialsFileIsOutOfDate() {
+    func testFingerprintDoesNotContainTheToken() {
         let sync = ClaudeCodeSyncService.shared
-        XCTAssertTrue(sync.credentialsFileIsOutOfDate(
-            keychainJSON: #"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#, fileJSON: nil))
+        let fingerprint = sync.systemLoginFingerprint(#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt-secret-value"}}"#)
+        XCTAssertFalse(fingerprint?.contains("rt-secret-value") ?? true)
     }
 
-    func testKeychainWithoutARefreshTokenNeverOverwritesTheFile() {
-        // A truncated or regex-recovered keychain payload is not a full login.
-        let sync = ClaudeCodeSyncService.shared
-        XCTAssertFalse(sync.credentialsFileIsOutOfDate(
-            keychainJSON: #"{"claudeAiOauth":{"accessToken":"a"}}"#,
-            fileJSON: #"{"claudeAiOauth":{"accessToken":"a1","refreshToken":"old"}}"#))
+    func testKeychainPayloadWithoutARefreshTokenHasNoFingerprint() {
+        // A truncated or regex-recovered payload is not a full login; ignore it.
+        XCTAssertNil(ClaudeCodeSyncService.shared.systemLoginFingerprint(#"{"claudeAiOauth":{"accessToken":"a"}}"#))
+    }
+
+    func testSignallingTouchesTheFileWithoutChangingItsContents() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("creds-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try "original".write(to: file, atomically: true, encoding: .utf8)
+        let old = Date(timeIntervalSinceNow: -3600)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: file.path)
+
+        XCTAssertTrue(ClaudeCodeSyncService.signalCredentialsReload(at: file))
+
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "original")
+        let modified = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date)
+        XCTAssertGreaterThan(modified.timeIntervalSince(old), 3000)
+    }
+
+    func testSignallingNeverCreatesTheFile() {
+        // No file means credentials live only in the keychain; keep it that way.
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("creds-\(UUID().uuidString).json")
+        XCTAssertFalse(ClaudeCodeSyncService.signalCredentialsReload(at: file))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
     }
 
     func testImportDirectoryKeychainEntryFollowsClaudeCodesNaming() {
