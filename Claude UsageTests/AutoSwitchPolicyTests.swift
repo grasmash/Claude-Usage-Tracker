@@ -226,6 +226,27 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(copy, activeId: UUID()))
     }
 
+    // The active login belongs to Claude Code. Refreshing it at the moment it
+    // expires races Claude Code's own refresh of the same single-use token;
+    // the server treats that as reuse and kills the login for both.
+
+    func testActiveLoginIsNotRefreshedRightAtExpiry() {
+        let now = Date()
+        XCTAssertFalse(AutoSwitchPolicy.mayRefreshActiveLogin(expiresAt: now.addingTimeInterval(-5), now: now))
+    }
+
+    func testActiveLoginIsNotRefreshedWhileValid() {
+        let now = Date()
+        XCTAssertFalse(AutoSwitchPolicy.mayRefreshActiveLogin(expiresAt: now.addingTimeInterval(600), now: now))
+    }
+
+    func testActiveLoginLeftExpiredLongEnoughMayBeRefreshed() {
+        // No session has needed it for a while, so none is refreshing it.
+        let now = Date()
+        XCTAssertTrue(AutoSwitchPolicy.mayRefreshActiveLogin(
+            expiresAt: now.addingTimeInterval(-(AutoSwitchPolicy.activeLoginRefreshGrace + 1)), now: now))
+    }
+
     func testMainLoginIsItsOwnWhenItsTokenDiffersFromThePinnedEntry() {
         XCTAssertTrue(AutoSwitchPolicy.isOwnMainLogin(mainRefreshToken: "main", pinnedRefreshToken: "pinned"))
     }

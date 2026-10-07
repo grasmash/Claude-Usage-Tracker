@@ -34,6 +34,24 @@ enum AutoSwitchPolicy {
         return profile.customKeychainServiceName == nil || profile.hasOwnMainLogin
     }
 
+    /// How long the active login must have been expired before the tracker
+    /// refreshes it itself.
+    static let activeLoginRefreshGrace: TimeInterval = 15 * 60
+
+    /// True when the tracker may refresh the ACTIVE login (the one in Claude
+    /// Code's keychain entry).
+    ///
+    /// Claude Code refreshes that login itself the moment a session needs it
+    /// after expiry. A tracker refresh in that same window uses the same
+    /// single-use refresh token; the server treats the second use as reuse and
+    /// rejects the login for everyone ("Login expired"). Observed 2026-10-06/07:
+    /// matt.grasmick and goose each died seconds after their access token
+    /// expired while active. Once the login has sat expired for the grace
+    /// period, no session is refreshing it and the tracker may.
+    static func mayRefreshActiveLogin(expiresAt: Date, now: Date = Date()) -> Bool {
+        now.timeIntervalSince(expiresAt) >= activeLoginRefreshGrace
+    }
+
     /// True when an idle account's saved main login has expired and should be
     /// refreshed now. Doing it ahead of time keeps the login alive and, if the
     /// server rejects it, reveals the dead login before auto-switch needs it.

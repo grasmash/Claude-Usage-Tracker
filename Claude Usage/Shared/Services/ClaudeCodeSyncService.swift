@@ -1306,6 +1306,9 @@ class ClaudeCodeSyncService {
     /// nil if nothing was refreshed. A rejected refresh token is remembered as
     /// dead and not retried.
     private func refreshIdleSystemLogin(_ systemJSON: String, profileName: String) async -> String? {
+        // Leave a freshly expired login to Claude Code; see mayRefreshActiveLogin.
+        guard let expiry = extractTokenExpiry(from: systemJSON),
+              AutoSwitchPolicy.mayRefreshActiveLogin(expiresAt: expiry) else { return nil }
         guard let refreshToken = extractRefreshToken(from: systemJSON), !deadLogins.isDead(refreshToken) else {
             return nil
         }
