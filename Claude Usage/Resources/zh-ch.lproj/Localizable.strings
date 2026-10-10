@@ -509,6 +509,9 @@
 "profiles.rename" = "重命名配置文件";
 "profiles.activate" = "激活配置文件";
 "profiles.delete" = "删除配置文件";
+"profiles.paused_badge" = "已暂停";
+"profiles.pause" = "暂停配置文件 — 自动切换时跳过";
+"profiles.resume" = "恢复配置文件";
 "profiles.delete_title" = "删除配置文件";
 "profiles.delete_confirm" = "您确定要删除 \"%@\" 吗？这将移除所有相关的凭据和设置。";
 "profiles.create_title" = "创建新配置文件";

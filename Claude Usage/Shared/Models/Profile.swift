@@ -82,6 +82,11 @@ struct Profile: Codable, Identifiable, Equatable {
     // MARK: - Display Configuration
     var isSelectedForDisplay: Bool  // For multi-profile menu bar mode
 
+    /// Set aside by the user (e.g. a lapsed subscription): never an auto-switch
+    /// target, its saved login is not refreshed, and the status line does not
+    /// report it as needing a login.
+    var isPaused: Bool = false
+
     // MARK: - Metadata
     var createdAt: Date
     var lastUsedAt: Date
@@ -166,6 +171,7 @@ struct Profile: Codable, Identifiable, Equatable {
         case refreshInterval, autoStartSessionEnabled, checkOverageLimitEnabled
         case notificationSettings
         case isSelectedForDisplay
+        case isPaused
         case createdAt, lastUsedAt
     }
 
@@ -205,6 +211,7 @@ struct Profile: Codable, Identifiable, Equatable {
         checkOverageLimitEnabled = try c.decodeIfPresent(Bool.self, forKey: .checkOverageLimitEnabled) ?? true
         notificationSettings = try c.decodeIfPresent(NotificationSettings.self, forKey: .notificationSettings) ?? NotificationSettings()
         isSelectedForDisplay = try c.decodeIfPresent(Bool.self, forKey: .isSelectedForDisplay) ?? true
+        isPaused = (try? c.decodeIfPresent(Bool.self, forKey: .isPaused)) ?? false
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         lastUsedAt = try c.decodeIfPresent(Date.self, forKey: .lastUsedAt) ?? Date()
     }
@@ -239,6 +246,7 @@ struct Profile: Codable, Identifiable, Equatable {
         try c.encode(checkOverageLimitEnabled, forKey: .checkOverageLimitEnabled)
         try c.encode(notificationSettings, forKey: .notificationSettings)
         try c.encode(isSelectedForDisplay, forKey: .isSelectedForDisplay)
+        try c.encode(isPaused, forKey: .isPaused)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(lastUsedAt, forKey: .lastUsedAt)
     }

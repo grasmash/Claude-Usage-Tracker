@@ -383,6 +383,16 @@ struct ProfileRow: View {
                                 .background(Color.accentColor)
                                 .cornerRadius(4)
                         }
+
+                        if profile.isPaused {
+                            Text("profiles.paused_badge".localized)
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary)
+                                .cornerRadius(4)
+                        }
                     }
                 }
 
@@ -420,6 +430,16 @@ struct ProfileRow: View {
                         .buttonStyle(.plain)
                         .help("profiles.activate".localized)
                     }
+
+                    // Pause / Resume Button
+                    Button(action: {
+                        profileManager.updatePaused(!profile.isPaused, for: profile.id)
+                    }) {
+                        Image(systemName: profile.isPaused ? "play.circle" : "pause.circle")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .help((profile.isPaused ? "profiles.resume" : "profiles.pause").localized)
 
                     // Delete Button (if not the last profile)
                     if profileManager.profiles.count > 1 {

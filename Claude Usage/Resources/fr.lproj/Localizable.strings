@@ -508,6 +508,9 @@
 "profiles.rename" = "Renommer le profil";
 "profiles.activate" = "Activer le profil";
 "profiles.delete" = "Supprimer le profil";
+"profiles.paused_badge" = "En pause";
+"profiles.pause" = "Mettre le profil en pause — l’ignorer lors du changement automatique";
+"profiles.resume" = "Reprendre le profil";
 "profiles.delete_title" = "Supprimer le Profil";
 "profiles.delete_confirm" = "Êtes-vous sûr de vouloir supprimer \"%@\" ? Cela supprimera tous les identifiants et paramètres associés.";
 "profiles.create_title" = "Créer un Nouveau Profil";

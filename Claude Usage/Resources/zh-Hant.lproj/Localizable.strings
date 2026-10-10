@@ -509,6 +509,9 @@
 "profiles.rename" = "重新命名設定檔";
 "profiles.activate" = "啟用設定檔";
 "profiles.delete" = "刪除設定檔";
+"profiles.paused_badge" = "已暫停";
+"profiles.pause" = "暫停設定檔 — 自動切換時略過";
+"profiles.resume" = "恢復設定檔";
 "profiles.delete_title" = "刪除設定檔";
 "profiles.delete_confirm" = "您確定要刪除 \"%@\" 嗎？這將移除所有相關的憑證和設定。";
 "profiles.create_title" = "建立新設定檔";

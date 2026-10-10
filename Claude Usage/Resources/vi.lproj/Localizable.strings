@@ -508,6 +508,9 @@
 "profiles.rename" = "Đổi tên hồ sơ";
 "profiles.activate" = "Kích hoạt hồ sơ";
 "profiles.delete" = "Xoá hồ sơ";
+"profiles.paused_badge" = "Đã tạm dừng";
+"profiles.pause" = "Tạm dừng hồ sơ — bỏ qua khi tự động chuyển";
+"profiles.resume" = "Tiếp tục hồ sơ";
 "profiles.delete_title" = "Xoá hồ sơ";
 "profiles.delete_confirm" = "Bạn có chắc chắn muốn xoá \"%@\" không? Thao tác này sẽ xoá toàn bộ thông tin đăng nhập và cài đặt liên quan.";
 "profiles.create_title" = "Tạo hồ sơ mới";

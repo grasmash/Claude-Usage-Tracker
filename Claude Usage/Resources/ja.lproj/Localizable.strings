@@ -530,6 +530,9 @@
 "profiles.rename" = "プロファイル名を変更";
 "profiles.activate" = "プロファイルを有効化";
 "profiles.delete" = "プロファイルを削除";
+"profiles.paused_badge" = "一時停止中";
+"profiles.pause" = "プロファイルを一時停止 — 自動切り替えでスキップ";
+"profiles.resume" = "プロファイルを再開";
 "profiles.delete_title" = "プロファイルを削除";
 "profiles.delete_confirm" = "\"%@\"を削除してもよろしいですか？これにより、関連するすべての認証情報と設定が削除されます。";
 "profiles.create_title" = "新しいプロファイルを作成";

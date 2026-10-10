@@ -49,6 +49,17 @@ final class ProfileProviderTests: XCTestCase {
         XCTAssertEqual(decoded.provider, .codex)
     }
 
+    func testProfileWithoutPausedFieldIsNotPaused() throws {
+        XCTAssertFalse(try decodeProfile(legacyProfileJSON()).isPaused)
+    }
+
+    func testPausedRoundTrips() throws {
+        var original = Profile(name: "Lapsed")
+        original.isPaused = true
+        let decoded = try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(original))
+        XCTAssertTrue(decoded.isPaused)
+    }
+
     // MARK: - Secret exclusion
 
     func testCodexCredentialsExcludedFromPlistEncoding() throws {

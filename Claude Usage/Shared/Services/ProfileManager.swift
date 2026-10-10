@@ -688,6 +688,19 @@ class ProfileManager: ObservableObject {
         }
     }
 
+    /// Pauses or resumes a profile (see `Profile.isPaused`)
+    func updatePaused(_ paused: Bool, for profileId: UUID) {
+        if let index = profiles.firstIndex(where: { $0.id == profileId }) {
+            profiles[index].isPaused = paused
+
+            if activeProfile?.id == profileId {
+                activeProfile = profiles[index]
+            }
+
+            profileStore.saveProfiles(profiles)
+        }
+    }
+
     /// Updates check overage limit setting for a profile
     func updateCheckOverageLimitEnabled(_ enabled: Bool, for profileId: UUID) {
         if let index = profiles.firstIndex(where: { $0.id == profileId }) {

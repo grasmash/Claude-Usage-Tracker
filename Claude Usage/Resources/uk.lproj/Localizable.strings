@@ -508,6 +508,9 @@
 "profiles.rename" = "Перейменувати профіль";
 "profiles.activate" = "Активувати профіль";
 "profiles.delete" = "Видалити профіль";
+"profiles.paused_badge" = "Призупинено";
+"profiles.pause" = "Призупинити профіль — пропускати під час автоперемикання";
+"profiles.resume" = "Відновити профіль";
 "profiles.delete_title" = "Видалити профіль";
 "profiles.delete_confirm" = "Ви впевнені, що хочете видалити «%@»? Це видалить всі пов'язані облікові дані та налаштування.";
 "profiles.create_title" = "Створити новий профіль";

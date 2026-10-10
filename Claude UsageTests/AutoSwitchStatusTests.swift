@@ -53,6 +53,23 @@ final class AutoSwitchStatusTests: XCTestCase {
         XCTAssertEqual(status.needsLogin, ["p"])
     }
 
+    func testPausedAccountIsNotListedAsNeedingLogin() {
+        let active = makeProfile("a@x.com", session: 0, weekly: 0)
+        var lapsed = makeProfile("littlewing@x.com", session: 0, weekly: 0)
+        lapsed.isPaused = true
+        let status = AutoSwitchStatus.build(profiles: [active, lapsed], activeId: active.id, now: now,
+                                            isLoginDead: { $0.id == lapsed.id })
+        XCTAssertEqual(status.needsLogin, [])
+    }
+
+    func testPausedAccountIsNotTheNextFree() {
+        let active = makeProfile("a@x.com", session: 100, weekly: 40, sessionResetIn: 7200)
+        var paused = makeProfile("p@x.com", session: 100, weekly: 10, sessionResetIn: 60)
+        paused.isPaused = true
+        let status = AutoSwitchStatus.build(profiles: [active, paused], activeId: active.id, now: now)
+        XCTAssertEqual(status.nextFree?.name, "a")
+    }
+
     func testSoonestFreeIsTheEarliestResetAmongUsableLogins() {
         let active = makeProfile("a@x.com", session: 100, weekly: 40, sessionResetIn: 7200)
         let soon = makeProfile("soon@x.com", session: 100, weekly: 10, sessionResetIn: 600)

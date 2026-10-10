@@ -18,7 +18,11 @@ struct AutoSwitchStatus {
         now: Date = Date(),
         isLoginDead: (Profile) -> Bool = { _ in false }
     ) -> AutoSwitchStatus {
-        let switchable = profiles.filter { $0.provider.descriptor.capabilities.cliAccountSync }
+        // Paused accounts are set aside on purpose; they are neither
+        // candidates nor something to nag about. The active one still counts.
+        let switchable = profiles.filter {
+            $0.provider.descriptor.capabilities.cliAccountSync && (!$0.isPaused || $0.id == activeId)
+        }
 
         let needsLogin = switchable
             .filter { isLoginDead($0) || !AutoSwitchPolicy.canBeApplied($0) }

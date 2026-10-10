@@ -508,6 +508,9 @@
 "profiles.rename" = "Profili yeniden adlandır";
 "profiles.activate" = "Profili etkinleştir";
 "profiles.delete" = "Profili sil";
+"profiles.paused_badge" = "Duraklatıldı";
+"profiles.pause" = "Profili duraklat — otomatik geçişte atla";
+"profiles.resume" = "Profili sürdür";
 "profiles.delete_title" = "Profili Sil";
 "profiles.delete_confirm" = "\"%@\" profilini silmek istediğinizden emin misiniz? Bu işlem ilişkili tüm kimlik bilgilerini ve ayarları kaldıracaktır.";
 "profiles.create_title" = "Yeni Profil Oluştur";

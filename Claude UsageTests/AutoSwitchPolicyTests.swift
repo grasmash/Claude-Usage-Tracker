@@ -193,6 +193,27 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(AutoSwitchPolicy.canBeApplied(pinned))
     }
 
+    // A paused account (e.g. a lapsed subscription) is never switched to and
+    // its saved login is left alone until it is resumed.
+
+    func testPausedProfileIsNotASwitchTarget() {
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 50))
+        var paused = makeProfile("b", usage: makeUsage(session: 0, weekly: 0))
+        paused.isPaused = true
+        let healthy = makeProfile("c", usage: makeUsage(session: 0, weekly: 68))
+
+        let next = AutoSwitchPolicy.nextAvailableProfile(in: [current, paused, healthy], after: current)
+        XCTAssertEqual(next?.id, healthy.id)
+    }
+
+    func testPausedProfilesSavedLoginIsNotRefreshed() {
+        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
+        var idle = Profile(name: "i", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
+                           customKeychainServiceName: "svc", hasOwnMainLogin: true)
+        idle.isPaused = true
+        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(idle, activeId: UUID()))
+    }
+
     // Idle accounts' saved logins are refreshed as they expire, so a dead one
     // shows up before auto-switch needs it.
 

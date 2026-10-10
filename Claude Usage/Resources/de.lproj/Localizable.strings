@@ -530,6 +530,9 @@
 "profiles.rename" = "Profil umbenennen";
 "profiles.activate" = "Profil aktivieren";
 "profiles.delete" = "Profil löschen";
+"profiles.paused_badge" = "Pausiert";
+"profiles.pause" = "Profil pausieren — beim automatischen Wechsel überspringen";
+"profiles.resume" = "Profil fortsetzen";
 "profiles.delete_title" = "Profil Löschen";
 "profiles.delete_confirm" = "Möchten Sie \"%@\" wirklich löschen? Dies entfernt alle zugehörigen Anmeldedaten und Einstellungen.";
 "profiles.create_title" = "Neues Profil Erstellen";

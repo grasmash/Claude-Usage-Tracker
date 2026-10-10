@@ -115,6 +115,9 @@
 "profiles.rename" = "프로필 이름 변경";
 "profiles.activate" = "프로필 활성화";
 "profiles.delete" = "프로필 삭제";
+"profiles.paused_badge" = "일시 중지됨";
+"profiles.pause" = "프로필 일시 중지 — 자동 전환에서 건너뛰기";
+"profiles.resume" = "프로필 재개";
 "profiles.delete_title" = "프로필 삭제";
 "profiles.delete_confirm" = "\"%@\"을(를) 삭제하시겠습니까? 관련된 모든 인증 정보와 설정이 제거됩니다.";
 "profiles.create_title" = "새 프로필 생성";

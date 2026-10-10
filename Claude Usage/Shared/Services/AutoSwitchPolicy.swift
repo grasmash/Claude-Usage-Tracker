@@ -61,6 +61,7 @@ enum AutoSwitchPolicy {
     /// Claude Code, and an unpinned profile's lineage may be owned elsewhere.
     static func shouldRefreshIdleLogin(_ profile: Profile, activeId: UUID?, now: Date = Date()) -> Bool {
         guard profile.id != activeId,
+              !profile.isPaused,
               profile.customKeychainServiceName != nil,
               profile.hasOwnMainLogin,
               let json = profile.cliCredentialsJSON,
@@ -84,7 +85,7 @@ enum AutoSwitchPolicy {
     /// Profiles with no usage data, or data older than `maxUsageAge`, are
     /// skipped: the tracker cannot currently see them, so there is no evidence
     /// they have capacity (see `maxUsageAge`). Profiles `isLoginDead` reports
-    /// as logged out are skipped too.
+    /// as logged out, and paused profiles, are skipped too.
     static func nextAvailableProfile(
         in profiles: [Profile],
         after current: Profile,
@@ -100,7 +101,7 @@ enum AutoSwitchPolicy {
         for offset in 1..<count {
             let candidate = profiles[(currentIndex + offset) % count]
 
-            guard canBeApplied(candidate) else { continue }
+            guard !candidate.isPaused, canBeApplied(candidate) else { continue }
 
             // A rejected refresh token means the account is logged out;
             // applying it would hand Claude Code a login that cannot work.

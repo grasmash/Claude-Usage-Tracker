@@ -508,6 +508,9 @@
 "profiles.rename" = "Rename profile";
 "profiles.activate" = "Activate profile";
 "profiles.delete" = "Delete profile";
+"profiles.paused_badge" = "Paused";
+"profiles.pause" = "Pause profile — skip it in auto-switch";
+"profiles.resume" = "Resume profile";
 "profiles.delete_title" = "Delete Profile";
 "profiles.delete_confirm" = "Are you sure you want to delete \"%@\"? This will remove all associated credentials and settings.";
 "profiles.create_title" = "Create New Profile";

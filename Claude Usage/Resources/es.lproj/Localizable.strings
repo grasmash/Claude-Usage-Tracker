@@ -511,6 +511,9 @@
 "profiles.rename" = "Renombrar perfil";
 "profiles.activate" = "Activar perfil";
 "profiles.delete" = "Eliminar perfil";
+"profiles.paused_badge" = "En pausa";
+"profiles.pause" = "Pausar perfil — omitirlo en el cambio automático";
+"profiles.resume" = "Reanudar perfil";
 "profiles.delete_title" = "Eliminar Perfil";
 "profiles.delete_confirm" = "¿Estás seguro de que quieres eliminar \"%@\"? Esto eliminará todas las credenciales y configuraciones asociadas.";
 "profiles.create_title" = "Crear Nuevo Perfil";
