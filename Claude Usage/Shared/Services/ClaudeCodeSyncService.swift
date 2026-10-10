@@ -776,7 +776,7 @@ class ClaudeCodeSyncService {
 
         // Capture current oauthAccount from .claude.json (if present) so we can
         // restore it when this profile is re-activated. See issue #175.
-        let capturedOAuthAccount = readOAuthAccount()
+        let capturedOAuthAccount = loginOAuthAccount(credentials: jsonData, configOAuthAccount: readOAuthAccount())
 
         // Save to profile directly
         var profiles = ProfileStore.shared.loadProfiles()
@@ -1193,7 +1193,7 @@ class ClaudeCodeSyncService {
 
     /// True when the system (Claude Code) credentials are for the same account as `profile`.
     private func systemCredentials(_ systemJSON: String, belongTo profile: Profile) -> Bool {
-        let systemIdentity = accountIdentity(fromOAuthAccountJSON: readOAuthAccount())
+        let systemIdentity = loginAccountIdentity(credentials: systemJSON, configOAuthAccount: readOAuthAccount())
         let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON)
         return (systemIdentity != nil && systemIdentity == profileIdentity)
             || extractRefreshToken(from: systemJSON) == profile.cliCredentialsJSON.flatMap(extractRefreshToken)
@@ -1266,6 +1266,102 @@ class ClaudeCodeSyncService {
         guard Self.signalCredentialsReload(at: Constants.ClaudePaths.credentialsFile) else { return false }
         LoggingService.shared.log("signalSessionsIfKeychainLoginChanged: keychain login changed; touched credentials file so open sessions reload")
         return true
+    }
+
+    // MARK: - Whose login is in the keychain
+
+    /// The account a keychain login belongs to, asked of the OAuth server with
+    /// the login's access token. Nil when it could not be found out.
+    /// Replaceable in tests.
+    var fetchLoginAccountUuid: (_ accessToken: String) async -> String? = { accessToken in
+        guard !AppEnvironment.isRunningTests,
+              let url = URL(string: "https://api.anthropic.com/api/oauth/profile") else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.timeoutInterval = 15
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = root["account"] as? [String: Any],
+              let uuid = account["uuid"] as? String, !uuid.isEmpty else { return nil }
+        return uuid
+    }
+
+    private enum LoginAccount {
+        case resolving
+        case resolved(String)
+        case unresolvable
+    }
+
+    /// Keyed by `systemLoginFingerprint`, so a login is looked up once.
+    private var loginAccounts: [String: LoginAccount] = [:]
+    private let loginAccountsLock = NSLock()
+
+    /// The account identity (`accountUuid`) of the login in `credentials`.
+    ///
+    /// `oauthAccount` in `.claude.json` cannot answer this: every running
+    /// Claude Code session rewrites that file from its own copy, so after a
+    /// `/login` it can go on naming the previous account while the keychain
+    /// holds the new one. Trusting it kept the tracker (and the status line)
+    /// on an account Claude Code was no longer using.
+    ///
+    /// Until the login has been looked up this returns nil, so callers treat
+    /// the account as unknown rather than guess. If it cannot be looked up
+    /// (offline, a token without a refresh token) the config's account is used.
+    func loginAccountIdentity(credentials: String, configOAuthAccount: String?) -> String? {
+        guard let fingerprint = systemLoginFingerprint(credentials) else {
+            return accountIdentity(fromOAuthAccountJSON: configOAuthAccount)
+        }
+        loginAccountsLock.lock()
+        let known = loginAccounts[fingerprint]
+        loginAccountsLock.unlock()
+
+        switch known {
+        case .resolved(let uuid):
+            return uuid
+        case .unresolvable:
+            return accountIdentity(fromOAuthAccountJSON: configOAuthAccount)
+        case .resolving:
+            return nil
+        case nil:
+            Task { await resolveLoginAccount(credentials: credentials) }
+            return nil
+        }
+    }
+
+    /// `configOAuthAccount` when it describes the login in `credentials`,
+    /// otherwise nil — so another account's details are never stored with
+    /// this login.
+    func loginOAuthAccount(credentials: String, configOAuthAccount: String?) -> String? {
+        guard let config = configOAuthAccount,
+              let identity = loginAccountIdentity(credentials: credentials, configOAuthAccount: config),
+              identity == accountIdentity(fromOAuthAccountJSON: config) else { return nil }
+        return config
+    }
+
+    /// Looks up which account the login in `credentials` belongs to.
+    func resolveLoginAccount(credentials: String) async {
+        guard let fingerprint = systemLoginFingerprint(credentials) else { return }
+        loginAccountsLock.lock()
+        if case .resolved = loginAccounts[fingerprint] {
+            loginAccountsLock.unlock()
+            return
+        }
+        loginAccounts[fingerprint] = .resolving
+        loginAccountsLock.unlock()
+
+        var uuid: String?
+        if let accessToken = extractAccessToken(from: credentials) {
+            uuid = await fetchLoginAccountUuid(accessToken)
+        }
+
+        loginAccountsLock.lock()
+        loginAccounts[fingerprint] = uuid.map(LoginAccount.resolved) ?? .unresolvable
+        loginAccountsLock.unlock()
+        if uuid == nil {
+            LoggingService.shared.log("resolveLoginAccount: could not look up the keychain login's account; using .claude.json")
+        }
     }
 
     // MARK: - Login import (claude-usage-login)
@@ -1468,7 +1564,7 @@ class ClaudeCodeSyncService {
         // consumed refresh token and every later refresh fails with invalid_grant.
         var profiles = ProfileStore.shared.loadProfiles()
         if let profile = profiles.first(where: { $0.id == profileId }) {
-            let systemIdentity = accountIdentity(fromOAuthAccountJSON: readOAuthAccount())
+            let systemIdentity = loginAccountIdentity(credentials: freshJSON, configOAuthAccount: readOAuthAccount())
             let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON)
             if let sys = systemIdentity, let stored = profileIdentity {
                 if sys != stored {
@@ -1499,7 +1595,7 @@ class ClaudeCodeSyncService {
         // Capture latest oauthAccount too, so if the user logged in with a
         // different account since the last sync we keep the profile's
         // `.claude.json` identity in sync with its keychain credentials.
-        let freshOAuthAccount = readOAuthAccount()
+        let freshOAuthAccount = loginOAuthAccount(credentials: freshJSON, configOAuthAccount: readOAuthAccount())
 
         // Update profile's stored credentials with fresh ones (profiles already loaded above)
         guard let index = profiles.firstIndex(where: { $0.id == profileId }) else {

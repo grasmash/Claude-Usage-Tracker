@@ -481,26 +481,30 @@ class ProfileManager: ObservableObject {
             return nil
         }
 
+        // Who the keychain login belongs to comes from the login itself; the
+        // `oauthAccount` in .claude.json can be a stale copy another session
+        // wrote back, and is only used when it matches.
         let sync = ClaudeCodeSyncService.shared
-        guard let systemAccount = sync.readOAuthAccount(),
-              let systemIdentity = sync.accountIdentity(fromOAuthAccountJSON: systemAccount) else {
+        guard let systemJSON = try? sync.readSystemCredentials() else { return nil }
+        let configAccount = sync.readOAuthAccount()
+        guard let systemIdentity = sync.loginAccountIdentity(credentials: systemJSON, configOAuthAccount: configAccount) else {
             return nil
         }
+        let systemAccount = sync.loginOAuthAccount(credentials: systemJSON, configOAuthAccount: configAccount)
 
         let activeIdentity = activeProfile.flatMap { sync.accountIdentity(fromOAuthAccountJSON: $0.oauthAccountJSON) }
         guard systemIdentity != activeIdentity else { return nil }
 
-        guard let index = Self.matchingProfileIndex(in: profiles, oauthAccountJSON: systemAccount) else {
-            LoggingService.shared.log("adoptExternalLogin: keychain account \(Self.email(inOAuthAccountJSON: systemAccount) ?? systemIdentity) is not a known profile; ignoring")
+        let accountForMatching = systemAccount ?? #"{"accountUuid":"\#(systemIdentity)"}"#
+        guard let index = Self.matchingProfileIndex(in: profiles, oauthAccountJSON: accountForMatching) else {
+            LoggingService.shared.log("adoptExternalLogin: keychain account \(Self.email(inOAuthAccountJSON: accountForMatching) ?? systemIdentity) is not a known profile; ignoring")
             return nil
         }
-
-        guard let systemJSON = try? sync.readSystemCredentials() else { return nil }
 
         var adopted = profiles[index]
         adopted.cliCredentialsJSON = systemJSON
         adopted.hasOwnMainLogin = sync.isOwnMainLogin(systemJSON, for: adopted)
-        adopted.oauthAccountJSON = systemAccount
+        adopted.oauthAccountJSON = systemAccount ?? adopted.oauthAccountJSON
         adopted.cliAccountSyncedAt = Date()
         adopted.lastUsedAt = Date()
         profiles[index] = adopted
