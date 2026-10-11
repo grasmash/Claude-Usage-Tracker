@@ -988,7 +988,7 @@
 "notification.no_fable_headroom.stayed" = "%@ hit its Fable limit and no account has Fable left, so the sessions stay where they are. Claude Code does not fall back to Opus on its own: run /model opus in each session.";
 "notification.model_fallback.applied" = "No Fable headroom on any account; Claude Code's default model is set to Opus. Running sessions: /model opus.";
 "notification.model_fallback.applied_moved" = "No Fable headroom on any account; Claude Code moved to %@ and its default model is set to Opus. Running sessions: /model opus.";
-"notification.model_fallback.failed" = "No Fable headroom on any account, and Claude Code's default model could not be set to Opus (%@). Run /model opus in each session.";
+"notification.model_fallback.failed" = "No Fable headroom on any account, and Claude Code's default model was not changed: %@. Run /model opus in each session.";
 "notification.model_fallback.restored.title" = "Fable available again";
 "notification.model_fallback.restored" = "An account has Fable headroom again; Claude Code's default model is restored.";
 "notification.switch_applied_later.title" = "Claude Code switched to %@";

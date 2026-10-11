@@ -149,6 +149,29 @@ enum AutoSwitchPolicy {
         }
     }
 
+    /// What to do about an active Opus fallback.
+    enum FableRestoreAction: Equatable {
+        /// The active account (the shared login) can run Fable: restore.
+        case restore
+        /// Another account can run Fable but the active one cannot: switch the
+        /// shared login there first, restore after. Restoring now would put
+        /// Claude Code back on Fable on a Fable-spent account.
+        case switchFirst
+        /// No account can run Fable yet.
+        case wait
+    }
+
+    static func fableRestoreAction(
+        profiles: [Profile], activeId: UUID?, now: Date = Date(), isLoginDead: (Profile) -> Bool = { _ in false }
+    ) -> FableRestoreAction {
+        if let active = profiles.first(where: { $0.id == activeId }),
+           anyProfileHasFableHeadroom([active], now: now, isLoginDead: isLoginDead) {
+            return .restore
+        }
+        let others = profiles.filter { $0.id != activeId }
+        return anyProfileHasFableHeadroom(others, now: now, isLoginDead: isLoginDead) ? .switchFirst : .wait
+    }
+
     // MARK: - Claude Code model selection
 
     /// True when a Claude Code model setting (alias like `fable`, or a full id
@@ -242,5 +265,59 @@ enum AutoSwitchPolicy {
             return model
         }
         return nil
+    }
+}
+
+/// Decides, each refresh tick, whether the active profile's limit calls for a
+/// switch. While the active profile stays spent and no target exists, the
+/// target search re-runs EVERY tick, so another account freeing up (its window
+/// resetting) is picked up on the next tick. 2026-10-11 6:05 PM: the app showed
+/// "no account free · next: madmatter23 6:05PM" and never switched, because a
+/// spent profile was latched until its OWN limits cleared. The user is told
+/// "no account free" once per episode, not every tick; a switch fires once.
+struct AutoSwitchDecider {
+    enum Decision: Equatable {
+        case stay
+        case switchTo(Profile, withoutFable: Bool)
+        case noTarget(notify: Bool)
+        case noFableHeadroom(notify: Bool)
+    }
+
+    /// Profiles already switched away from in this episode (switch in flight).
+    private(set) var switched: Set<UUID> = []
+    /// Profiles already reported as stuck in this episode.
+    private(set) var notifiedStuck: Set<UUID> = []
+
+    mutating func decide(
+        current: Profile, profiles: [Profile], usingFable: Bool, now: Date = Date(),
+        isLoginDead: (Profile) -> Bool = { _ in false }
+    ) -> Decision {
+        guard let usage = current.claudeUsage, usage.isLimitReached(usingFable: usingFable) else {
+            reset(current.id)   // a window reset ends the episode
+            return .stay
+        }
+        guard !switched.contains(current.id) else { return .stay }
+
+        switch AutoSwitchPolicy.switchTarget(
+            in: profiles, after: current, usingFable: usingFable, blockedBeyondFable: usage.isLimitReached,
+            now: now, isLoginDead: isLoginDead
+        ) {
+        case .profile(let p):
+            switched.insert(current.id); notifiedStuck.remove(current.id)
+            return .switchTo(p, withoutFable: false)
+        case .profileWithoutFable(let p):
+            switched.insert(current.id); notifiedStuck.remove(current.id)
+            return .switchTo(p, withoutFable: true)
+        case .noFableHeadroom:
+            return .noFableHeadroom(notify: notifiedStuck.insert(current.id).inserted)
+        case .none:
+            return .noTarget(notify: notifiedStuck.insert(current.id).inserted)
+        }
+    }
+
+    /// Forgets a profile's episode (its limits cleared, or a re-arm).
+    mutating func reset(_ id: UUID) {
+        switched.remove(id)
+        notifiedStuck.remove(id)
     }
 }

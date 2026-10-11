@@ -477,6 +477,98 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(AutoSwitchPolicy.anyProfileHasFableHeadroom([ok], isLoginDead: { _ in true }))
     }
 
+    // MARK: - Ending the Opus fallback: restore only on an account with Fable headroom
+
+    func testRestoreWhenTheActiveAccountHasFableHeadroom() {
+        let active = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 10))
+        let other = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id), .restore)
+    }
+
+    func testSwitchFirstWhenOnlyAnotherAccountHasFableHeadroom() {
+        // Restoring here would put Claude Code back on Fable while the shared
+        // login still sits on a Fable-spent account.
+        let active = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        let other = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 10))
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id), .switchFirst)
+    }
+
+    func testWaitWhenNoAccountHasFableHeadroom() {
+        let active = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        let other = makeProfile("B", usage: makeUsage(session: 10, weekly: 100, fable: 10))
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id), .wait)
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active], activeId: nil), .wait)
+    }
+
+    // MARK: - Stuck with no free account: retry every tick (2026-10-11 6:05 PM)
+    //
+    // The app showed "no account free · next: madmatter23 6:05PM"; madmatter's
+    // window reset at 6:05 and nothing switched, because the spent profile was
+    // latched and only its OWN limits clearing re-armed the check.
+
+    func testWhenAnotherAccountFreesUpTheNextTickSwitchesToIt() {
+        var a = makeProfile("A", usage: makeUsage(session: 10, weekly: 100))
+        var b = makeProfile("B", usage: makeUsage(session: 100, weekly: 10))
+        let c = makeProfile("C", usage: makeUsage(session: 10, weekly: 100))
+        var decider = AutoSwitchDecider()
+
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b, c], usingFable: false), .noTarget(notify: true))
+
+        b.claudeUsage = makeUsage(session: 0, weekly: 10)   // B's window reset
+        a.claudeUsage = makeUsage(session: 10, weekly: 100)
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b, c], usingFable: false), .switchTo(b, withoutFable: false))
+    }
+
+    func testWhileEverythingIsSpentItNeitherSwitchesNorReNotifies() {
+        let a = makeProfile("A", usage: makeUsage(session: 10, weekly: 100))
+        let b = makeProfile("B", usage: makeUsage(session: 100, weekly: 10))
+        var decider = AutoSwitchDecider()
+
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .noTarget(notify: true))
+        for _ in 0..<5 {
+            XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .noTarget(notify: false))
+        }
+    }
+
+    func testAfterSwitchingItDoesNotFireAgainForTheSameProfile() {
+        let a = makeProfile("A", usage: makeUsage(session: 10, weekly: 100))
+        let b = makeProfile("B", usage: makeUsage(session: 10, weekly: 10))
+        var decider = AutoSwitchDecider()
+
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .switchTo(b, withoutFable: false))
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .stay, "the switch is in flight")
+    }
+
+    func testAProfileWithHeadroomResetsItsLatch() {
+        var a = makeProfile("A", usage: makeUsage(session: 10, weekly: 100))
+        let b = makeProfile("B", usage: makeUsage(session: 100, weekly: 10))
+        var decider = AutoSwitchDecider()
+        _ = decider.decide(current: a, profiles: [a, b], usingFable: false)
+
+        a.claudeUsage = makeUsage(session: 10, weekly: 10)
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .stay)
+        a.claudeUsage = makeUsage(session: 10, weekly: 100)
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .noTarget(notify: true), "a new episode notifies again")
+    }
+
+    func testFableOnlyBlockWithNoFableHeadroomRetriesToo() {
+        let a = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        var b = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        var decider = AutoSwitchDecider()
+
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: true), .noFableHeadroom(notify: true))
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: true), .noFableHeadroom(notify: false))
+        b.claudeUsage = makeUsage(session: 10, weekly: 10, fable: 5)
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: true), .switchTo(b, withoutFable: false))
+    }
+
+    func testFableSpentAloneIsNotABlockWhenFableIsNotInUse() {
+        let a = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        let b = makeProfile("B", usage: makeUsage(session: 10, weekly: 10))
+        var decider = AutoSwitchDecider()
+        XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .stay)
+    }
+
     private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {
         Profile(
             name: name,

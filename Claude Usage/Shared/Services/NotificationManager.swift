@@ -407,8 +407,10 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
-    /// The Opus fallback was applied (`applied`) or ended.
-    func sendModelFallbackNotification(applied: Bool, movedTo: String?) {
+    /// The Opus fallback was applied (`applied`) or ended; nil when the
+    /// profile's notifications are off.
+    static func modelFallbackContent(applied: Bool, movedTo: String?, settings: NotificationSettings) -> UNMutableNotificationContent? {
+        guard settings.enabled else { return nil }
         let content = UNMutableNotificationContent()
         if applied {
             content.title = "notification.no_fable_headroom.title".localized
@@ -421,18 +423,31 @@ class NotificationManager: NotificationServiceProtocol {
         content.sound = applied ? .defaultCritical : .default
         content.categoryIdentifier = "INFO_ALERT"
         content.interruptionLevel = applied ? .timeSensitive : .active
-        post(content, id: "model_fallback_\(applied)")
+        return content
     }
 
     /// The Opus fallback was wanted but settings.json could not be edited.
-    func sendModelFallbackFailedNotification(reason: String) {
+    static func modelFallbackFailedContent(failure: ModelFallback.Failure, settings: NotificationSettings) -> UNMutableNotificationContent? {
+        guard settings.enabled else { return nil }
         let content = UNMutableNotificationContent()
         content.title = "notification.no_fable_headroom.title".localized
-        content.body = "notification.model_fallback.failed".localized(with: reason)
+        content.body = "notification.model_fallback.failed".localized(with: failure.message)
         content.sound = .defaultCritical
         content.categoryIdentifier = "INFO_ALERT"
         content.interruptionLevel = .timeSensitive
-        post(content, id: "model_fallback_failed")
+        return content
+    }
+
+    func sendModelFallbackNotification(applied: Bool, movedTo: String?, settings: NotificationSettings) {
+        if let content = Self.modelFallbackContent(applied: applied, movedTo: movedTo, settings: settings) {
+            post(content, id: "model_fallback_\(applied)")
+        }
+    }
+
+    func sendModelFallbackFailedNotification(failure: ModelFallback.Failure, settings: NotificationSettings) {
+        if let content = Self.modelFallbackFailedContent(failure: failure, settings: settings) {
+            post(content, id: "model_fallback_failed")
+        }
     }
 
     private func post(_ content: UNMutableNotificationContent, id: String) {

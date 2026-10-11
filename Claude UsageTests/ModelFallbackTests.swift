@@ -1,9 +1,10 @@
 import XCTest
+import UserNotifications
 @testable import Claude_Usage
 
 /// Last resort when Fable is in use and no account has Fable headroom
 /// (operator, 2026-10-11: "App switches default to Opus"): the tracker sets
-/// Claude Code's default `model` to Opus, touching only that key, and restores
+/// Claude Code's default `model` to Opus with a minimal text edit, and restores
 /// the previous value once Fable is available again, unless the user changed
 /// the setting in the meantime.
 final class ModelFallbackTests: XCTestCase {
@@ -25,6 +26,7 @@ final class ModelFallbackTests: XCTestCase {
     }
 
     override func tearDown() {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         defaults.removePersistentDomain(forName: suiteName)
         try? FileManager.default.removeItem(at: dir)
         super.tearDown()
@@ -35,50 +37,94 @@ final class ModelFallbackTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: settings.path)
     }
 
+    private func text() throws -> String { try String(contentsOf: settings, encoding: .utf8) }
+
     private func json() throws -> [String: Any] {
-        let data = try Data(contentsOf: settings)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: settings)) as? [String: Any])
     }
 
     private func mode() throws -> Int {
         try XCTUnwrap(FileManager.default.attributesOfItem(atPath: settings.path)[.posixPermissions] as? Int)
     }
 
+    private func failure(_ result: ModelFallback.ApplyResult) -> ModelFallback.Failure? {
+        if case .failed(let f) = result { return f }
+        return nil
+    }
+
     private let original = """
     {
       "model": "fable",
-      "env": {"FOO": "bar", "N": "1"},
+      "env": {"FOO": "bar", "URL": "https://example.com//x"},
       "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/y.sh"}]}]},
-      "statusLine": {"type": "command", "command": "~/.claude/statusline.sh", "padding": 0},
-      "alwaysThinkingEnabled": true
+      "alwaysThinkingEnabled": true,
+      "padding": 1.50
     }
+
     """
 
-    // MARK: - The edit
+    // MARK: - The edit is minimal
 
-    func testSetsTheDefaultModelToOpusAndKeepsEveryOtherKey() throws {
+    func testOnlyTheModelValueChangesAndTheModeIsKept() throws {
         try write(original, mode: 0o600)
 
         XCTAssertEqual(fallback.applyOpus(), .applied(previous: "fable"))
 
-        let after = try json()
-        XCTAssertEqual(after["model"] as? String, ModelFallback.opusModel)
-        XCTAssertEqual(after["env"] as? [String: String], ["FOO": "bar", "N": "1"])
-        XCTAssertEqual(after["alwaysThinkingEnabled"] as? Bool, true)
-        XCTAssertEqual((after["statusLine"] as? [String: Any])?["padding"] as? Int, 0)
-        let hooks = try XCTUnwrap(after["hooks"] as? [String: Any])
-        XCTAssertNotNil(hooks["Stop"])
-        XCTAssertEqual(Set(after.keys), ["model", "env", "hooks", "statusLine", "alwaysThinkingEnabled"])
-        XCTAssertEqual(try mode(), 0o600, "the file mode is kept")
+        XCTAssertEqual(try text(), original.replacingOccurrences(of: #""model": "fable""#, with: #""model": "opus""#),
+                       "every other byte is kept, including key order, spacing and 1.50")
+        XCTAssertEqual(try mode(), 0o600)
         XCTAssertTrue(fallback.isActive)
     }
 
-    func testApplyingTwiceDoesNotOverwriteTheRecordedPreviousValue() throws {
+    func testAMissingModelKeyIsInsertedAfterTheBraceWithTheFilesIndent() throws {
+        let before = "{\n    \"env\": {\"A\": \"b\"},\n    \"x\": 1\n}\n"
+        try write(before)
+
+        XCTAssertEqual(fallback.applyOpus(), .applied(previous: nil))
+        XCTAssertEqual(try text(), "{\n    \"model\": \"opus\",\n    \"env\": {\"A\": \"b\"},\n    \"x\": 1\n}\n")
+
+        XCTAssertEqual(fallback.restore(), .restored)
+        XCTAssertEqual(try text(), before, "restore puts back the exact bytes")
+    }
+
+    func testCompactAndEmptyObjects() throws {
+        try write(#"{"a":1}"#)
+        XCTAssertEqual(fallback.applyOpus(), .applied(previous: nil))
+        XCTAssertEqual(try text(), #"{"model": "opus", "a":1}"#)
+        XCTAssertEqual(fallback.restore(), .restored)
+        XCTAssertEqual(try text(), #"{"a":1}"#)
+
+        try write("{}")
+        XCTAssertEqual(fallback.applyOpus(), .applied(previous: nil))
+        XCTAssertEqual(try json()["model"] as? String, ModelFallback.opusModel)
+        XCTAssertEqual(fallback.restore(), .restored)
+        XCTAssertEqual(try text(), "{}")
+    }
+
+    func testRemovingTheLastMemberLeavesTheRestIntact() throws {
+        let before = "{\n  \"a\": 1,\n  \"model\": \"fable\"\n}"
+        try write(before)
+        _ = fallback.applyOpus()
+        XCTAssertEqual(try text(), "{\n  \"a\": 1,\n  \"model\": \"opus\"\n}")
+        XCTAssertEqual(fallback.restore(), .restored)
+        XCTAssertEqual(try text(), before)
+    }
+
+    func testApplyingTwiceKeepsTheFirstRecord() throws {
         try write(original)
         XCTAssertEqual(fallback.applyOpus(), .applied(previous: "fable"))
         XCTAssertEqual(fallback.applyOpus(), .alreadyApplied)
         XCTAssertEqual(fallback.restore(), .restored)
-        XCTAssertEqual(try json()["model"] as? String, "fable")
+        XCTAssertEqual(try text(), original)
+    }
+
+    func testWhileActiveAUserChangeIsNotOverwrittenByAnotherApply() throws {
+        try write(original)
+        _ = fallback.applyOpus()
+        try write(original.replacingOccurrences(of: #""model": "fable""#, with: #""model": "sonnet""#))
+        let before = try text()
+        XCTAssertEqual(fallback.applyOpus(), .alreadyApplied)
+        XCTAssertEqual(try text(), before)
     }
 
     // MARK: - Restore
@@ -89,66 +135,72 @@ final class ModelFallbackTests: XCTestCase {
 
         XCTAssertEqual(fallback.restore(), .restored)
 
-        let after = try json()
-        XCTAssertEqual(after["model"] as? String, "fable")
-        XCTAssertEqual(after["env"] as? [String: String], ["FOO": "bar", "N": "1"])
+        XCTAssertEqual(try text(), original)
         XCTAssertEqual(try mode(), 0o640)
         XCTAssertFalse(fallback.isActive)
-    }
-
-    func testRestoringRemovesTheKeyWhenThereWasNoneBefore() throws {
-        try write(#"{"env": {"A": "b"}}"#)
-        XCTAssertEqual(fallback.applyOpus(), .applied(previous: nil))
-        XCTAssertEqual(try json()["model"] as? String, ModelFallback.opusModel)
-
-        XCTAssertEqual(fallback.restore(), .restored)
-
-        let after = try json()
-        XCTAssertNil(after["model"], "Claude Code is back on its own default")
-        XCTAssertEqual(after["env"] as? [String: String], ["A": "b"])
     }
 
     func testDoesNotRestoreAfterTheUserChangedTheSetting() throws {
         try write(original)
         _ = fallback.applyOpus()
-        var edited = try json()
-        edited["model"] = "sonnet"
-        try JSONSerialization.data(withJSONObject: edited).write(to: settings)
+        let edited = original.replacingOccurrences(of: #""model": "fable""#, with: #""model": "sonnet""#)
+        try write(edited)
 
         XCTAssertEqual(fallback.restore(), .userChanged)
 
-        XCTAssertEqual(try json()["model"] as? String, "sonnet", "the user's choice is left alone")
+        XCTAssertEqual(try text(), edited, "the user's choice is left alone")
         XCTAssertFalse(fallback.isActive, "and the tracker forgets its own edit")
     }
 
     func testRestoreIsANoOpWhenNothingWasApplied() throws {
         try write(original)
-        let before = try Data(contentsOf: settings)
         XCTAssertEqual(fallback.restore(), .nothingToRestore)
-        XCTAssertEqual(try Data(contentsOf: settings), before)
+        XCTAssertEqual(try text(), original)
     }
 
     // MARK: - Fail safe
 
     func testAMalformedSettingsFileIsNeverEdited() throws {
         try write(#"{"model": "fable", "env": {"#)
-        let before = try Data(contentsOf: settings)
-
-        guard case .failed = fallback.applyOpus() else { return XCTFail("expected .failed") }
-
-        XCTAssertEqual(try Data(contentsOf: settings), before)
+        let before = try text()
+        XCTAssertNotNil(failure(fallback.applyOpus()))
+        XCTAssertEqual(try text(), before)
         XCTAssertFalse(fallback.isActive)
     }
 
     func testANonObjectSettingsFileIsNeverEdited() throws {
         try write(#"["model", "fable"]"#)
-        let before = try Data(contentsOf: settings)
-        guard case .failed = fallback.applyOpus() else { return XCTFail("expected .failed") }
-        XCTAssertEqual(try Data(contentsOf: settings), before)
+        XCTAssertNotNil(failure(fallback.applyOpus()))
+        XCTAssertEqual(try text(), #"["model", "fable"]"#)
+    }
+
+    func testAFileWithCommentsIsNeverEditedAndSaysSo() throws {
+        let jsonc = "{\n  // pick a model\n  \"model\": \"fable\"\n}"
+        try write(jsonc)
+        XCTAssertEqual(failure(fallback.applyOpus()), .hasComments)
+        XCTAssertEqual(try text(), jsonc)
+        XCTAssertTrue(ModelFallback.Failure.hasComments.message.contains("has comments; edit the model key by hand"))
+    }
+
+    func testSlashesInsideStringsAreNotComments() throws {
+        try write(#"{"url": "https://x/*y*/", "model": "fable"}"#)
+        XCTAssertEqual(fallback.applyOpus(), .applied(previous: "fable"))
+        XCTAssertEqual(try text(), #"{"url": "https://x/*y*/", "model": "opus"}"#)
+    }
+
+    func testDuplicateTopLevelKeysAreRefused() throws {
+        try write(#"{"model": "fable", "a": 1, "model": "sonnet"}"#)
+        XCTAssertEqual(failure(fallback.applyOpus()), .duplicateKeys)
+        XCTAssertFalse(fallback.isActive)
+    }
+
+    func testANonStringModelIsRefused() throws {
+        try write(#"{"model": {"name": "fable"}}"#)
+        XCTAssertEqual(failure(fallback.applyOpus()), .modelNotAString)
     }
 
     func testAMissingSettingsFileIsNotCreated() {
-        guard case .failed = fallback.applyOpus() else { return XCTFail("expected .failed") }
+        XCTAssertEqual(failure(fallback.applyOpus()), .unreadable)
         XCTAssertFalse(FileManager.default.fileExists(atPath: settings.path))
         XCTAssertFalse(fallback.isActive)
     }
@@ -161,6 +213,16 @@ final class ModelFallbackTests: XCTestCase {
         XCTAssertTrue(fallback.isActive, "retried once the file parses again")
     }
 
+    func testAFailedWriteLeavesNoRecord() throws {
+        try write(original)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+
+        guard case .failed(.writeFailed) = fallback.applyOpus() else { return XCTFail("expected .writeFailed") }
+
+        XCTAssertFalse(fallback.isActive, "the record written before the rename is cleared")
+        XCTAssertEqual(try text(), original)
+    }
+
     func testASymlinkedSettingsFileStaysASymlink() throws {
         let real = dir.appendingPathComponent("real-settings.json")
         try original.write(to: real, atomically: true, encoding: .utf8)
@@ -171,5 +233,33 @@ final class ModelFallbackTests: XCTestCase {
         let attrs = try FileManager.default.attributesOfItem(atPath: settings.path)
         XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink)
         XCTAssertEqual(try json()["model"] as? String, ModelFallback.opusModel)
+    }
+
+    func testStaleTemporaryFilesAreSwept() throws {
+        try write(original)
+        let stale = dir.appendingPathComponent(".settings.json.claude-usage-OLD")
+        FileManager.default.createFile(atPath: stale.path, contents: Data("x".utf8))
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)], ofItemAtPath: stale.path)
+
+        _ = fallback.applyOpus()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.contains("claude-usage-") }
+        XCTAssertEqual(leftovers, [], "the edit leaves no temporary file behind")
+    }
+
+    // MARK: - Notifications honour the profile's settings
+
+    func testModelFallbackNotificationsHonourEnabled() {
+        let on = NotificationSettings(enabled: true)
+        let off = NotificationSettings(enabled: false)
+
+        XCTAssertNil(NotificationManager.modelFallbackContent(applied: true, movedTo: nil, settings: off))
+        XCTAssertNil(NotificationManager.modelFallbackContent(applied: false, movedTo: nil, settings: off))
+        XCTAssertNil(NotificationManager.modelFallbackFailedContent(failure: .hasComments, settings: off))
+        XCTAssertNotNil(NotificationManager.modelFallbackContent(applied: true, movedTo: "B", settings: on))
+        XCTAssertNotNil(NotificationManager.modelFallbackContent(applied: false, movedTo: nil, settings: on))
+        XCTAssertTrue(NotificationManager.modelFallbackFailedContent(failure: .hasComments, settings: on)?.body
+            .contains("has comments; edit the model key by hand") ?? false)
     }
 }
