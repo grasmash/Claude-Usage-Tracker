@@ -33,10 +33,34 @@ class ProfileManager: ObservableObject {
     /// Set when a switch could not rewrite the shared Claude Code login (sessions
     /// were holding it); `applyPendingMainLoginSwitchIfSafe` retries each cycle.
     private static let pendingMainLoginSwitchKey = "ProfileManager.pendingMainLoginSwitch"
+    private static let pendingMainLoginSwitchSinceKey = "ProfileManager.pendingMainLoginSwitchSince"
+    private static let pendingMainLoginPreviousKey = "ProfileManager.pendingMainLoginPrevious"
+    /// A pending switch older than this is dropped: the account that was chosen
+    /// a day ago is not necessarily the one with room now.
+    static let pendingMainLoginSwitchMaxAge: TimeInterval = 24 * 3600
     private var pendingMainLoginSwitch: Bool {
         get { AppEnvironment.userDefaults.bool(forKey: Self.pendingMainLoginSwitchKey) }
-        set { AppEnvironment.userDefaults.set(newValue, forKey: Self.pendingMainLoginSwitchKey) }
+        set {
+            AppEnvironment.userDefaults.set(newValue, forKey: Self.pendingMainLoginSwitchKey)
+            if newValue {
+                AppEnvironment.userDefaults.set(Date().timeIntervalSince1970, forKey: Self.pendingMainLoginSwitchSinceKey)
+            } else {
+                AppEnvironment.userDefaults.removeObject(forKey: Self.pendingMainLoginSwitchSinceKey)
+                AppEnvironment.userDefaults.removeObject(forKey: Self.pendingMainLoginPreviousKey)
+            }
+        }
     }
+    private var pendingMainLoginSwitchSince: Date? {
+        let t = AppEnvironment.userDefaults.double(forKey: Self.pendingMainLoginSwitchSinceKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+    /// The account the shared login still belongs to while a switch is pending.
+    private var pendingMainLoginPrevious: String? {
+        get { AppEnvironment.userDefaults.string(forKey: Self.pendingMainLoginPreviousKey) }
+        set { AppEnvironment.userDefaults.set(newValue, forKey: Self.pendingMainLoginPreviousKey) }
+    }
+    /// True while a pending-switch retry is in flight, so cycles never overlap.
+    private var isApplyingPendingSwitch = false
 
     /// The account the keychain login belonged to when the tracker last looked,
     /// so a `/login` (the keychain changing account) is told apart from the
@@ -73,6 +97,14 @@ class ProfileManager: ObservableObject {
             if let first = profiles.first {
                 profileStore.saveActiveProfileId(first.id)
             }
+        }
+
+        // First run of this build: the keychain login was the active profile's
+        // (earlier builds kept them equal), so seed the last-seen identity from
+        // it rather than treating the first look as a `/login`.
+        if lastKeychainIdentity == nil, let active = activeProfile,
+           let identity = cliSyncService.accountIdentity(fromOAuthAccountJSON: active.oauthAccountJSON) {
+            lastKeychainIdentity = identity
         }
 
         displayMode = profileStore.loadDisplayMode()
@@ -274,12 +306,14 @@ class ProfileManager: ObservableObject {
         LoggingService.shared.log("Checking CLI credentials for profile '\(updatedProfile.name)': hasJSON=\(updatedProfile.cliCredentialsJSON != nil)")
 
         if AutoSwitchPolicy.canBeApplied(updatedProfile) {
+            let previousName = activeProfile?.name ?? "the previous account"
             pendingMainLoginSwitch = true
+            pendingMainLoginPrevious = previousName
             do {
                 let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id)
                 // Reload: the switch may have refreshed and stored the login.
                 profiles = profileStore.loadProfiles()
-                handleMainLoginSwitch(outcome, for: updatedProfile, announceLater: false)
+                handleMainLoginSwitch(outcome, for: updatedProfile, previousName: previousName, announceLater: false)
             } catch {
                 pendingMainLoginSwitch = false
                 LoggingService.shared.logError("Failed to apply CLI credentials (non-fatal)", error: error)
@@ -389,9 +423,11 @@ class ProfileManager: ObservableObject {
     func captureActiveMainLogin() {
         guard !switchingSemaphore else { return }
         ClaudeCodeSyncService.shared.signalSessionsIfKeychainLoginChanged()
+        // One keychain read per cycle, shared by every candidate.
+        guard let systemJSON = try? ClaudeCodeSyncService.shared.readSystemCredentials() else { return }
         let candidates = ([activeProfile].compactMap { $0 } + profiles)
             .filter { $0.provider.descriptor.capabilities.cliAccountSync }
-        for profile in candidates where ClaudeCodeSyncService.shared.captureMainLogin(for: profile.id) {
+        for profile in candidates where ClaudeCodeSyncService.shared.captureMainLogin(systemJSON, for: profile.id) {
             reloadStoredCredentialState()
             LoggingService.shared.log("captureActiveMainLogin: saved main login for '\(profile.name)'")
             return
@@ -408,26 +444,40 @@ class ProfileManager: ObservableObject {
 
     /// Acts on the outcome of `switchMainLogin`: clears or keeps the pending
     /// flag and tells the user what Claude Code's shared login is doing.
-    private func handleMainLoginSwitch(_ outcome: ClaudeCodeSyncService.MainLoginSwitch, for profile: Profile, announceLater: Bool) {
+    private func handleMainLoginSwitch(
+        _ outcome: ClaudeCodeSyncService.MainLoginSwitch, for profile: Profile, previousName: String, announceLater: Bool
+    ) {
         switch outcome {
-        case .applied, .alreadyApplied:
+        case .applied(let raced):
             pendingMainLoginSwitch = false
             lastKeychainIdentity = ClaudeCodeSyncService.shared.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) ?? lastKeychainIdentity
-            LoggingService.shared.log("✓ Claude Code's shared login is '\(profile.name)' (\(outcome == .applied ? "written" : "already there"))")
-            if announceLater, outcome == .applied {
+            LoggingService.shared.log("✓ Claude Code's shared login is '\(profile.name)' (written; was '\(previousName)')")
+            if raced > 0 {
+                NotificationManager.shared.sendSharedLoginRaceNotification(
+                    profileName: profile.name, previousName: previousName, count: raced, settings: profile.notificationSettings)
+            } else if announceLater {
                 NotificationManager.shared.sendSwitchAppliedLaterNotification(
                     profileName: profile.name, settings: profile.notificationSettings)
             }
+        case .alreadyApplied:
+            pendingMainLoginSwitch = false
+            lastKeychainIdentity = ClaudeCodeSyncService.shared.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) ?? lastKeychainIdentity
+            LoggingService.shared.log("✓ Claude Code's shared login is already '\(profile.name)'")
         case .refused(let reason):
-            // Stays pending; `applyPendingMainLoginSwitchIfSafe` retries.
-            LoggingService.shared.log("⚠️ Claude Code's shared login NOT switched to '\(profile.name)': \(reason); new sessions via cca use it")
-            guard !announceLater else { return }   // a retry's refusal is routine; say it once, at the switch
+            LoggingService.shared.log("⚠️ Claude Code's shared login NOT switched to '\(profile.name)': \(reason); it stays on '\(previousName)'; new sessions via cca use '\(profile.name)'")
             let text: String
             switch reason {
             case .sessionsRunning(let count):
-                text = "notification.switch_not_applied.sessions_running".localized(with: count, profile.name)
+                // Stays pending; `applyPendingMainLoginSwitchIfSafe` retries.
+                guard !announceLater else { return }   // a retry's refusal is routine; say it once, at the switch
+                text = "notification.switch_not_applied.sessions_running".localized(with: count, previousName, profile.name)
             case .unknownKeychainLogin:
-                text = "notification.switch_not_applied.unknown_login".localized
+                guard !announceLater else { return }
+                text = "notification.switch_not_applied.unknown_login".localized(with: previousName)
+            case .notTheSharedLoginEntry(let service):
+                // Not retryable: the resolved entry will not change by itself.
+                pendingMainLoginSwitch = false
+                text = "notification.switch_not_applied.not_shared_entry".localized(with: service, previousName)
             }
             NotificationManager.shared.sendSwitchNotAppliedNotification(
                 profileName: profile.name, reason: text, settings: profile.notificationSettings)
@@ -436,17 +486,27 @@ class ProfileManager: ObservableObject {
 
     /// Retries a shared-login switch that was refused earlier, once the policy
     /// allows it (no `claude` session on the shared login any more, keychain as
-    /// last seen). Runs every refresh cycle; a no-op while nothing is pending.
+    /// last seen). Runs every refresh cycle; a no-op while nothing is pending,
+    /// while a retry is already in flight, or during a switch. A switch left
+    /// pending longer than `pendingMainLoginSwitchMaxAge` is dropped.
     func applyPendingMainLoginSwitchIfSafe() {
-        guard pendingMainLoginSwitch, !switchingSemaphore, let active = activeProfile,
+        guard pendingMainLoginSwitch, !switchingSemaphore, !isApplyingPendingSwitch, let active = activeProfile,
               AutoSwitchPolicy.canBeApplied(active) else { return }
+        if let since = pendingMainLoginSwitchSince, Date().timeIntervalSince(since) > Self.pendingMainLoginSwitchMaxAge {
+            LoggingService.shared.log("applyPendingMainLoginSwitchIfSafe: the switch to '\(active.name)' has been pending for over a day; dropping it (the shared login stays on '\(pendingMainLoginPrevious ?? "the previous account")')")
+            pendingMainLoginSwitch = false
+            return
+        }
+        let previousName = pendingMainLoginPrevious ?? "the previous account"
+        isApplyingPendingSwitch = true
         Task {
+            defer { Task { @MainActor in self.isApplyingPendingSwitch = false } }
             do {
                 let outcome = try await cliSyncService.switchMainLogin(to: active.id)
                 await MainActor.run {
                     self.reloadStoredCredentialState()
                     if case .applied = outcome { self.lastProfileSwitchAt = Date() }
-                    self.handleMainLoginSwitch(outcome, for: active, announceLater: true)
+                    self.handleMainLoginSwitch(outcome, for: active, previousName: previousName, announceLater: true)
                 }
             } catch {
                 await MainActor.run { self.pendingMainLoginSwitch = false }
@@ -519,6 +579,7 @@ class ProfileManager: ObservableObject {
             // Apply it to Claude Code the same guarded way a switch does.
             lastProfileSwitchAt = Date()
             pendingMainLoginSwitch = true
+            pendingMainLoginPrevious = profile.name
             applyPendingMainLoginSwitchIfSafe()
         }
         return profile

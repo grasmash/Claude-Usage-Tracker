@@ -40,6 +40,9 @@ final class SingleRefresherTests: XCTestCase {
         refreshCalls = 0
         processes = []
 
+        // Pin the resolved entry to the legacy shared name: the real resolution
+        // chain persists to UserDefaults.standard, which a test must not touch.
+        sync.setResolvedServiceNameForTesting(mainService)
         sync.credentialsFileURL = tempDir.appendingPathComponent(".credentials.json")
         sync.runningProcesses = { [unowned self] in self.processes }
         sync.tokenRefresher = { [unowned self] _ in
@@ -73,6 +76,7 @@ final class SingleRefresherTests: XCTestCase {
     }
 
     override func tearDown() {
+        sync.setResolvedServiceNameForTesting(nil)
         sync.securityCommandRunner = savedRunner
         sync.tokenRefresher = savedRefresher
         sync.runningProcesses = savedProcesses
@@ -187,7 +191,7 @@ final class SingleRefresherTests: XCTestCase {
 
         let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
         XCTAssertEqual(writes.count, 1, "exactly one write: \(writes)")
         XCTAssertEqual(writes.first?.first, "add-generic-password")
@@ -203,7 +207,7 @@ final class SingleRefresherTests: XCTestCase {
 
         let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
         XCTAssertEqual(refreshCalls, 1, "the tracker is the stored login's only holder at this point")
         XCTAssertEqual(keychain[mainService]?.contains("new-refresh"), true, "the rotated login is what was written")
     }
@@ -240,8 +244,115 @@ final class SingleRefresherTests: XCTestCase {
     func testSwitchWritesAnEmptyKeychain() async throws {
         let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
         let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!])
-        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+    }
+
+    // MARK: - F1: a Claude Code run by its versioned path counts as a holder
+
+    func testSwitchIsRefusedWhileHappyRunsClaudeByItsVersionedPath() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        processes = MainLoginSwapPolicy.parsePsOutput("""
+        41200 1 node /Users/me/.npm-global/lib/node_modules/happy-coder/dist/claude_local_launcher.cjs HOME=/Users/me
+        41233 41200 /Users/me/.local/share/claude/versions/2.1.292 --resume 3f2b7a9c-1d2e-4f5a-8b6c-7d8e9f0a1b2c HOME=/Users/me
+        """)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)))
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    // MARK: - F2: never write a keychain entry that is not the shared login's
+
+    func testSwitchRefusesWhenTheResolvedEntryIsAPinnedOne() async throws {
+        // resolveServiceName landed on another config dir's entry (e.g. a stale
+        // persisted resolution). Writing it would hand that dir's sessions a
+        // second holder's login.
+        sync.setResolvedServiceNameForTesting(pinnedService)
+        keychain[pinnedService] = login("pinned", expiresIn: 3600)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: -600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!, keychain[pinnedService]!])
+
+        XCTAssertEqual(outcome, .refused(.notTheSharedLoginEntry(service: pinnedService)))
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(refreshCalls, 0)
+        XCTAssertEqual(keychain[pinnedService]?.contains("refresh-pinned"), true)
+    }
+
+    func testTheDefaultDirHashedNameIsAcceptedAsTheSharedEntry() async throws {
+        let hashed = "Claude Code-credentials-\(sync.defaultClaudeDirectoryHash)"
+        sync.setResolvedServiceNameForTesting(hashed)
+        keychain[hashed] = login("A", expiresIn: 3600)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[hashed]!, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+        XCTAssertEqual(keychain[hashed], b.cliCredentialsJSON)
+    }
+
+    // MARK: - F3: concurrent switches are serialised
+
+    func testConcurrentSwitchesYieldOneRefreshAndOneWrite() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: -600))
+        let known = [a, b.cliCredentialsJSON!]
+
+        async let first = sync.switchMainLogin(to: b, knownLogins: known)
+        async let second = sync.switchMainLogin(to: b, knownLogins: known)
+        let outcomes = try await [first, second]
+
+        XCTAssertEqual(refreshCalls, 1, "the second switch never refreshed")
+        XCTAssertEqual(writes.count, 1, "one write: \(writes)")
+        XCTAssertEqual(outcomes.filter { $0 == .applied(racedHolders: 0) }.count, 1, "exactly one switch wrote: \(outcomes)")
+        // The second call runs after the first (mutex) and holds the by-value
+        // Profile whose stored login the first call just refreshed, so to it the
+        // keychain holds a rotated, unknown login: the compare-and-swap refuses
+        // rather than overwrite it. (The id-based wrapper reloads the store and
+        // sees `.alreadyApplied` instead.) Either way: no second refresh, no
+        // second write.
+        let other = outcomes.first { $0 != .applied(racedHolders: 0) }
+        XCTAssertTrue(other == .alreadyApplied || other == .refused(.unknownKeychainLogin), "\(outcomes)")
+    }
+
+    // MARK: - F4: the keychain is authoritative; the file only when there is no item
+
+    func testKeychainWinsOverAFresherPlaintextFile() throws {
+        let stale = login("keychain", expiresIn: 60)
+        keychain[mainService] = stale
+        try login("file", expiresIn: 36_000).write(to: sync.credentialsFileURL, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(try sync.readSystemCredentials(), stale)
+    }
+
+    func testFileIsUsedOnlyWhenThereIsNoKeychainItem() throws {
+        let file = login("file", expiresIn: 3600)
+        try file.write(to: sync.credentialsFileURL, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(try sync.readSystemCredentials(), file)
+    }
+
+    // MARK: - F5: a holder that appears during the switch is reported
+
+    func testAHolderAppearingAfterTheWriteIsReported() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+        var scans = 0
+        sync.runningProcesses = { [unowned self] in
+            scans += 1
+            return scans == 1 ? [] : [self.bareClaude(77)]   // idle at the guard, a session right after the write
+        }
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 1))
+        XCTAssertEqual(scans, 2, "scanned before and after the write")
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON, "the write itself was legitimate at the time")
     }
 
     // MARK: - A4: no plaintext mirror

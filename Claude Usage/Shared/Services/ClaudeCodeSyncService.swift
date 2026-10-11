@@ -69,7 +69,7 @@ class ClaudeCodeSyncService {
     static func listRunningProcesses() -> [MainLoginSwapPolicy.RunningProcess] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axwwE", "-o", "pid=,command="]
+        process.arguments = ["-axwwE", "-o", "pid=,ppid=,command="]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
@@ -135,64 +135,42 @@ class ClaudeCodeSyncService {
     /// 2. System Keychain (may be truncated for large payloads >2KB)
     /// 3. Regex extraction of accessToken from truncated keychain data (last resort)
     func readSystemCredentials() throws -> String? {
-        // Read BOTH sources and pick the fresher one. On macOS Claude Code rotates
-        // tokens in the KEYCHAIN only; `.credentials.json` is a mirror written by this
-        // app at apply-time and goes stale as soon as Claude Code rotates. Letting the
-        // file shadow the keychain made sync capture pre-rotation (consumed) tokens,
-        // which later failed refresh with invalid_grant and forced re-login.
-        let fileJSON = readCredentialsFile()
-
-        // Keychain: validate JSON; fall back to regex extraction for truncated payloads.
-        // A keychain read error is fatal only when there is no file to fall back to.
+        // The KEYCHAIN is authoritative: on macOS Claude Code rotates tokens there
+        // and nowhere else. `.credentials.json` is only consulted when there is no
+        // keychain item at all (a Linux-style or file-only install). Earlier builds
+        // picked whichever source expired later, which let a stale plaintext mirror
+        // this app once wrote shadow the live login.
         var keychainJSON: String?
         let rawKeychain: String?
         do {
             rawKeychain = try readKeychainCredentials()
         } catch {
-            if fileJSON == nil { throw error }
-            rawKeychain = nil
+            // A read error is fatal only when there is no file to fall back to.
+            guard let file = readCredentialsFile() else { throw error }
+            LoggingService.shared.log("Read credentials from .credentials.json file (keychain unreadable)")
+            return file
         }
         if let rawJSON = rawKeychain {
             if let data = rawJSON.data(using: .utf8),
                (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil {
                 keychainJSON = rawJSON
             } else {
+                // Validate JSON; fall back to regex extraction for truncated payloads.
                 LoggingService.shared.log("Keychain JSON is invalid (likely truncated), attempting regex extraction")
                 if let token = extractAccessTokenViaRegex(from: rawJSON) {
                     keychainJSON = "{\"claudeAiOauth\":{\"accessToken\":\"\(token)\"}}"
                     LoggingService.shared.log("Built minimal credentials from regex-extracted token")
-                } else if fileJSON == nil {
-                    // Keychain garbage and no file — surface the error as before.
+                } else {
                     throw ClaudeCodeError.invalidJSON
                 }
             }
         }
-
-        switch (fileJSON, keychainJSON) {
-        case (nil, nil):
-            return nil
-        case (let file?, nil):
-            LoggingService.shared.log("Read credentials from .credentials.json file (no keychain entry)")
-            return file
-        case (nil, let keychain?):
-            LoggingService.shared.log("Read credentials from keychain (no credentials file)")
-            return keychain
-        case (let file?, let keychain?):
-            // Prefer whichever expires LATER; on a tie (or missing expiry on the file
-            // side) prefer the keychain — it is Claude Code's authoritative store.
-            let fileExpiry = extractTokenExpiry(from: file)
-            let keychainExpiry = extractTokenExpiry(from: keychain)
-            if let fe = fileExpiry, let ke = keychainExpiry, fe > ke {
-                LoggingService.shared.log("Read credentials from .credentials.json file (newer than keychain)")
-                return file
-            }
-            if keychainExpiry == nil && fileExpiry != nil {
-                LoggingService.shared.log("Read credentials from .credentials.json file (keychain entry has no expiry)")
-                return file
-            }
-            LoggingService.shared.log("Read credentials from keychain (authoritative/fresher source)")
-            return keychain
+        if let keychainJSON {
+            return keychainJSON
         }
+        guard let file = readCredentialsFile() else { return nil }
+        LoggingService.shared.log("Read credentials from .credentials.json file (no keychain entry)")
+        return file
     }
 
     // MARK: - Private Credential Sources
@@ -805,12 +783,31 @@ class ClaudeCodeSyncService {
 
     /// Outcome of `switchMainLogin(to:)`.
     enum MainLoginSwitch: Equatable {
-        /// The shared login now is this profile's (it was written, or already there).
-        case applied
+        /// The shared login was written. `racedHolders` is how many Claude Code
+        /// processes on the shared login were found in a re-scan right after
+        /// the write: normally 0; more means one started in the window between
+        /// the scan and the write and may hold the login that was replaced.
+        case applied(racedHolders: Int)
         /// The keychain already held this profile's login; nothing was written.
         case alreadyApplied
         /// Not done, for a reason the policy names. Retry on a later cycle.
         case refused(MainLoginSwapPolicy.Refusal)
+    }
+
+    /// Serialises `switchMainLogin`: two overlapping switches would be two
+    /// refreshes of one stored login, or two writes racing each other.
+    private let switchMutex = AsyncMutex()
+
+    /// Only for tests: pins the resolved service name so a test never runs
+    /// the real resolution chain (which persists to `UserDefaults.standard`).
+    func setResolvedServiceNameForTesting(_ name: String?) {
+        resolvedServiceName = name
+    }
+
+    /// The hash Claude Code derives from the default config dir for its
+    /// keychain entry name (`Claude Code-credentials-<hash>`).
+    var defaultClaudeDirectoryHash: String {
+        sha256HexPrefix(Constants.ClaudePaths.claudeDirectory.path, length: 8)
     }
 
     /// Makes `profile`'s stored main login the shared Claude Code login — the
@@ -833,11 +830,32 @@ class ClaudeCodeSyncService {
     /// `knownLogins` are the main logins the tracker has captured (every
     /// profile's `cliCredentialsJSON`), for the compare-and-swap.
     func switchMainLogin(to profile: Profile, knownLogins: [String]) async throws -> MainLoginSwitch {
+        await switchMutex.lock()
+        do {
+            let outcome = try await performMainLoginSwitch(to: profile, knownLogins: knownLogins)
+            await switchMutex.unlock()
+            return outcome
+        } catch {
+            await switchMutex.unlock()
+            throw error
+        }
+    }
+
+    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String]) async throws -> MainLoginSwitch {
         guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
             // A pinned entry's login is never copied into the main keychain:
             // that puts one single-use refresh token in two config dirs.
             LoggingService.shared.log("switchMainLogin: '\(profile.name)' has no main login of its own; nothing to apply")
             throw ClaudeCodeError.noProfileCredentials
+        }
+
+        // The target entry must BE the shared login's. `resolveServiceName` can
+        // land on a hashed name; if that is another config dir's entry, writing
+        // it would hand a second holder's login to that dir's sessions.
+        let service = resolveServiceName()
+        guard MainLoginSwapPolicy.isSharedLoginServiceName(service, claudeDirectoryHash: defaultClaudeDirectoryHash) else {
+            LoggingService.shared.logError("switchMainLogin: resolved keychain entry '\(service)' is not the shared login's; refusing to write it")
+            return .refused(.notTheSharedLoginEntry(service: service))
         }
 
         let keychainJSON = try? readKeychainCredentials()
@@ -869,6 +887,14 @@ class ClaudeCodeSyncService {
         }
         lastSeenSystemLoginFingerprint = systemLoginFingerprint(jsonData)
 
+        // Re-scan: a `claude` that started between the scan above and the write
+        // read the keychain before or after it, and we cannot tell which. Say so
+        // loudly; the caller notifies, and the keychain-mdat log will show it.
+        let raced = MainLoginSwapPolicy.sharedLoginHolders(in: runningProcesses())
+        if !raced.isEmpty {
+            LoggingService.shared.logError("⚠️ switchMainLogin: \(raced.count) Claude Code process(es) on the shared login appeared during the switch to '\(profile.name)' (pids \(raced.map { String($0.pid) }.joined(separator: ","))); one may hold the replaced login")
+        }
+
         // Restore the profile's captured oauthAccount (if any) so Claude Code's
         // /status Status tab shows the right email/org/plan for this profile.
         // No session is running (see 1), so none can write a stale copy back.
@@ -881,7 +907,7 @@ class ClaudeCodeSyncService {
         }
 
         LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)'")
-        return .applied
+        return .applied(racedHolders: raced.count)
     }
 
     /// `switchMainLogin(to:knownLogins:)` for a stored profile, with every
@@ -1153,8 +1179,15 @@ class ClaudeCodeSyncService {
     /// keychain.
     @discardableResult
     func captureMainLogin(for profileId: UUID) -> Bool {
+        guard let systemJSON = try? readSystemCredentials() else { return false }
+        return captureMainLogin(systemJSON, for: profileId)
+    }
+
+    /// `captureMainLogin(for:)` with the system login already read, so one
+    /// keychain read serves every profile in a cycle.
+    @discardableResult
+    func captureMainLogin(_ systemJSON: String, for profileId: UUID) -> Bool {
         guard let profile = ProfileStore.shared.loadProfiles().first(where: { $0.id == profileId }),
-              let systemJSON = try? readSystemCredentials(),
               extractRefreshToken(from: systemJSON) != nil,
               systemCredentials(systemJSON, belongTo: profile) else { return false }
         let own = isOwnMainLogin(systemJSON, for: profile)

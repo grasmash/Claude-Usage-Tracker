@@ -347,6 +347,29 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// A Claude Code process appeared on the shared login during the switch;
+    /// it may hold the replaced login. Loud, and not gated on the profile's
+    /// notification setting: the user has to check that session.
+    func sendSharedLoginRaceNotification(profileName: String, previousName: String, count: Int, settings: NotificationSettings) {
+        let content = UNMutableNotificationContent()
+        content.title = "notification.shared_login_raced.title".localized(with: profileName)
+        content.body = "notification.shared_login_raced.body".localized(with: count, previousName, profileName)
+        content.sound = .defaultCritical
+        content.categoryIdentifier = "INFO_ALERT"
+        content.interruptionLevel = .timeSensitive
+
+        let request = UNNotificationRequest(
+            identifier: "shared_login_raced_\(profileName)_\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send shared-login-race notification: \(error)")
+            }
+        }
+    }
+
     /// Tells the user a profile switch did NOT reach Claude Code (the keychain
     /// still holds the previous account) and what to do about it.
     func sendSwitchNotAppliedNotification(profileName: String, reason: String, settings: NotificationSettings) {

@@ -70,14 +70,53 @@ tokens.
    stored into whichever profile it belongs to (not just the active one), so
    the copy a later switch writes is the lineage Claude Code last rotated.
 
+   Guards around the write: the resolved keychain entry must be the shared
+   login's (`Claude Code-credentials` or `Claude Code-credentials-<sha256(~/.claude)[:8]>`;
+   a pinned, per-config-dir entry is refused even if `resolveServiceName`
+   landed on it); switches are serialised by an async mutex, so two cycles
+   never refresh one stored login twice; processes are re-scanned right after
+   the write and any holder that appeared in the window is logged and raises a
+   time-sensitive notification ("Check Claude Code's login") naming both
+   accounts; a pending switch is dropped after 24 h.
+
 ## Why not keep the live swap
 
 A swap under running sessions can only be made safe by every session reloading
 the keychain at once and none of them ever writing back — neither is something
 the tracker can verify. Refusing while sessions run is the only rule that
-leaves one holder per login. The cost is that already-running bare `claude`
-sessions stay on their account until they exit; new work rotates through
-`cca`.
+leaves one holder per login.
+
+**The cost, stated plainly:** while any bare `claude` (or happy-launched
+Claude Code without `CLAUDE_CONFIG_DIR`) is running, auto-switch does NOT
+change the account those sessions use. They stay on their account — at the
+limit, if that is why the switch fired — until they exit. Rotation reaches
+new work only: `cca` / `cca auto` and the cloud launcher. If the operator
+wants a running session on the new account, the move is `/exit` and `cca`.
+
+## Holder-scan blind spots
+
+`sharedLoginHolders` sees what `ps -axwwE` on THIS machine shows for this
+user. It cannot see:
+
+- Claude Code on another host (littlewing's sessions use littlewing's keychain;
+  the laptop tracker never writes it, so they are safe but also never
+  rotated by the laptop — rotation there is the selection file plus its own
+  per-dir logins).
+- Processes of another macOS user, or processes whose environment `ps -E`
+  cannot read (hardened processes hide `envp`; such a `claude` is counted
+  as a holder anyway, because an unreadable env has no `CLAUDE_CONFIG_DIR`
+  and so passes the holder test — the failure mode is a refused switch, not
+  a wrong write).
+- A Claude Code binary under a name this policy does not recognise AND not
+  launched by `happy`/Claude.app. Recognised: argv0 basename `claude`,
+  `…/claude/versions/<semver>`, `@anthropic-ai/claude-code/cli.js`, and any
+  child of a known launcher. Anything else is invisible; the re-scan after
+  the write catches only the recognised shapes too.
+- A `claude` that starts between the scan and the write (~100 ms). The
+  re-scan reports it and the notification tells the user which session to
+  check; the keychain-mdat log shows whether two writers followed.
+- Short-lived probes (`claude auth status`, `claude -p`) that start and exit
+  between cycles.
 
 ## Tests
 

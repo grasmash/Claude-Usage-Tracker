@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - pinned profiles (`Claude Code-credentials-<hash>`) are now **read-only** — never refreshed, never written; an expired entry shows as stale usage;
   - the shared `~/.claude` login is **never refreshed** by the tracker (`refreshIdleSystemLogin` deleted; `mayRefreshActiveLogin` is `false`);
   - auto-switch no longer rewrites the shared login under running sessions. It records the chosen account in `~/.claude/.autoswitch-selected` (for `cca`), and rewrites the keychain only when no `claude` without `CLAUDE_CONFIG_DIR` is running, over a login it has captured (compare-and-swap), with one in-place `-U` update — never delete+add. A refused switch stays pending and is retried each cycle.
-- No more plaintext `~/.claude/.credentials.json` mirror; the keychain is the only store.
+- No more plaintext `~/.claude/.credentials.json` mirror; the keychain is the only store, and `readSystemCredentials` is keychain-authoritative (the file is read only when there is no keychain item at all).
 - Following a `/login` now keys on the keychain's *account changing*, so a deliberately refused switch is not undone.
+- Review hardening (independent review, 2026-10-11): the holder scan recognises Claude Code by its updater path (`…/claude/versions/<semver>`, how `happy` runs it) and counts any child of a known launcher; the swap writes only the shared login's own keychain entry (legacy name or `Claude Code-credentials-<sha256(~/.claude)[:8]>`), never a pinned one; switches are serialised; processes are re-scanned after the write and a session that appeared in the window raises a time-sensitive alert naming both accounts; a pending switch is dropped after 24 h; the keychain is read once per cycle.
 
 ## [3.3.0] - 2026-08-29
 

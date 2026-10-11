@@ -974,8 +974,11 @@
 "notification.switch_not_applied.no_cli_creds" = "This profile has no Claude Code login linked, so the terminal is still on the previous account. Run /login in Claude Code, or link it in Settings.";
 "notification.switch_not_applied.needs_main_login" = "This account has no login of its own in Claude Code yet, so the terminal is still on the previous account. Run /login in Claude Code as this account once; the tracker remembers it.";
 "notification.switch_not_applied.apply_failed" = "Writing this profile's login to the keychain failed. The terminal is still on the previous account.";
-"notification.switch_not_applied.sessions_running" = "%d Claude Code session(s) are running on the shared login, so it stays on the previous account; switching it under them would log them out. New sessions started with cca use %@. The shared login switches once those sessions end.";
-"notification.switch_not_applied.unknown_login" = "Claude Code is logged into an account the tracker has not seen yet (a /login it has not caught up with). Not overwriting it; the tracker will catch up and retry.";
+"notification.switch_not_applied.sessions_running" = "%d Claude Code session(s) are running on the shared login, so it stays on %@; switching it under them would log them out. New sessions started with cca use %@. The shared login switches once those sessions end (within a day).";
+"notification.switch_not_applied.unknown_login" = "Claude Code is logged into an account the tracker has not seen yet (a /login it has not caught up with); the shared login stays as it is (last known: %@). The tracker will catch up and retry.";
+"notification.switch_not_applied.not_shared_entry" = "The keychain entry the tracker resolved (%@) is not the shared login's, so it was not written; the shared login stays on %@. Reset the keychain entry in Settings.";
+"notification.shared_login_raced.title" = "Check Claude Code's login: %@";
+"notification.shared_login_raced.body" = "%d Claude Code session(s) started while the shared login was being switched from %@ to %@. If one of them shows \"Login expired\", run /login in it.";
 "notification.switch_applied_later.title" = "Claude Code switched to %@";
 "notification.switch_applied_later.body" = "No session was using the shared login any more, so it now belongs to %@. New terminals without cca start on this account.";
 
