@@ -342,3 +342,37 @@ struct AutoSwitchDecider {
         notifiedStuck.remove(id)
     }
 }
+
+/// The dead-login auto-switch's per-profile state: one attempt per episode
+/// while a switch is pending, retried when a switch did not land, and "no way
+/// out" reported once per episode while the target search re-runs every tick.
+struct DeadLoginSwitchLatch {
+    private(set) var switched: Set<UUID> = []
+    private(set) var stuckNotified: Set<UUID> = []
+
+    /// The login works again: the episode is over.
+    mutating func loginAlive(_ id: UUID) {
+        switched.remove(id)
+        stuckNotified.remove(id)
+    }
+
+    func mayAttempt(_ id: UUID, switchInFlight: Bool) -> Bool {
+        !switchInFlight && !switched.contains(id)
+    }
+
+    /// No target this tick; returns true the first time in the episode.
+    mutating func noTarget(_ id: UUID) -> Bool {
+        stuckNotified.insert(id).inserted
+    }
+
+    mutating func attempted(_ id: UUID) {
+        switched.insert(id)
+        stuckNotified.remove(id)
+    }
+
+    /// activateProfile returned without switching: retry next tick.
+    mutating func didNotLand(_ id: UUID) { switched.remove(id) }
+
+    /// Re-armed from outside (the Opus fallback's `.switchFirst`).
+    mutating func rearm(_ id: UUID) { switched.remove(id) }
+}

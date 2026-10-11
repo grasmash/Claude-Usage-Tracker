@@ -99,9 +99,7 @@ class MenuBarManager: NSObject, ObservableObject {
     /// The fallback wait reason last logged, so each is logged once.
     private var lastLoggedRestoreWait: AutoSwitchPolicy.WaitReason?
     /// Profiles already auto-switched away from because their login died.
-    private var deadLoginSwitchedProfileIds: Set<UUID> = []
-    /// Dead-login profiles already reported as having no way out (once per episode).
-    private var deadLoginStuckNotified: Set<UUID> = []
+    private var deadLoginLatch = DeadLoginSwitchLatch()
 
     // Observer for refresh interval changes
     private var refreshIntervalObserver: NSKeyValueObservation?
@@ -1563,13 +1561,13 @@ class MenuBarManager: NSObject, ObservableObject {
         guard profiles.count > 1, let currentProfile = profileManager.activeProfile else { return }
 
         guard ClaudeCodeSyncService.shared.isLoginDead(for: currentProfile) else {
-            deadLoginSwitchedProfileIds.remove(currentProfile.id)
-            deadLoginStuckNotified.remove(currentProfile.id)
+            deadLoginLatch.loginAlive(currentProfile.id)
             return
         }
 
-        // Guard: don't re-trigger for this profile
-        guard !deadLoginSwitchedProfileIds.contains(currentProfile.id) else { return }
+        // Guard: not while a switch is in flight, and not twice for one episode.
+        guard !autoSwitchInFlight, !profileManager.isSwitchingProfile,
+              deadLoginLatch.mayAttempt(currentProfile.id, switchInFlight: false) else { return }
 
         // A dead login blocks every model, so an account without Fable headroom
         // is still a way out (`profileWithoutFable`).
@@ -1586,13 +1584,12 @@ class MenuBarManager: NSObject, ObservableObject {
             nextProfile = p
         case .noFableHeadroom, .none:
             // Retried every tick (another account may free up); said once.
-            if deadLoginStuckNotified.insert(currentProfile.id).inserted {
+            if deadLoginLatch.noTarget(currentProfile.id) {
                 LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead but no other profile is available, staying put (retrying each refresh)")
             }
             return
         }
-        deadLoginSwitchedProfileIds.insert(currentProfile.id)
-        deadLoginStuckNotified.remove(currentProfile.id)
+        deadLoginLatch.attempted(currentProfile.id)
 
         LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead, switching to '\(nextProfile.name)'")
         performAutoSwitch(from: currentProfile, to: nextProfile)
@@ -1654,7 +1651,7 @@ class MenuBarManager: NSObject, ObservableObject {
             // the END of activateProfile, and this runs on two paths per refresh).
             guard !autoSwitchInFlight, !profileManager.isSwitchingProfile, let id = active?.id else { return }
             autoSwitchDecider.reset(id)
-            deadLoginSwitchedProfileIds.remove(id)
+            deadLoginLatch.rearm(id)
             if !switchFirstLogged {
                 switchFirstLogged = true
                 LoggingService.shared.log("ModelFallback: another account has Fable headroom; switching to it before restoring the default model")
@@ -1696,6 +1693,7 @@ class MenuBarManager: NSObject, ObservableObject {
                 ) else {
                     LoggingService.shared.log("AutoSwitch: switch to '\(toName)' did not change the active profile; not announced, retried next tick")
                     self.autoSwitchDecider.reset(currentProfile.id)
+                    self.deadLoginLatch.didNotLand(currentProfile.id)
                     return
                 }
                 NotificationManager.shared.sendAutoSwitchNotification(

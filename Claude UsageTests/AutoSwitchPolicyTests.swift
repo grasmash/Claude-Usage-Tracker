@@ -590,6 +590,39 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(AutoSwitchPolicy.switchLanded(fromId: a, targetId: b, activeIdAfter: c))
     }
 
+    // MARK: - Dead-login switch: a switch that does not land is retried
+
+    func testADeadLoginSwitchThatDoesNotLandIsRetriedNextTick() {
+        let a = UUID()
+        var latch = DeadLoginSwitchLatch()
+
+        XCTAssertTrue(latch.mayAttempt(a, switchInFlight: false))
+        latch.attempted(a)
+        XCTAssertFalse(latch.mayAttempt(a, switchInFlight: false), "no second attempt while the first is pending")
+
+        latch.didNotLand(a)   // activateProfile returned without switching
+        XCTAssertTrue(latch.mayAttempt(a, switchInFlight: false), "the next tick tries again")
+    }
+
+    func testADeadLoginSwitchIsNotAttemptedWhileAnotherSwitchIsInFlight() {
+        let a = UUID()
+        var latch = DeadLoginSwitchLatch()
+        XCTAssertFalse(latch.mayAttempt(a, switchInFlight: true))
+        latch.attempted(a)
+        latch.loginAlive(a)
+        XCTAssertTrue(latch.mayAttempt(a, switchInFlight: false), "a live login ends the episode")
+    }
+
+    func testDeadLoginWithNoTargetIsReportedOncePerEpisode() {
+        let a = UUID()
+        var latch = DeadLoginSwitchLatch()
+        XCTAssertTrue(latch.noTarget(a))
+        XCTAssertFalse(latch.noTarget(a))
+        XCTAssertTrue(latch.mayAttempt(a, switchInFlight: false), "no target does not latch: retried every tick")
+        latch.loginAlive(a)
+        XCTAssertTrue(latch.noTarget(a))
+    }
+
     private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {
         Profile(
             name: name,
