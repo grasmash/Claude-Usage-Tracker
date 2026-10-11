@@ -255,7 +255,7 @@ final class MainLoginSwapPolicyTests: XCTestCase {
         let unread = Profile(name: "unread", cliCredentialsJSON: "json-unread")
 
         let spent = MainLoginSwapPolicy.spentLogins(
-            in: [weekly, session, headroom, rolledOver, unread], usingFable: false, isLoginDead: { _ in false })
+            in: [weekly, session, headroom, rolledOver, unread], isLoginDead: { _ in false })
 
         XCTAssertEqual(spent, ["json-weekly", "json-session"])
     }
@@ -264,26 +264,58 @@ final class MainLoginSwapPolicyTests: XCTestCase {
         // The tracker stops polling an account once it is no longer the active
         // profile; a 100% weekly window stays spent until its reset regardless.
         let old = profile("old", spentUsage(weekly: 100, updatedAt: Date().addingTimeInterval(-3 * 3600)))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [old], usingFable: false, isLoginDead: { _ in false }), ["json-old"])
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [old], isLoginDead: { _ in false }), ["json-old"])
     }
 
-    func testASpentFableQuotaAloneDoesNotOverrideRunningSessionsByDefault() {
-        // Fable-weekly decides which account auto-switch picks, but on its own
-        // it does not let the swap go under running sessions (operator call).
+    func testASpentFableQuotaIsNotASessionOrWeeklySpentLogin() {
         let fable = profile("fable", spentUsage(fable: 100))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: true, isLoginDead: { _ in false }), [])
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: false, isLoginDead: { _ in false }), [])
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], isLoginDead: { _ in false }), [])
     }
 
-    func testASpentFableQuotaCountsWhenAllowedAndClaudeCodeRunsFable() {
+    func testFableSpentLoginsAreThoseWhoseFableWeeklyIsAt100() {
         let fable = profile("fable", spentUsage(fable: 100))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: true, fableOverrideAllowed: true, isLoginDead: { _ in false }), ["json-fable"])
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: false, fableOverrideAllowed: true, isLoginDead: { _ in false }), [])
+        let weekly = profile("weekly", spentUsage(weekly: 100))
+        let some = profile("some", spentUsage(fable: 80))
+        XCTAssertEqual(MainLoginSwapPolicy.fableSpentLogins(in: [fable, weekly, some]), ["json-fable"])
+    }
+
+    // MARK: - Is Fable in use by the sessions holding the shared login?
+
+    func testFableIsInUseOnlyWhenEveryHolderIsOnFable() {
+        let holders: [MainLoginSwapPolicy.RunningProcess] = [
+            .init(pid: 1, command: "claude", configDir: nil), .init(pid: 2, command: "claude", configDir: nil)]
+        let models: [Int32: String] = [1: "claude-fable-5-1", 2: "claude-fable-5-1"]
+        XCTAssertTrue(MainLoginSwapPolicy.allHoldersOnFable(holders, modelOf: { models[$0] }))
+        XCTAssertFalse(MainLoginSwapPolicy.allHoldersOnFable(holders, modelOf: { $0 == 1 ? "claude-fable-5-1" : "claude-opus-5-5" }),
+                       "a holder on Opus is working; it is not stranded")
+        XCTAssertFalse(MainLoginSwapPolicy.allHoldersOnFable(holders, modelOf: { $0 == 1 ? "claude-fable-5-1" : nil }),
+                       "a holder whose model is unknown is not assumed stranded")
+        XCTAssertFalse(MainLoginSwapPolicy.allHoldersOnFable([], modelOf: { _ in "claude-fable-5-1" }))
+    }
+
+    func testAHolderModelIsReadFromItsOwnSessionTranscript() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions")
+        let project = root.appendingPathComponent("projects/-Users-me-work")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"pid":4242,"sessionId":"sess-1","cwd":"/Users/me/work"}"#.write(
+            to: sessions.appendingPathComponent("4242.json"), atomically: true, encoding: .utf8)
+        try """
+        {"type":"assistant","message":{"model":"claude-fable-5-1","content":[]}}
+        {"type":"assistant","message":{"model":"<synthetic>","content":[]}}
+        """.write(to: project.appendingPathComponent("sess-1.jsonl"), atomically: true, encoding: .utf8)
+        try #"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[]}}"#.write(
+            to: project.appendingPathComponent("other.jsonl"), atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(MainLoginSwapPolicy.holderModel(pid: 4242, sessionsDirectory: sessions, projectsDirectory: root.appendingPathComponent("projects")), "claude-fable-5-1")
+        XCTAssertNil(MainLoginSwapPolicy.holderModel(pid: 999, sessionsDirectory: sessions, projectsDirectory: root.appendingPathComponent("projects")))
     }
 
     func testADeadLoginIsSpent() {
         let dead = profile("dead", spentUsage(weekly: 10))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [dead], usingFable: false, isLoginDead: { $0.name == "dead" }), ["json-dead"])
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [dead], isLoginDead: { $0.name == "dead" }), ["json-dead"])
     }
 
     private func profile(_ name: String, _ usage: ClaudeUsage) -> Profile {

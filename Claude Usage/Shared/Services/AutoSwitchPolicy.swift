@@ -101,6 +101,41 @@ enum AutoSwitchPolicy {
         return nil
     }
 
+    /// Where auto-switch goes (operator, 2026-10-11: "if fable is being used,
+    /// and a fable limit is hit, change profile. only if being used. if none
+    /// is available, downgrade to opus as last resort").
+    enum SwitchTarget: Equatable {
+        /// A profile that unblocks Claude Code as it is configured (with Fable
+        /// headroom when Fable is in use).
+        case profile(Profile)
+        /// Fable is in use and no profile has Fable headroom, but the current
+        /// account is blocked beyond Fable (session/weekly/dead) and this one
+        /// is not: the sessions can run there once switched to Opus.
+        case profileWithoutFable(Profile)
+        /// Fable is in use, only its Fable quota is spent, and no profile has
+        /// Fable headroom: moving gains nothing; the sessions stay.
+        case noFableHeadroom
+        /// Nothing available.
+        case none
+    }
+
+    /// `blockedBeyondFable`: the current account is blocked by its session or
+    /// weekly limit (or a dead login), not only by its Fable quota.
+    static func switchTarget(
+        in profiles: [Profile], after current: Profile, usingFable: Bool, blockedBeyondFable: Bool,
+        now: Date = Date(), isLoginDead: (Profile) -> Bool = { _ in false }
+    ) -> SwitchTarget {
+        if let p = nextAvailableProfile(in: profiles, after: current, usingFable: usingFable, now: now, isLoginDead: isLoginDead) {
+            return .profile(p)
+        }
+        guard usingFable else { return .none }
+        guard blockedBeyondFable else { return .noFableHeadroom }
+        if let p = nextAvailableProfile(in: profiles, after: current, usingFable: false, now: now, isLoginDead: isLoginDead) {
+            return .profileWithoutFable(p)
+        }
+        return .none
+    }
+
     // MARK: - Claude Code model selection
 
     /// True when a Claude Code model setting (alias like `fable`, or a full id

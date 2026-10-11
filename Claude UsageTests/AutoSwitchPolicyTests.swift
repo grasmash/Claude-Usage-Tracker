@@ -423,6 +423,47 @@ final class AutoSwitchPolicyTests: XCTestCase {
 
     /// A profile that is a valid switch target: it has CLI credentials the
     /// tracker can write into the keychain.
+    // MARK: - Fable in use: target choice and last resort (operator, 2026-10-11)
+
+    func testWhenFableIsInUseAProfileWithFableHeadroomIsPreferred() {
+        let current = makeProfile("A", usage: makeUsage(session: 10, weekly: 100))
+        let noFable = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        let fableLeft = makeProfile("C", usage: makeUsage(session: 10, weekly: 10, fable: 20))
+
+        let target = AutoSwitchPolicy.switchTarget(
+            in: [current, noFable, fableLeft], after: current, usingFable: true, blockedBeyondFable: true)
+
+        XCTAssertEqual(target, .profile(fableLeft))
+    }
+
+    func testWhenNoProfileHasFableHeadroomASessionOrWeeklyBlockStillMovesToOneWithout() {
+        let current = makeProfile("A", usage: makeUsage(session: 10, weekly: 100))
+        let noFable = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+
+        let target = AutoSwitchPolicy.switchTarget(
+            in: [current, noFable], after: current, usingFable: true, blockedBeyondFable: true)
+
+        XCTAssertEqual(target, .profileWithoutFable(noFable), "the sessions can run Opus there; on A they can run nothing")
+    }
+
+    func testAFableOnlyBlockDoesNotMoveToAnAccountWithoutFableHeadroom() {
+        let current = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        let noFable = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+
+        let target = AutoSwitchPolicy.switchTarget(
+            in: [current, noFable], after: current, usingFable: true, blockedBeyondFable: false)
+
+        XCTAssertEqual(target, .noFableHeadroom, "moving gains nothing: Opus runs on A as well as on B")
+    }
+
+    func testWithoutFableTheTargetIsTheNextProfileUnderSessionAndWeekly() {
+        let current = makeProfile("A", usage: makeUsage(session: 100, weekly: 10))
+        let b = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+
+        XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [current, b], after: current, usingFable: false, blockedBeyondFable: true), .profile(b))
+        XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [current], after: current, usingFable: false, blockedBeyondFable: true), .none)
+    }
+
     private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {
         Profile(
             name: name,

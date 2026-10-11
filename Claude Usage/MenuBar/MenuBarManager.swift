@@ -1493,11 +1493,26 @@ class MenuBarManager: NSObject, ObservableObject {
         // Mark as triggered
         autoSwitchedProfileIds.insert(profileId)
 
-        // Find the next available profile
-        guard let nextProfile = AutoSwitchPolicy.nextAvailableProfile(
-            in: profiles, after: currentProfile, usingFable: usingFable,
+        // Find the next available profile: with Fable headroom first when Fable
+        // is in use; Opus on another account only as a last resort.
+        let nextProfile: Profile
+        switch AutoSwitchPolicy.switchTarget(
+            in: profiles, after: currentProfile, usingFable: usingFable, blockedBeyondFable: usage.isLimitReached,
             isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
-        ) else {
+        ) {
+        case .profile(let p):
+            nextProfile = p
+        case .profileWithoutFable(let p):
+            LoggingService.shared.log("AutoSwitch: no account has Fable headroom; '\(currentProfile.name)' is blocked beyond Fable, so moving to '\(p.name)' (sessions need /model opus)")
+            NotificationManager.shared.sendNoFableHeadroomNotification(
+                fromProfile: currentProfile.name, movedTo: p.name, settings: currentProfile.notificationSettings)
+            nextProfile = p
+        case .noFableHeadroom:
+            LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit its Fable limit and no account has Fable headroom; staying (sessions need /model opus)")
+            NotificationManager.shared.sendNoFableHeadroomNotification(
+                fromProfile: currentProfile.name, movedTo: nil, settings: currentProfile.notificationSettings)
+            return
+        case .none:
             let limits = usingFable ? "session/weekly/Fable" : "session/weekly"
             LoggingService.shared.log("AutoSwitch: All profiles at \(limits) limit or unavailable, staying on '\(currentProfile.name)'")
             return
@@ -1555,11 +1570,21 @@ class MenuBarManager: NSObject, ObservableObject {
         guard !deadLoginSwitchedProfileIds.contains(currentProfile.id) else { return }
         deadLoginSwitchedProfileIds.insert(currentProfile.id)
 
-        guard let nextProfile = AutoSwitchPolicy.nextAvailableProfile(
+        // A dead login blocks every model, so an account without Fable headroom
+        // is still a way out (`profileWithoutFable`).
+        let target = AutoSwitchPolicy.switchTarget(
             in: profiles, after: currentProfile,
-            usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(),
+            usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(), blockedBeyondFable: true,
             isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
-        ) else {
+        )
+        let nextProfile: Profile
+        switch target {
+        case .profile(let p): nextProfile = p
+        case .profileWithoutFable(let p):
+            NotificationManager.shared.sendNoFableHeadroomNotification(
+                fromProfile: currentProfile.name, movedTo: p.name, settings: currentProfile.notificationSettings)
+            nextProfile = p
+        case .noFableHeadroom, .none:
             LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead but no other profile is available, staying put")
             return
         }

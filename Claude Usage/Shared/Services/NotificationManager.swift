@@ -377,6 +377,36 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// Fable is in use and no account has Fable headroom. Claude Code does not
+    /// fall back to Opus by itself on a Fable limit ("switch models with
+    /// /model"), and the tracker never edits Claude Code's model setting, so
+    /// the user is told to switch. `movedTo` is set when the shared login was
+    /// still moved (the old account was blocked beyond Fable).
+    func sendNoFableHeadroomNotification(fromProfile: String, movedTo: String?, settings: NotificationSettings) {
+        guard settings.enabled else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "notification.no_fable_headroom.title".localized
+        if let movedTo {
+            content.body = "notification.no_fable_headroom.moved".localized(with: fromProfile, movedTo)
+        } else {
+            content.body = "notification.no_fable_headroom.stayed".localized(with: fromProfile)
+        }
+        content.sound = .defaultCritical
+        content.categoryIdentifier = "INFO_ALERT"
+        content.interruptionLevel = .timeSensitive
+
+        let request = UNNotificationRequest(
+            identifier: "no_fable_headroom_\(fromProfile)_\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send no-Fable-headroom notification: \(error)")
+            }
+        }
+    }
+
     /// Tells the user the shared login was switched off a spent account, but the
     /// sessions stranded on it could not be told to reload.
     func sendStrandedSessionsNotSignalledNotification(profileName: String, previousName: String, settings: NotificationSettings) {

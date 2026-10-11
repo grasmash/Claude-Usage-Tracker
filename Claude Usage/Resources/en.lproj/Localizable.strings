@@ -983,6 +983,9 @@
 "notification.shared_login_raced.body" = "%d Claude Code session(s) started while the shared login was being switched from %@ to %@. If one of them shows \"Login expired\", run /login in it.";
 "notification.shared_login_raced.unverified" = "The shared login was switched from %@ to %@, but the tracker could not verify the result (keychain or process list unreadable right after the write). If a Claude Code session shows \"Login expired\", run /login in it.";
 "notification.stranded_not_signalled.body" = "%@ hit its limit, so Claude Code's shared login was switched to %@, but the running sessions could not be told to reload. Restart them or run /login in one.";
+"notification.no_fable_headroom.title" = "No Fable headroom on any account";
+"notification.no_fable_headroom.moved" = "%@ hit its limit and no account has Fable left, so Claude Code moved to %@. Claude Code does not fall back to Opus on its own: run /model opus in each session.";
+"notification.no_fable_headroom.stayed" = "%@ hit its Fable limit and no account has Fable left, so the sessions stay where they are. Claude Code does not fall back to Opus on its own: run /model opus in each session.";
 "notification.switch_applied_later.title" = "Claude Code switched to %@";
 "notification.switch_applied_later.body" = "No session was using the shared login any more, so it now belongs to %@. New terminals without cca start on this account.";
 

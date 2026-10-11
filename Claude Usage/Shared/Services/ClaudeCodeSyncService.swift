@@ -61,6 +61,16 @@ class ClaudeCodeSyncService {
         ClaudeCodeSyncService.listRunningProcesses()
     }
 
+    /// The model a shared-login holder's session last answered with, from its
+    /// `~/.claude/sessions/<pid>.json` and that session's transcript; nil when
+    /// unknown. Tests supply a map.
+    var holderModel: (Int32) -> String? = { pid in
+        MainLoginSwapPolicy.holderModel(
+            pid: pid,
+            sessionsDirectory: Constants.ClaudePaths.claudeDirectory.appendingPathComponent("sessions"),
+            projectsDirectory: Constants.ClaudePaths.projectsDirectory)
+    }
+
     static func isMutatingSecurityVerb(_ verb: String?) -> Bool {
         guard let verb else { return false }
         return verb.hasPrefix("add-") || verb.hasPrefix("delete-") || verb.hasPrefix("set-")
@@ -847,7 +857,8 @@ class ClaudeCodeSyncService {
     /// 1. No Claude Code process is running on the shared login. Every such
     ///    process holds the login in memory; swapping it under them leaves two
     ///    holders of one single-use refresh token. Exception: when the shared
-    ///    login's account is spent (in `spentLogins`: at a limit, or dead), its
+    ///    login's account is spent (in `spentLogins`: at a session or weekly
+    ///    limit, or dead; or in `fableSpentLogins` with every holder on Fable), its
     ///    sessions are stranded and can make no request, so they do not block;
     ///    they are told to reload onto the new login after the write.
     /// 2. The keychain holds a login the tracker has captured (compare-and-
@@ -862,9 +873,9 @@ class ClaudeCodeSyncService {
     ///
     /// `knownLogins` are the main logins the tracker has captured (every
     /// profile's `cliCredentialsJSON`), for the compare-and-swap.
-    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], spentLogins: [String] = []) async throws -> MainLoginSwitch {
+    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], spentLogins: [String] = [], fableSpentLogins: [String] = []) async throws -> MainLoginSwitch {
         try await withSwitchMutex {
-            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, spentLogins: spentLogins)
+            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, spentLogins: spentLogins, fableSpentLogins: fableSpentLogins)
         }
     }
 
@@ -880,7 +891,7 @@ class ClaudeCodeSyncService {
         }
     }
 
-    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String], spentLogins: [String]) async throws -> MainLoginSwitch {
+    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String], spentLogins: [String], fableSpentLogins: [String]) async throws -> MainLoginSwitch {
         guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
             // A pinned entry's login is never copied into the main keychain:
             // that puts one single-use refresh token in two config dirs.
@@ -933,7 +944,12 @@ class ClaudeCodeSyncService {
         let holders = MainLoginSwapPolicy.sharedLoginHolders(in: processes)
         let known = Set(knownLogins.compactMap(systemLoginFingerprint))
         // Sessions on a spent login are stranded, not working: they do not block.
-        let keychainLoginSpent = keychainFingerprint.map { Set(spentLogins.compactMap(systemLoginFingerprint)).contains($0) } ?? false
+        // A spent Fable quota strands them only if every holder is on Fable.
+        func listed(_ logins: [String]) -> Bool {
+            keychainFingerprint.map { Set(logins.compactMap(systemLoginFingerprint)).contains($0) } ?? false
+        }
+        let keychainLoginSpent = listed(spentLogins)
+            || (listed(fableSpentLogins) && !holders.isEmpty && MainLoginSwapPolicy.allHoldersOnFable(holders, modelOf: holderModel))
         if let refusal = MainLoginSwapPolicy.refusal(
             holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known,
             keychainLoginSpent: keychainLoginSpent
@@ -1053,10 +1069,10 @@ class ClaudeCodeSyncService {
                 throw ClaudeCodeError.noProfileCredentials
             }
             let pinned = Set(profiles.compactMap(\.customKeychainServiceName)).compactMap { readKeychainCredentials(serviceName: $0) }
-            let spent = MainLoginSwapPolicy.spentLogins(
-                in: profiles, usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(), isLoginDead: isLoginDead(for:))
+            let spent = MainLoginSwapPolicy.spentLogins(in: profiles, isLoginDead: isLoginDead(for:))
             return try await performMainLoginSwitch(
-                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned, spentLogins: spent)
+                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned, spentLogins: spent,
+                fableSpentLogins: MainLoginSwapPolicy.fableSpentLogins(in: profiles))
         }
     }
 

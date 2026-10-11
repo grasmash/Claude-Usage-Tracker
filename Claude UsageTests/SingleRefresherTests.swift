@@ -20,6 +20,8 @@ final class SingleRefresherTests: XCTestCase {
     private var refreshCalls = 0
     /// nil = "ps failed", which the swap must treat as unknown (C1).
     private var processes: [MainLoginSwapPolicy.RunningProcess]? = []
+    private var holderModels: [Int32: String] = [:]
+    private var savedHolderModel: ((Int32) -> String?)!
     private var tempDir: URL!
 
     private var savedRunner: ((_ arguments: [String], _ timeout: TimeInterval) -> ClaudeCodeSyncService.SecurityCommandResult?)!
@@ -32,6 +34,8 @@ final class SingleRefresherTests: XCTestCase {
         savedRunner = sync.securityCommandRunner
         savedRefresher = sync.tokenRefresher
         savedProcesses = sync.runningProcesses
+        savedHolderModel = sync.holderModel
+        holderModels = [:]
         savedCredentialsFile = sync.credentialsFileURL
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -46,6 +50,7 @@ final class SingleRefresherTests: XCTestCase {
         sync.setResolvedServiceNameForTesting(mainService)
         sync.credentialsFileURL = tempDir.appendingPathComponent(".credentials.json")
         sync.runningProcesses = { [unowned self] in self.processes }
+        sync.holderModel = { [unowned self] pid in self.holderModels[pid] }
         sync.tokenRefresher = { [unowned self] _ in
             self.refreshCalls += 1
             return ClaudeCodeSyncService.OAuthRefreshResponse(
@@ -81,6 +86,7 @@ final class SingleRefresherTests: XCTestCase {
         sync.securityCommandRunner = savedRunner
         sync.tokenRefresher = savedRefresher
         sync.runningProcesses = savedProcesses
+        sync.holderModel = savedHolderModel
         sync.credentialsFileURL = savedCredentialsFile
         try? FileManager.default.removeItem(at: tempDir)
         super.tearDown()
@@ -277,6 +283,34 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertEqual(keychain[mainService], rotated, "the rotated login is never overwritten")
         XCTAssertFalse(securityCalls.contains { $0.first == "add-generic-password" && $0.contains(self.mainService) },
                        "no write to the shared entry: \(writes)")
+    }
+
+    func testAFableLimitStrandsTheSessionsWhenEveryHolderIsOnFable() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = [bareClaude(500), bareClaude(501)]
+        holderModels = [500: "claude-fable-5-1", 501: "claude-fable-5-1[1m]"]
+        let b = imported("B", login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(
+            to: b, knownLogins: [a, b.cliCredentialsJSON!], fableSpentLogins: [a])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0, strandedSignalled: false))
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+    }
+
+    func testAFableLimitDoesNotOverrideAHolderThatIsNotOnFable() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = [bareClaude(500), bareClaude(501)]
+        holderModels = [500: "claude-fable-5-1", 501: "claude-opus-5-5"]
+        let b = imported("B", login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(
+            to: b, knownLogins: [a, b.cliCredentialsJSON!], fableSpentLogins: [a])
+
+        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 2)), "the Opus session on A is working")
+        XCTAssertTrue(writes.isEmpty)
     }
 
     func testSessionsStillBlockTheSwitchWhenTheSpentLoginIsNotTheSharedOne() async throws {

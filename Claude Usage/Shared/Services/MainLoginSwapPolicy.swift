@@ -248,17 +248,51 @@ enum MainLoginSwapPolicy {
     /// spent window stays spent until its reset time, which the effective
     /// percentages already honour, and the tracker stops polling an account
     /// once it is no longer the active profile. A spent Fable-weekly quota
-    /// counts only with `fableOverrideAllowed` (default off).
-    static func spentLogins(in profiles: [Profile], usingFable: Bool, fableOverrideAllowed: Bool = false, isLoginDead: (Profile) -> Bool) -> [String] {
+    /// is not here: see `fableSpentLogins`.
+    static func spentLogins(in profiles: [Profile], isLoginDead: (Profile) -> Bool) -> [String] {
         profiles.compactMap { profile in
             guard let json = profile.cliCredentialsJSON else { return nil }
-            // Fable-weekly picks the auto-switch target, but alone it overrides
-            // running sessions only when `fableOverrideAllowed` (operator call).
-            let atLimit = profile.claudeUsage.map {
-                fableOverrideAllowed ? $0.isLimitReached(usingFable: usingFable) : $0.isLimitReached
-            } ?? false
+            let atLimit = profile.claudeUsage?.isLimitReached ?? false
             return atLimit || isLoginDead(profile) ? json : nil
         }
+    }
+
+    /// The stored main logins whose Fable weekly quota is at 100% and has not
+    /// reset. Spent for the swap only when every holder is on Fable
+    /// (`allHoldersOnFable`): a session on another model is still working.
+    static func fableSpentLogins(in profiles: [Profile]) -> [String] {
+        profiles.compactMap { profile in
+            guard let json = profile.cliCredentialsJSON,
+                  let usage = profile.claudeUsage, usage.effectiveFableWeeklyPercentage >= 100.0 else { return nil }
+            return json
+        }
+    }
+
+    /// True when every holder's session is on Fable. A holder on another model,
+    /// or one whose model cannot be read, is not assumed stranded.
+    static func allHoldersOnFable(_ holders: [RunningProcess], modelOf: (Int32) -> String?) -> Bool {
+        !holders.isEmpty && holders.allSatisfy { AutoSwitchPolicy.isFableModel(modelOf($0.pid)) }
+    }
+
+    /// The model a holder's own session last answered with: Claude Code
+    /// records each live session in `sessions/<pid>.json` (`sessionId`), and
+    /// the transcript is `projects/<project>/<sessionId>.jsonl`. nil when
+    /// either is missing or has no real reply yet.
+    static func holderModel(pid: Int32, sessionsDirectory: URL, projectsDirectory: URL) -> String? {
+        let record = sessionsDirectory.appendingPathComponent("\(pid).json")
+        guard let data = try? Data(contentsOf: record),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessionId = json["sessionId"] as? String, !sessionId.isEmpty,
+              !sessionId.contains("/") else { return nil }
+        guard let projects = try? FileManager.default.contentsOfDirectory(
+            at: projectsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
+        for dir in projects {
+            let transcript = dir.appendingPathComponent("\(sessionId).jsonl")
+            if FileManager.default.fileExists(atPath: transcript.path) {
+                return AutoSwitchPolicy.latestAssistantModel(in: transcript)
+            }
+        }
+        return nil
     }
 
     /// Only one tracker may run per user: two would be two refreshers and two
