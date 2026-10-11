@@ -448,10 +448,14 @@ class ProfileManager: ObservableObject {
         _ outcome: ClaudeCodeSyncService.MainLoginSwitch, for profile: Profile, previousName: String, announceLater: Bool
     ) {
         switch outcome {
-        case .applied(let raced):
+        case .applied(let raced, let strandedSignalled):
             pendingMainLoginSwitch = false
             lastKeychainIdentity = ClaudeCodeSyncService.shared.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) ?? lastKeychainIdentity
             LoggingService.shared.log("✓ Claude Code's shared login is '\(profile.name)' (written; was '\(previousName)')")
+            if !strandedSignalled {
+                NotificationManager.shared.sendStrandedSessionsNotSignalledNotification(
+                    profileName: profile.name, previousName: previousName, settings: profile.notificationSettings)
+            }
             if raced == nil || raced! > 0 {
                 // nil: the write or the re-scan could not be verified; a separate wording.
                 NotificationManager.shared.sendSharedLoginRaceNotification(

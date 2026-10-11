@@ -247,11 +247,16 @@ enum MainLoginSwapPolicy {
     /// has not reset yet, or a dead login. The reading need not be fresh: a
     /// spent window stays spent until its reset time, which the effective
     /// percentages already honour, and the tracker stops polling an account
-    /// once it is no longer the active profile.
-    static func spentLogins(in profiles: [Profile], usingFable: Bool, isLoginDead: (Profile) -> Bool) -> [String] {
+    /// once it is no longer the active profile. A spent Fable-weekly quota
+    /// counts only with `fableOverrideAllowed` (default off).
+    static func spentLogins(in profiles: [Profile], usingFable: Bool, fableOverrideAllowed: Bool = false, isLoginDead: (Profile) -> Bool) -> [String] {
         profiles.compactMap { profile in
             guard let json = profile.cliCredentialsJSON else { return nil }
-            let atLimit = profile.claudeUsage?.isLimitReached(usingFable: usingFable) ?? false
+            // Fable-weekly picks the auto-switch target, but alone it overrides
+            // running sessions only when `fableOverrideAllowed` (operator call).
+            let atLimit = profile.claudeUsage.map {
+                fableOverrideAllowed ? $0.isLimitReached(usingFable: usingFable) : $0.isLimitReached
+            } ?? false
             return atLimit || isLoginDead(profile) ? json : nil
         }
     }

@@ -812,7 +812,12 @@ class ClaudeCodeSyncService {
         /// the write: normally 0; more means one started in the window between
         /// the scan and the write and may hold the login that was replaced;
         /// nil means the re-scan itself failed, so the window is unverified.
-        case applied(racedHolders: Int?)
+        ///
+        /// `strandedSignalled` is false only when sessions stranded on a spent
+        /// login were switched under but could not be told to reload (the
+        /// credentials file is missing): they stay on the spent login until
+        /// they restart or the user runs /login.
+        case applied(racedHolders: Int?, strandedSignalled: Bool = true)
         /// The keychain already held this profile's login; nothing was written.
         case alreadyApplied
         /// Not done, for a reason the policy names. Retry on a later cycle.
@@ -946,6 +951,21 @@ class ClaudeCodeSyncService {
             throw ClaudeCodeError.noProfileCredentials
         }
 
+        // Re-do the compare-and-swap: the refresh above is a network call, and
+        // a session (or a /login) may have rotated the keychain meanwhile. The
+        // pending retry picks this up on a later cycle.
+        let keychainNow: String?
+        do {
+            keychainNow = try readKeychainCredentials()
+        } catch {
+            LoggingService.shared.logError("switchMainLogin: cannot re-read the shared keychain entry before writing; refusing", error: error)
+            return .refused(.keychainUnreadable)
+        }
+        if keychainNow.flatMap(systemLoginFingerprint) != keychainFingerprint {
+            LoggingService.shared.log("switchMainLogin: the shared login changed while '\(profile.name)''s stored login was refreshed; not writing")
+            return .refused(.unknownKeychainLogin)
+        }
+
         try writeSystemCredentials(jsonData)
         // Verify the write. A read that THROWS (timeout, launch failure) after a
         // write that succeeded is not a failed write: retry once, and if it still
@@ -971,15 +991,22 @@ class ClaudeCodeSyncService {
         }
         lastSeenSystemLoginFingerprint = systemLoginFingerprint(jsonData)
 
+        // Stranded sessions (on a spent login) were there before the write and
+        // are expected; tell them to reload onto the new login now. The signal
+        // never creates the file; a failure is reported to the caller.
+        var strandedSignalled = true
+        if !holders.isEmpty {
+            strandedSignalled = Self.signalCredentialsReload(at: credentialsFileURL)
+            if strandedSignalled {
+                LoggingService.shared.log("switchMainLogin: touched the credentials file so the \(holders.count) stranded session(s) reload onto '\(profile.name)'")
+            } else {
+                LoggingService.shared.logError("⚠️ switchMainLogin: could not signal the \(holders.count) stranded session(s) to reload (no \(credentialsFileURL.lastPathComponent)); they stay on the spent login until restarted or /login")
+            }
+        }
+
         // Re-scan: a `claude` that started between the scan above and the write
         // read the keychain before or after it, and we cannot tell which. Say so
         // loudly; the caller notifies, and the keychain-mdat log will show it.
-        // Stranded sessions (on a spent login) were there before the write and
-        // are expected; tell them to reload onto the new login now.
-        if !holders.isEmpty, Self.signalCredentialsReload(at: credentialsFileURL) {
-            LoggingService.shared.log("switchMainLogin: touched the credentials file so the \(holders.count) stranded session(s) reload onto '\(profile.name)'")
-        }
-
         let racedCount: Int?
         if let after = runningProcesses() {
             let before = Set(holders.map(\.pid))
@@ -1010,7 +1037,7 @@ class ClaudeCodeSyncService {
         }
 
         LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)'")
-        return .applied(racedHolders: verified ? racedCount : nil)
+        return .applied(racedHolders: verified ? racedCount : nil, strandedSignalled: strandedSignalled)
     }
 
     /// `switchMainLogin(to:knownLogins:pinnedLogins:)` for a stored profile,

@@ -267,10 +267,18 @@ final class MainLoginSwapPolicyTests: XCTestCase {
         XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [old], usingFable: false, isLoginDead: { _ in false }), ["json-old"])
     }
 
-    func testASpentFableQuotaCountsOnlyWhenClaudeCodeRunsFable() {
+    func testASpentFableQuotaAloneDoesNotOverrideRunningSessionsByDefault() {
+        // Fable-weekly decides which account auto-switch picks, but on its own
+        // it does not let the swap go under running sessions (operator call).
         let fable = profile("fable", spentUsage(fable: 100))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: true, isLoginDead: { _ in false }), ["json-fable"])
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: true, isLoginDead: { _ in false }), [])
         XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: false, isLoginDead: { _ in false }), [])
+    }
+
+    func testASpentFableQuotaCountsWhenAllowedAndClaudeCodeRunsFable() {
+        let fable = profile("fable", spentUsage(fable: 100))
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: true, fableOverrideAllowed: true, isLoginDead: { _ in false }), ["json-fable"])
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: false, fableOverrideAllowed: true, isLoginDead: { _ in false }), [])
     }
 
     func testADeadLoginIsSpent() {

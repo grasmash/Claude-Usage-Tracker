@@ -240,6 +240,45 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertGreaterThan(mtime ?? past, past, "the stranded sessions are told to reload onto B")
     }
 
+    func testAFailedReloadSignalToStrandedSessionsIsReported() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = [bareClaude(500)]
+        let b = imported("B", login("B", expiresIn: 3600))
+        let creds = sync.credentialsFileURL
+        XCTAssertFalse(FileManager.default.fileExists(atPath: creds.path))
+
+        let outcome = try await sync.switchMainLogin(
+            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [a])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0, strandedSignalled: false),
+                       "the stranded session could not be told to reload; the caller must say so")
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: creds.path), "the signal never creates the file")
+    }
+
+    func testSwitchIsRefusedWhenTheKeychainChangesDuringTheStoredLoginRefresh() async throws {
+        // A session refreshed (or the user ran /login) while the tracker was
+        // refreshing B's expired stored login: the compare-and-swap is re-done
+        // right before the write.
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = imported("B", login("B", expiresIn: -600))
+        let rotated = login("A-rotated", expiresIn: 3600)
+        let inner = sync.tokenRefresher
+        sync.tokenRefresher = { [unowned self] token in
+            self.keychain[self.mainService] = rotated
+            return try await inner(token)
+        }
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.unknownKeychainLogin))
+        XCTAssertEqual(keychain[mainService], rotated, "the rotated login is never overwritten")
+        XCTAssertFalse(securityCalls.contains { $0.first == "add-generic-password" && $0.contains(self.mainService) },
+                       "no write to the shared entry: \(writes)")
+    }
+
     func testSessionsStillBlockTheSwitchWhenTheSpentLoginIsNotTheSharedOne() async throws {
         let a = login("A", expiresIn: 3600)
         keychain[mainService] = a

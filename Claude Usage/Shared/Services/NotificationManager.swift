@@ -377,6 +377,28 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// Tells the user the shared login was switched off a spent account, but the
+    /// sessions stranded on it could not be told to reload.
+    func sendStrandedSessionsNotSignalledNotification(profileName: String, previousName: String, settings: NotificationSettings) {
+        let content = UNMutableNotificationContent()
+        content.title = "notification.shared_login_raced.title".localized(with: profileName)
+        content.body = "notification.stranded_not_signalled.body".localized(with: previousName, profileName)
+        content.sound = .defaultCritical
+        content.categoryIdentifier = "INFO_ALERT"
+        content.interruptionLevel = .timeSensitive
+
+        let request = UNNotificationRequest(
+            identifier: "stranded_not_signalled_\(profileName)_\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send stranded-sessions notification: \(error)")
+            }
+        }
+    }
+
     /// Tells the user a profile switch did NOT reach Claude Code (the keychain
     /// still holds the previous account) and what to do about it.
     func sendSwitchNotAppliedNotification(profileName: String, reason: String, settings: NotificationSettings) {

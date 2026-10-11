@@ -982,6 +982,7 @@
 "notification.shared_login_raced.title" = "Check Claude Code's login: %@";
 "notification.shared_login_raced.body" = "%d Claude Code session(s) started while the shared login was being switched from %@ to %@. If one of them shows \"Login expired\", run /login in it.";
 "notification.shared_login_raced.unverified" = "The shared login was switched from %@ to %@, but the tracker could not verify the result (keychain or process list unreadable right after the write). If a Claude Code session shows \"Login expired\", run /login in it.";
+"notification.stranded_not_signalled.body" = "%@ hit its limit, so Claude Code's shared login was switched to %@, but the running sessions could not be told to reload. Restart them or run /login in one.";
 "notification.switch_applied_later.title" = "Claude Code switched to %@";
 "notification.switch_applied_later.body" = "No session was using the shared login any more, so it now belongs to %@. New terminals without cca start on this account.";
 
