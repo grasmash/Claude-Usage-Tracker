@@ -1190,7 +1190,7 @@ class MenuBarManager: NSObject, ObservableObject {
         profileManager.importPendingLogin()
         profileManager.adoptExternalLoginIfNeeded()
         profileManager.captureActiveMainLogin()
-        profileManager.refreshIdleLogins()
+        profileManager.applyPendingMainLoginSwitchIfSafe()
 
         // In multi-profile mode, refresh ALL selected profiles
         if profileManager.displayMode == .multi {
@@ -1573,7 +1573,7 @@ class MenuBarManager: NSObject, ObservableObject {
         let toName = nextProfile.name
         let notificationSettings = currentProfile.notificationSettings
         Task {
-            await profileManager.activateProfile(nextProfile.id)
+            await profileManager.activateProfile(nextProfile.id, selectedBy: "auto")
 
             await MainActor.run {
                 // Send notification

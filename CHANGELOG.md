@@ -5,6 +5,17 @@ All notable changes to Claude Usage Tracker will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — fork: one refresher per login
+
+### Fixed
+
+- **The tracker no longer logs Claude Code out.** Claude Code OAuth refresh tokens are single-use, and every running `claude` holds its login in memory; whenever the tracker refreshed or rewrote a login a session also held, the second user of the token was rejected and the session saw "Login expired · Please run /login". Three paths did that and all are gone (`docs/single-refresher.md`):
+  - pinned profiles (`Claude Code-credentials-<hash>`) are now **read-only** — never refreshed, never written; an expired entry shows as stale usage;
+  - the shared `~/.claude` login is **never refreshed** by the tracker (`refreshIdleSystemLogin` deleted; `mayRefreshActiveLogin` is `false`);
+  - auto-switch no longer rewrites the shared login under running sessions. It records the chosen account in `~/.claude/.autoswitch-selected` (for `cca`), and rewrites the keychain only when no `claude` without `CLAUDE_CONFIG_DIR` is running, over a login it has captured (compare-and-swap), with one in-place `-U` update — never delete+add. A refused switch stays pending and is retried each cycle.
+- No more plaintext `~/.claude/.credentials.json` mirror; the keychain is the only store.
+- Following a `/login` now keys on the keychain's *account changing*, so a deliberately refused switch is not undone.
+
 ## [3.3.0] - 2026-08-29
 
 ### Major Features

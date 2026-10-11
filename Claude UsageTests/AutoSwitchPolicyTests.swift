@@ -206,50 +206,11 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(next?.id, healthy.id)
     }
 
-    func testPausedProfilesSavedLoginIsNotRefreshed() {
-        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
-        var idle = Profile(name: "i", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
-                           customKeychainServiceName: "svc", hasOwnMainLogin: true)
-        idle.isPaused = true
-        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(idle, activeId: UUID()))
-    }
-
-    // Idle accounts' saved logins are refreshed as they expire, so a dead one
-    // shows up before auto-switch needs it.
-
-    func testIdleSavedLoginIsRefreshedOnceExpired() {
-        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
-        let idle = Profile(name: "i", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
-                           customKeychainServiceName: "svc", hasOwnMainLogin: true)
-        XCTAssertTrue(AutoSwitchPolicy.shouldRefreshIdleLogin(idle, activeId: UUID()))
-    }
-
-    func testIdleSavedLoginIsLeftAloneWhileValid() {
-        let valid = Int((Date().timeIntervalSince1970 + 3600) * 1000)
-        let idle = Profile(name: "i", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(valid)}}"#,
-                           customKeychainServiceName: "svc", hasOwnMainLogin: true)
-        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(idle, activeId: UUID()))
-    }
-
-    func testActiveLoginIsNeverRefreshedAsIdle() {
-        // Claude Code owns the active login and refreshes it itself.
-        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
-        let active = Profile(name: "a", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
-                             customKeychainServiceName: "svc", hasOwnMainLogin: true)
-        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(active, activeId: active.id))
-    }
-
-    func testLoginThatIsACopyOfThePinnedEntryIsNotRefreshedAsIdle() {
-        // Not ours alone: the pinned config dir uses the same refresh token.
-        let expired = Int((Date().timeIntervalSince1970 - 60) * 1000)
-        let copy = Profile(name: "c", cliCredentialsJSON: #"{"claudeAiOauth":{"accessToken":"t","refreshToken":"r","expiresAt":\#(expired)}}"#,
-                           customKeychainServiceName: "svc", hasOwnMainLogin: false)
-        XCTAssertFalse(AutoSwitchPolicy.shouldRefreshIdleLogin(copy, activeId: UUID()))
-    }
-
-    // The active login belongs to Claude Code. Refreshing it at the moment it
-    // expires races Claude Code's own refresh of the same single-use token;
-    // the server treats that as reuse and kills the login for both.
+    // The active login belongs to Claude Code's sessions, which hold it in
+    // memory and refresh it themselves. A tracker refresh of the same
+    // single-use token is treated as reuse and kills the login for everyone —
+    // however long it has been expired, because a session asleep through any
+    // grace period wakes still holding the old token.
 
     func testActiveLoginIsNotRefreshedRightAtExpiry() {
         let now = Date()
@@ -261,11 +222,13 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertFalse(AutoSwitchPolicy.mayRefreshActiveLogin(expiresAt: now.addingTimeInterval(600), now: now))
     }
 
-    func testActiveLoginLeftExpiredLongEnoughMayBeRefreshed() {
-        // No session has needed it for a while, so none is refreshing it.
+    func testActiveLoginIsNotRefreshedHoweverLongItHasBeenExpired() {
         let now = Date()
-        XCTAssertTrue(AutoSwitchPolicy.mayRefreshActiveLogin(
-            expiresAt: now.addingTimeInterval(-(AutoSwitchPolicy.activeLoginRefreshGrace + 1)), now: now))
+        let expiries: [TimeInterval] = [15 * 60, 3600, 86_400, 30 * 86_400]
+        for expiredFor in expiries {
+            XCTAssertFalse(AutoSwitchPolicy.mayRefreshActiveLogin(expiresAt: now.addingTimeInterval(-expiredFor), now: now),
+                           "expired for \(expiredFor)s")
+        }
     }
 
     func testMainLoginIsItsOwnWhenItsTokenDiffersFromThePinnedEntry() {

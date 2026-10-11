@@ -34,39 +34,21 @@ enum AutoSwitchPolicy {
         return profile.customKeychainServiceName == nil || profile.hasOwnMainLogin
     }
 
-    /// How long the active login must have been expired before the tracker
-    /// refreshes it itself.
-    static let activeLoginRefreshGrace: TimeInterval = 15 * 60
-
-    /// True when the tracker may refresh the ACTIVE login (the one in Claude
-    /// Code's keychain entry).
+    /// Whether the tracker may refresh the ACTIVE login (the one in Claude
+    /// Code's keychain entry): never.
     ///
-    /// Claude Code refreshes that login itself the moment a session needs it
-    /// after expiry. A tracker refresh in that same window uses the same
-    /// single-use refresh token; the server treats the second use as reuse and
-    /// rejects the login for everyone ("Login expired"). Observed 2026-10-06/07:
-    /// matt.grasmick and goose each died seconds after their access token
-    /// expired while active. Once the login has sat expired for the grace
-    /// period, no session is refreshing it and the tracker may.
+    /// Claude Code sessions hold that login in memory and refresh it themselves
+    /// when they need it. A tracker refresh uses the same single-use refresh
+    /// token; the server treats the second use as reuse and rejects the login
+    /// for everyone ("Login expired"). Observed 2026-10-06/07: matt.grasmick
+    /// and goose each died seconds after their access token expired while
+    /// active. A grace period after expiry did not fix it — a session asleep
+    /// through the grace period still wakes holding the old token — so the
+    /// tracker now never refreshes a login any `claude` process may hold.
+    /// (`ClaudeCodeSyncService.switchMainLogin(to:)` refreshes a STORED login
+    /// only after proving no process holds the shared login.)
     static func mayRefreshActiveLogin(expiresAt: Date, now: Date = Date()) -> Bool {
-        now.timeIntervalSince(expiresAt) >= activeLoginRefreshGrace
-    }
-
-    /// True when an idle account's saved main login has expired and should be
-    /// refreshed now. Doing it ahead of time keeps the login alive and, if the
-    /// server rejects it, reveals the dead login before auto-switch needs it.
-    ///
-    /// Only for pinned profiles' own main logins: the tracker is their only
-    /// holder while the profile is inactive. The active login belongs to
-    /// Claude Code, and an unpinned profile's lineage may be owned elsewhere.
-    static func shouldRefreshIdleLogin(_ profile: Profile, activeId: UUID?, now: Date = Date()) -> Bool {
-        guard profile.id != activeId,
-              !profile.isPaused,
-              profile.customKeychainServiceName != nil,
-              profile.hasOwnMainLogin,
-              let json = profile.cliCredentialsJSON,
-              let expiry = ClaudeCodeSyncService.shared.extractTokenExpiry(from: json) else { return false }
-        return expiry <= now
+        false
     }
 
     /// True when a login found in the main keychain is separate from a

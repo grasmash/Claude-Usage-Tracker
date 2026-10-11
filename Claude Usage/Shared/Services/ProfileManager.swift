@@ -30,6 +30,23 @@ class ProfileManager: ObservableObject {
     private var lastProfileSwitchAt: Date?
     private static let adoptionGracePeriod: TimeInterval = 90
 
+    /// Set when a switch could not rewrite the shared Claude Code login (sessions
+    /// were holding it); `applyPendingMainLoginSwitchIfSafe` retries each cycle.
+    private static let pendingMainLoginSwitchKey = "ProfileManager.pendingMainLoginSwitch"
+    private var pendingMainLoginSwitch: Bool {
+        get { AppEnvironment.userDefaults.bool(forKey: Self.pendingMainLoginSwitchKey) }
+        set { AppEnvironment.userDefaults.set(newValue, forKey: Self.pendingMainLoginSwitchKey) }
+    }
+
+    /// The account the keychain login belonged to when the tracker last looked,
+    /// so a `/login` (the keychain changing account) is told apart from the
+    /// keychain simply still holding the account the tracker switched away from.
+    private static let lastKeychainIdentityKey = "ProfileManager.lastKeychainIdentity"
+    private var lastKeychainIdentity: String? {
+        get { AppEnvironment.userDefaults.string(forKey: Self.lastKeychainIdentityKey) }
+        set { AppEnvironment.userDefaults.set(newValue, forKey: Self.lastKeychainIdentityKey) }
+    }
+
     private init() {}
 
     // MARK: - Initialization
@@ -194,7 +211,9 @@ class ProfileManager: ObservableObject {
 
     // MARK: - Profile Activation (Centralized)
 
-    func activateProfile(_ id: UUID) async {
+    /// `selectedBy` is recorded in the selection file: `auto` for a switch the
+    /// tracker made (limit reached, dead login), `user` for a click.
+    func activateProfile(_ id: UUID, selectedBy: String = "user") async {
         guard !switchingSemaphore else {
             LoggingService.shared.log("Profile switch already in progress, ignoring")
             return
@@ -242,27 +261,27 @@ class ProfileManager: ObservableObject {
             return
         }
 
-        // Apply new profile's CLI credentials (if available; Anthropic-only —
-        // switching to e.g. a Codex profile must not rewrite ~/.claude.json
-        // or the Claude Code keychain entry)
+        // Rotation first reaches NEW work: the selection file names the account
+        // `cca` (claude-rotate) starts its next session in. That never touches a
+        // login a running session holds. (Anthropic-only — switching to e.g. a
+        // Codex profile must not rewrite anything of Claude Code's.)
+        if updatedProfile.provider.descriptor.capabilities.cliAccountSync {
+            writeSelection(for: updatedProfile, by: selectedBy)
+        }
+
+        // Then the shared Claude Code login (the main keychain entry), but only
+        // when nothing holds it — see `ClaudeCodeSyncService.switchMainLogin`.
         LoggingService.shared.log("Checking CLI credentials for profile '\(updatedProfile.name)': hasJSON=\(updatedProfile.cliCredentialsJSON != nil)")
 
         if AutoSwitchPolicy.canBeApplied(updatedProfile) {
-            // Refresh the OAuth token before applying. Stored tokens expire (~8h),
-            // so applying a stale snapshot would write a dead access token to the
-            // keychain and Claude Code would 401 ("Please run /login"). This refreshes
-            // via the refresh_token grant and persists the rotated tokens back to the
-            // profile, so applyProfileCredentials below writes a valid token.
-            if let refreshed = await cliSyncService.ensureFreshMainLogin(for: updatedProfile.id) {
-                LoggingService.shared.log("✓ Ensured fresh credentials before apply for: \(updatedProfile.name)")
-                _ = refreshed
-                // Reload so applyProfileCredentials picks up the refreshed token.
-                profiles = profileStore.loadProfiles()
-            }
+            pendingMainLoginSwitch = true
             do {
-                try cliSyncService.applyProfileCredentials(updatedProfile.id)
-                LoggingService.shared.log("✓ Applied CLI credentials for: \(updatedProfile.name)")
+                let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id)
+                // Reload: the switch may have refreshed and stored the login.
+                profiles = profileStore.loadProfiles()
+                handleMainLoginSwitch(outcome, for: updatedProfile, announceLater: false)
             } catch {
+                pendingMainLoginSwitch = false
                 LoggingService.shared.logError("Failed to apply CLI credentials (non-fatal)", error: error)
                 NotificationManager.shared.sendSwitchNotAppliedNotification(
                     profileName: updatedProfile.name,
@@ -277,6 +296,7 @@ class ProfileManager: ObservableObject {
             // claims it left.
             // A pinned profile's keychain entry belongs to another config dir
             // and is never copied here; it needs its own /login in Claude Code.
+            pendingMainLoginSwitch = false   // nothing to apply later either
             let needsMainLogin = updatedProfile.customKeychainServiceName != nil
             LoggingService.shared.log("⚠️ Profile '\(updatedProfile.name)' has no \(needsMainLogin ? "main login of its own" : "CLI credentials JSON") — Claude Code NOT switched")
             NotificationManager.shared.sendSwitchNotAppliedNotification(
@@ -359,17 +379,80 @@ class ProfileManager: ObservableObject {
         }
     }
 
-    /// Records the active profile's main login (the one Claude Code's main
-    /// sessions use) as its own, so a later switch back can apply it. Runs
-    /// every cycle: `adoptExternalLoginIfNeeded` only fires when the account
-    /// changes, and the usage fetch may never touch CLI credentials.
+    /// Records the shared Claude Code login (the main keychain entry) into the
+    /// profile it belongs to, as that profile's own main login, so a later
+    /// switch back can apply it and the compare-and-swap in `switchMainLogin`
+    /// recognises it. Runs every cycle, read-only. The login need not be the
+    /// active profile's: after a switch whose keychain write was refused, the
+    /// keychain goes on holding the previous account, and Claude Code goes on
+    /// rotating it — the stored copy must follow, or it is stale when needed.
     func captureActiveMainLogin() {
-        if !switchingSemaphore { ClaudeCodeSyncService.shared.signalSessionsIfKeychainLoginChanged() }
-        guard !switchingSemaphore, let active = activeProfile,
-              active.provider.descriptor.capabilities.cliAccountSync,
-              ClaudeCodeSyncService.shared.captureMainLogin(for: active.id) else { return }
-        reloadStoredCredentialState()
-        LoggingService.shared.log("captureActiveMainLogin: saved main login for '\(active.name)'")
+        guard !switchingSemaphore else { return }
+        ClaudeCodeSyncService.shared.signalSessionsIfKeychainLoginChanged()
+        let candidates = ([activeProfile].compactMap { $0 } + profiles)
+            .filter { $0.provider.descriptor.capabilities.cliAccountSync }
+        for profile in candidates where ClaudeCodeSyncService.shared.captureMainLogin(for: profile.id) {
+            reloadStoredCredentialState()
+            LoggingService.shared.log("captureActiveMainLogin: saved main login for '\(profile.name)'")
+            return
+        }
+    }
+
+    /// Writes the account chosen for new work to the selection file.
+    private func writeSelection(for profile: Profile, by: String) {
+        guard !AppEnvironment.isRunningTests else { return }
+        if AutoSwitchSelection.forProfile(profile, by: by).write() {
+            LoggingService.shared.log("activateProfile: new work goes to '\(profile.name)' (\(AutoSwitchSelection.fileName))")
+        }
+    }
+
+    /// Acts on the outcome of `switchMainLogin`: clears or keeps the pending
+    /// flag and tells the user what Claude Code's shared login is doing.
+    private func handleMainLoginSwitch(_ outcome: ClaudeCodeSyncService.MainLoginSwitch, for profile: Profile, announceLater: Bool) {
+        switch outcome {
+        case .applied, .alreadyApplied:
+            pendingMainLoginSwitch = false
+            lastKeychainIdentity = ClaudeCodeSyncService.shared.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) ?? lastKeychainIdentity
+            LoggingService.shared.log("✓ Claude Code's shared login is '\(profile.name)' (\(outcome == .applied ? "written" : "already there"))")
+            if announceLater, outcome == .applied {
+                NotificationManager.shared.sendSwitchAppliedLaterNotification(
+                    profileName: profile.name, settings: profile.notificationSettings)
+            }
+        case .refused(let reason):
+            // Stays pending; `applyPendingMainLoginSwitchIfSafe` retries.
+            LoggingService.shared.log("⚠️ Claude Code's shared login NOT switched to '\(profile.name)': \(reason); new sessions via cca use it")
+            guard !announceLater else { return }   // a retry's refusal is routine; say it once, at the switch
+            let text: String
+            switch reason {
+            case .sessionsRunning(let count):
+                text = "notification.switch_not_applied.sessions_running".localized(with: count, profile.name)
+            case .unknownKeychainLogin:
+                text = "notification.switch_not_applied.unknown_login".localized
+            }
+            NotificationManager.shared.sendSwitchNotAppliedNotification(
+                profileName: profile.name, reason: text, settings: profile.notificationSettings)
+        }
+    }
+
+    /// Retries a shared-login switch that was refused earlier, once the policy
+    /// allows it (no `claude` session on the shared login any more, keychain as
+    /// last seen). Runs every refresh cycle; a no-op while nothing is pending.
+    func applyPendingMainLoginSwitchIfSafe() {
+        guard pendingMainLoginSwitch, !switchingSemaphore, let active = activeProfile,
+              AutoSwitchPolicy.canBeApplied(active) else { return }
+        Task {
+            do {
+                let outcome = try await cliSyncService.switchMainLogin(to: active.id)
+                await MainActor.run {
+                    self.reloadStoredCredentialState()
+                    if case .applied = outcome { self.lastProfileSwitchAt = Date() }
+                    self.handleMainLoginSwitch(outcome, for: active, announceLater: true)
+                }
+            } catch {
+                await MainActor.run { self.pendingMainLoginSwitch = false }
+                LoggingService.shared.logError("applyPendingMainLoginSwitchIfSafe: giving up on '\(active.name)'", error: error)
+            }
+        }
     }
 
     /// The profile an `oauthAccount` belongs to: by stored account identity
@@ -433,38 +516,12 @@ class ProfileManager: ObservableObject {
         LoggingService.shared.log("importPendingLogin: saved login for '\(profile.name)'")
 
         if activeProfile?.id == profile.id {
-            do {
-                try sync.applyProfileCredentials(profile.id)
-                lastProfileSwitchAt = Date()
-            } catch {
-                LoggingService.shared.logError("importPendingLogin: could not apply the new login for the active profile", error: error)
-            }
+            // Apply it to Claude Code the same guarded way a switch does.
+            lastProfileSwitchAt = Date()
+            pendingMainLoginSwitch = true
+            applyPendingMainLoginSwitchIfSafe()
         }
         return profile
-    }
-
-    /// Refreshes idle accounts' saved logins once they expire (see
-    /// `AutoSwitchPolicy.shouldRefreshIdleLogin`), one refresh at a time.
-    private var isRefreshingIdleLogins = false
-
-    func refreshIdleLogins() {
-        guard !switchingSemaphore, !isRefreshingIdleLogins else { return }
-        let due = profiles.filter { AutoSwitchPolicy.shouldRefreshIdleLogin($0, activeId: activeProfile?.id) }
-            .filter { profile in
-                // Already known dead: wait for a new login instead of retrying.
-                !ClaudeCodeSyncService.shared.isLoginDead(for: profile)
-            }
-        guard !due.isEmpty else { return }
-        isRefreshingIdleLogins = true
-        Task {
-            for profile in due {
-                _ = await ClaudeCodeSyncService.shared.ensureFreshMainLogin(for: profile.id)
-            }
-            await MainActor.run {
-                self.reloadStoredCredentialState()
-                self.isRefreshingIdleLogins = false
-            }
-        }
     }
 
     @discardableResult
@@ -492,6 +549,15 @@ class ProfileManager: ObservableObject {
         }
         let systemAccount = sync.loginOAuthAccount(credentials: systemJSON, configOAuthAccount: configAccount)
 
+        // Only a CHANGE of the keychain's account is a `/login`. The active
+        // profile may legitimately differ from the keychain: a switch whose
+        // keychain write was refused (sessions were holding the login) leaves
+        // the keychain on the previous account on purpose, and following it
+        // back here would undo the switch every cycle.
+        let previousIdentity = lastKeychainIdentity
+        lastKeychainIdentity = systemIdentity
+        guard systemIdentity != previousIdentity else { return nil }
+
         let activeIdentity = activeProfile.flatMap { sync.accountIdentity(fromOAuthAccountJSON: $0.oauthAccountJSON) }
         guard systemIdentity != activeIdentity else { return nil }
 
@@ -511,8 +577,10 @@ class ProfileManager: ObservableObject {
 
         let previous = activeProfile?.name ?? "none"
         activeProfile = adopted
+        pendingMainLoginSwitch = false   // the user chose this login; nothing to apply
         profileStore.saveActiveProfileId(adopted.id)
         profileStore.saveProfiles(profiles)
+        writeSelection(for: adopted, by: "login")
 
         LoggingService.shared.log("adoptExternalLogin: Claude Code is logged into '\(adopted.name)' (was '\(previous)'); adopted as active without touching the keychain")
         return adopted

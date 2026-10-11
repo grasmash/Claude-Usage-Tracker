@@ -1,0 +1,286 @@
+import XCTest
+@testable import Claude_Usage
+
+/// Each Claude Code login has exactly one refresher. The tracker reads logins
+/// and never refreshes or rewrites one that any `claude` process holds:
+/// pinned entries are read-only, the shared login is never refreshed, and it
+/// is rewritten only when idle, over a login the tracker has seen, in place.
+///
+/// `security` and the token endpoint are replaced with recorders, so these
+/// tests prove the absence of network calls and keychain writes directly.
+final class SingleRefresherTests: XCTestCase {
+
+    private let sync = ClaudeCodeSyncService.shared
+    private let mainService = "Claude Code-credentials"
+    private let pinnedService = "Claude Code-credentials-0a1b2c3d"
+
+    /// Fake keychain: service name -> stored JSON.
+    private var keychain: [String: String] = [:]
+    private var securityCalls: [[String]] = []
+    private var refreshCalls = 0
+    private var processes: [MainLoginSwapPolicy.RunningProcess] = []
+    private var tempDir: URL!
+
+    private var savedRunner: ((_ arguments: [String], _ timeout: TimeInterval) -> ClaudeCodeSyncService.SecurityCommandResult?)!
+    private var savedRefresher: ((_ refreshToken: String) async throws -> ClaudeCodeSyncService.OAuthRefreshResponse)!
+    private var savedProcesses: (() -> [MainLoginSwapPolicy.RunningProcess])!
+    private var savedCredentialsFile: URL!
+
+    override func setUp() {
+        super.setUp()
+        savedRunner = sync.securityCommandRunner
+        savedRefresher = sync.tokenRefresher
+        savedProcesses = sync.runningProcesses
+        savedCredentialsFile = sync.credentialsFileURL
+        tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        keychain = [:]
+        securityCalls = []
+        refreshCalls = 0
+        processes = []
+
+        sync.credentialsFileURL = tempDir.appendingPathComponent(".credentials.json")
+        sync.runningProcesses = { [unowned self] in self.processes }
+        sync.tokenRefresher = { [unowned self] _ in
+            self.refreshCalls += 1
+            return ClaudeCodeSyncService.OAuthRefreshResponse(
+                access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600, token_type: "Bearer")
+        }
+        sync.securityCommandRunner = { [unowned self] arguments, _ in
+            self.securityCalls.append(arguments)
+            func result(_ code: Int32, _ out: String = "") -> ClaudeCodeSyncService.SecurityCommandResult {
+                .init(exitCode: code, stdout: out, stderr: "", timedOut: false)
+            }
+            guard let verb = arguments.first,
+                  let s = arguments.firstIndex(of: "-s"), s + 1 < arguments.count else { return result(1) }
+            let service = arguments[s + 1]
+            switch verb {
+            case "find-generic-password":
+                guard let json = self.keychain[service] else { return result(44) }
+                return result(0, arguments.contains("-w") ? json : "attributes")
+            case "add-generic-password":
+                guard let w = arguments.firstIndex(of: "-w"), w + 1 < arguments.count else { return result(1) }
+                self.keychain[service] = arguments[w + 1]
+                return result(0)
+            case "delete-generic-password":
+                self.keychain[service] = nil
+                return result(0)
+            default:
+                return result(1)
+            }
+        }
+    }
+
+    override func tearDown() {
+        sync.securityCommandRunner = savedRunner
+        sync.tokenRefresher = savedRefresher
+        sync.runningProcesses = savedProcesses
+        sync.credentialsFileURL = savedCredentialsFile
+        try? FileManager.default.removeItem(at: tempDir)
+        super.tearDown()
+    }
+
+    // MARK: - Helpers
+
+    private func login(_ tag: String, expiresIn: TimeInterval) -> String {
+        let ms = Int((Date().timeIntervalSince1970 + expiresIn) * 1000)
+        return #"{"claudeAiOauth":{"accessToken":"access-\#(tag)","refreshToken":"refresh-\#(tag)","expiresAt":\#(ms),"scopes":["user:inference"],"subscriptionType":"max"}}"#
+    }
+
+    private var writes: [[String]] { securityCalls.filter { ClaudeCodeSyncService.isMutatingSecurityVerb($0.first) } }
+
+    private func bareClaude(_ pid: Int32) -> MainLoginSwapPolicy.RunningProcess {
+        .init(pid: pid, command: "claude", environment: ["HOME": "/Users/me"])
+    }
+
+    private func rotateClaude(_ pid: Int32) -> MainLoginSwapPolicy.RunningProcess {
+        .init(pid: pid, command: "claude", environment: ["CLAUDE_CONFIG_DIR": "/Users/me/.claude-rotate/accounts/goose"])
+    }
+
+    // MARK: - A1: pinned profiles are read-only
+
+    func testExpiredPinnedEntryIsReadButNeverRefreshedOrWritten() {
+        keychain[pinnedService] = login("pinned", expiresIn: -3600)
+        let profile = Profile(name: "goose", customKeychainServiceName: pinnedService)
+
+        let json = sync.usableCredentials(for: profile, isActive: false)
+
+        XCTAssertEqual(json, keychain[pinnedService], "the stale login is reported as is")
+        XCTAssertEqual(refreshCalls, 0, "no network refresh of a login claude-rotate sessions own")
+        XCTAssertTrue(writes.isEmpty, "no keychain write: \(writes)")
+    }
+
+    func testPinnedEntryAboutToExpireIsNotRefreshedEither() {
+        // Inside the old 60-second leeway window, where the tracker used to
+        // refresh — at the same moment the pinned dir's sessions did.
+        keychain[pinnedService] = login("pinned", expiresIn: 30)
+        let profile = Profile(name: "goose", customKeychainServiceName: pinnedService)
+
+        _ = sync.usableCredentials(for: profile, isActive: true)
+
+        XCTAssertEqual(refreshCalls, 0)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testUsageReadsOfAnExpiredPinnedEntryCountAsStale() {
+        keychain[pinnedService] = login("pinned", expiresIn: -60)
+        let profile = Profile(name: "goose", customKeychainServiceName: pinnedService)
+        let json = sync.usableCredentials(for: profile, isActive: false)!
+        XCTAssertTrue(sync.isTokenExpired(json), "the caller falls back to last-known usage")
+    }
+
+    // MARK: - A2: the shared (active) login is never refreshed
+
+    func testExpiredSharedLoginOfTheActiveProfileIsNotRefreshed() {
+        // Expired for hours: the old 15-minute grace would have refreshed it.
+        keychain[mainService] = login("main", expiresIn: -4 * 3600)
+        let profile = Profile(name: "me", cliCredentialsJSON: keychain[mainService])
+
+        let json = sync.usableCredentials(for: profile, isActive: true)
+
+        XCTAssertEqual(json, keychain[mainService])
+        XCTAssertEqual(refreshCalls, 0)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testInactiveUnpinnedSnapshotIsNotRefreshed() {
+        let stored = login("idle", expiresIn: -86_400)
+        let profile = Profile(name: "idle", cliCredentialsJSON: stored)
+
+        XCTAssertEqual(sync.usableCredentials(for: profile, isActive: false), stored)
+        XCTAssertEqual(refreshCalls, 0)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    // MARK: - A3: the shared login is rewritten only when nothing holds it
+
+    func testSwitchIsRefusedWhileABareClaudeSessionRuns() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        processes = [bareClaude(500), rotateClaude(501)]
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: -600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)), "the claude-rotate session does not count")
+        XCTAssertEqual(keychain[mainService]?.contains("refresh-A"), true, "A is untouched")
+        XCTAssertEqual(refreshCalls, 0, "B's stored login is not refreshed while the switch is refused")
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testSwitchIsRefusedOverALoginTheTrackerNeverCaptured() async throws {
+        keychain[mainService] = login("fresh-login", expiresIn: 3600)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!, login("A", expiresIn: 3600)])
+
+        XCTAssertEqual(outcome, .refused(.unknownKeychainLogin))
+        XCTAssertEqual(keychain[mainService]?.contains("refresh-fresh-login"), true)
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testSwitchWritesInPlaceWhenIdleAndTheKeychainIsAsLastSeen() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+        XCTAssertEqual(writes.count, 1, "exactly one write: \(writes)")
+        XCTAssertEqual(writes.first?.first, "add-generic-password")
+        XCTAssertTrue(writes.first?.contains("-U") ?? false, "in-place update")
+        XCTAssertFalse(securityCalls.contains { $0.first == "delete-generic-password" }, "never delete-then-add")
+        XCTAssertEqual(refreshCalls, 0, "a valid stored login is written as is")
+    }
+
+    func testStoredLoginIsRefreshedOnlyAfterTheGuardPasses() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: -600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(refreshCalls, 1, "the tracker is the stored login's only holder at this point")
+        XCTAssertEqual(keychain[mainService]?.contains("new-refresh"), true, "the rotated login is what was written")
+    }
+
+    func testSwitchLeavesTheKeychainAloneWhenItAlreadyHoldsThatLogin() async throws {
+        // Switching back to the account the shared login already is: Claude
+        // Code's sessions own that lineage, even if it has expired.
+        let b = login("B", expiresIn: -600)
+        keychain[mainService] = b
+        let profile = Profile(name: "B", cliCredentialsJSON: b)
+        processes = [bareClaude(1)]
+
+        let outcome = try await sync.switchMainLogin(to: profile, knownLogins: [b])
+
+        XCTAssertEqual(outcome, .alreadyApplied)
+        XCTAssertEqual(refreshCalls, 0)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testAPinnedEntryIsNeverCopiedIntoTheSharedLogin() async {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        keychain[pinnedService] = login("pinned", expiresIn: 3600)
+        let pinned = Profile(name: "goose", cliCredentialsJSON: keychain[pinnedService], customKeychainServiceName: pinnedService, hasOwnMainLogin: false)
+
+        do {
+            _ = try await sync.switchMainLogin(to: pinned, knownLogins: [keychain[mainService]!])
+            XCTFail("expected noProfileCredentials")
+        } catch {
+            XCTAssertTrue(writes.isEmpty)
+            XCTAssertEqual(refreshCalls, 0)
+        }
+    }
+
+    func testSwitchWritesAnEmptyKeychain() async throws {
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!])
+        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+    }
+
+    // MARK: - A4: no plaintext mirror
+
+    func testSwitchDoesNotWriteThePlaintextCredentialsMirror() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sync.credentialsFileURL.path),
+                       "the keychain is the only store; no copy on disk")
+    }
+
+    func testAnExistingMirrorIsLeftUntouchedBySwitch() async throws {
+        // Earlier builds wrote this file; it must not be rewritten with the new login.
+        let stale = "{\"stale\":true}"
+        try stale.write(to: sync.credentialsFileURL, atomically: true, encoding: .utf8)
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(try String(contentsOf: sync.credentialsFileURL, encoding: .utf8), stale)
+    }
+
+    // MARK: - Test seams fail closed
+
+    func testDefaultSecurityRunnerRefusesMutationsUnderTests() {
+        sync.securityCommandRunner = savedRunner
+        XCTAssertThrowsError(try sync.writeKeychainCredentials(serviceName: "Claude Code-credentials-test-\(UUID())", jsonData: "{}"))
+    }
+
+    func testMutatingVerbsAreRecognised() {
+        XCTAssertTrue(ClaudeCodeSyncService.isMutatingSecurityVerb("add-generic-password"))
+        XCTAssertTrue(ClaudeCodeSyncService.isMutatingSecurityVerb("delete-generic-password"))
+        XCTAssertFalse(ClaudeCodeSyncService.isMutatingSecurityVerb("find-generic-password"))
+        XCTAssertFalse(ClaudeCodeSyncService.isMutatingSecurityVerb("dump-keychain"))
+    }
+}

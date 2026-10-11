@@ -31,6 +31,60 @@ class ClaudeCodeSyncService {
 
     private init() {}
 
+    // MARK: - Seams (replaceable in tests)
+
+    /// Runs `/usr/bin/security`. Tests replace this to observe every keychain
+    /// read and write without a keychain. The default refuses mutating verbs
+    /// under tests, so a test can never touch the user's real login.
+    var securityCommandRunner: (_ arguments: [String], _ timeout: TimeInterval) -> SecurityCommandResult? = { arguments, timeout in
+        if AppEnvironment.isRunningTests, ClaudeCodeSyncService.isMutatingSecurityVerb(arguments.first) {
+            return SecurityCommandResult(exitCode: -1, stdout: "", stderr: "keychain writes are disabled while running tests", timedOut: false)
+        }
+        return ClaudeCodeSyncService.runSecurityProcess(arguments: arguments, timeout: timeout)
+    }
+
+    /// Posts the `refresh_token` grant. Tests replace this to prove a path
+    /// makes no network call. The default refuses under tests: refresh tokens
+    /// are single-use, so a refresh from a test run would log out whoever
+    /// holds that login.
+    var tokenRefresher: (_ refreshToken: String) async throws -> OAuthRefreshResponse = { refreshToken in
+        guard !AppEnvironment.isRunningTests else {
+            throw ClaudeCodeError.refreshFailed(status: 0, body: "token refresh disabled while running tests")
+        }
+        return try await ClaudeCodeSyncService.postTokenRefresh(refreshToken: refreshToken)
+    }
+
+    /// The processes running now, for `MainLoginSwapPolicy`. Tests supply a list.
+    var runningProcesses: () -> [MainLoginSwapPolicy.RunningProcess] = {
+        ClaudeCodeSyncService.listRunningProcesses()
+    }
+
+    static func isMutatingSecurityVerb(_ verb: String?) -> Bool {
+        guard let verb else { return false }
+        return verb.hasPrefix("add-") || verb.hasPrefix("delete-") || verb.hasPrefix("set-")
+            || verb == "import" || verb == "unlock-keychain"
+    }
+
+    /// `ps -axwwE`: every process with its arguments and environment.
+    static func listRunningProcesses() -> [MainLoginSwapPolicy.RunningProcess] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axwwE", "-o", "pid=,command="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            LoggingService.shared.logError("listRunningProcesses: could not run ps", error: error)
+            return []
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return [] }
+        return MainLoginSwapPolicy.parsePsOutput(text)
+    }
+
     // MARK: - Cached Availability Check
 
     /// Refresh tokens the OAuth server has rejected with `invalid_grant`.
@@ -146,8 +200,8 @@ class ClaudeCodeSyncService {
     /// Reads credentials from ~/.claude/.credentials.json or ~/.claude/credentials.json file
     private func readCredentialsFile() -> String? {
         let paths = [
-            Constants.ClaudePaths.claudeDirectory.appendingPathComponent(".credentials.json"),
-            Constants.ClaudePaths.claudeDirectory.appendingPathComponent("credentials.json")
+            credentialsFileURL,
+            credentialsFileURL.deletingLastPathComponent().appendingPathComponent("credentials.json")
         ]
 
         for fileURL in paths {
@@ -174,20 +228,28 @@ class ClaudeCodeSyncService {
     }
 
     /// Result of a bounded `/usr/bin/security` invocation.
-    private struct SecurityCommandResult {
+    struct SecurityCommandResult {
         let exitCode: Int32
         let stdout: String
         let stderr: String
         let timedOut: Bool
     }
 
+    /// Runs `/usr/bin/security` through `securityCommandRunner`.
+    private func runSecurityCommand(
+        arguments: [String],
+        timeout: TimeInterval = ClaudeCodeSyncService.securityCommandTimeout
+    ) -> SecurityCommandResult? {
+        securityCommandRunner(arguments, timeout)
+    }
+
     /// Runs `/usr/bin/security` with the given arguments and a hard timeout.
     /// If the timeout elapses, the subprocess is terminated and `timedOut` is true.
     /// This is critical: without the timeout, a hung `security` call blocks the
     /// calling thread (and, if called from main, the whole app) indefinitely.
-    private func runSecurityCommand(
+    private static func runSecurityProcess(
         arguments: [String],
-        timeout: TimeInterval = ClaudeCodeSyncService.securityCommandTimeout
+        timeout: TimeInterval
     ) -> SecurityCommandResult? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
@@ -590,79 +652,24 @@ class ClaudeCodeSyncService {
         defaults.removeObject(forKey: Self.discoveryAttemptedKey)
     }
 
-    /// Writes credentials to `~/.claude/.credentials.json` so that
-    /// `readSystemCredentials()` (which reads the file as Priority 1) returns
-    /// the correct data after a profile switch. Without this, the stale file
-    /// from the previous profile shadows the freshly-written keychain entry.
-    private func writeCredentialsFile(_ jsonData: String) {
-        guard !AppEnvironment.isRunningTests else { return }
-        let fileURL = Constants.ClaudePaths.credentialsFile
-        guard let data = jsonData.data(using: .utf8) else {
-            LoggingService.shared.log("writeCredentialsFile: failed to encode JSON as UTF-8")
-            return
-        }
-        do {
-            try data.write(to: fileURL, options: [.atomic])
-            // .atomic replaces the inode, dropping the 0600 mode Claude Code uses for
-            // this file — restore owner-only permissions on the credential-bearing file.
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: fileURL.path
-            )
-            LoggingService.shared.log("writeCredentialsFile: updated \(fileURL.lastPathComponent)")
-        } catch {
-            // Non-fatal: the keychain write is the authoritative path; the file
-            // is a convenience/performance optimisation. Log and move on.
-            LoggingService.shared.logError("writeCredentialsFile: failed to write \(fileURL.lastPathComponent)", error: error)
-        }
-    }
+    /// The plaintext mirror `~/.claude/.credentials.json`, which earlier builds
+    /// rewrote on every switch. The tracker no longer writes credentials to it:
+    /// on macOS Claude Code keeps its login in the keychain and uses the file's
+    /// modification time only as a reload signal (`signalCredentialsReload`).
+    /// Copying keychain secrets to plaintext on disk bought nothing. Replaceable
+    /// so tests can prove the file is left alone.
+    var credentialsFileURL: URL = Constants.ClaudePaths.credentialsFile
 
-    /// Writes Claude Code credentials to system Keychain using security command.
-    /// Every subprocess invocation is bounded by `securityCommandTimeout` so a
-    /// hung `security` process cannot block the caller indefinitely.
+    /// Writes Claude Code's shared login (the main keychain entry) in place with
+    /// a single `add-generic-password -U`. Never delete-then-add: that left the
+    /// entry momentarily empty or half-written for any session reading it.
+    ///
+    /// Only `switchMainLogin(to:)` calls this, after `MainLoginSwapPolicy` has
+    /// confirmed nothing holds the login being replaced.
     func writeSystemCredentials(_ jsonData: String) throws {
-        // Never touch the real Claude Code login from a test run.
-        guard !AppEnvironment.isRunningTests else { throw ClaudeCodeError.keychainWriteFailed(status: -1) }
         let serviceName = resolveServiceName()
-        LoggingService.shared.log("Writing credentials to keychain using security command (service: \(serviceName))")
-
-        // First, delete existing item (best-effort; ignore failures)
-        if let deleteResult = runSecurityCommand(arguments: [
-            "delete-generic-password",
-            "-s", serviceName,
-            "-a", NSUserName()
-        ]) {
-            if deleteResult.timedOut {
-                LoggingService.shared.log("writeSystemCredentials: delete step timed out, proceeding with add")
-            } else if deleteResult.exitCode == 0 {
-                LoggingService.shared.log("Deleted existing keychain item")
-            } else {
-                LoggingService.shared.log("No existing keychain item to delete (or delete failed with code \(deleteResult.exitCode))")
-            }
-        }
-
-        // Add new item using security command
-        guard let addResult = runSecurityCommand(arguments: [
-            "add-generic-password",
-            "-s", serviceName,
-            "-a", NSUserName(),
-            "-w", jsonData,
-            "-U"  // Update if exists
-        ]) else {
-            throw ClaudeCodeError.keychainWriteFailed(status: -1)
-        }
-
-        if addResult.timedOut {
-            LoggingService.shared.log("❌ writeSystemCredentials: add step timed out")
-            throw ClaudeCodeError.keychainWriteFailed(status: -1)
-        }
-
-        if addResult.exitCode == 0 {
-            LoggingService.shared.log("✅ Added Claude Code system credentials successfully using security command")
-        } else {
-            LoggingService.shared.log("❌ Failed to add credentials: \(addResult.stderr)")
-            throw ClaudeCodeError.keychainWriteFailed(status: OSStatus(addResult.exitCode))
-        }
+        LoggingService.shared.log("Writing the shared Claude Code login in place (service: \(serviceName))")
+        try writeKeychainCredentials(serviceName: serviceName, jsonData: jsonData)
     }
 
     // MARK: - Claude Code Config File (oauthAccount)
@@ -728,6 +735,8 @@ class ClaudeCodeSyncService {
     /// `.claude.json` file exists (we don't want to create a file from scratch
     /// and accidentally overwrite user settings).
     func writeOAuthAccount(_ oauthAccountJSON: String) throws {
+        // Never touch the user's real .claude.json from a test run.
+        guard !AppEnvironment.isRunningTests else { return }
         guard let url = locateClaudeConfigFile() else {
             LoggingService.shared.log("writeOAuthAccount: no .claude.json config file found — skipping write")
             return
@@ -794,43 +803,95 @@ class ClaudeCodeSyncService {
         LoggingService.shared.log("Synced CLI credentials to profile: \(profileId)\(capturedOAuthAccount != nil ? " (with oauthAccount)" : "")")
     }
 
-    /// Applies profile's CLI credentials to system (overwrites current login).
-    /// Also restores the profile's captured `oauthAccount` to `~/.claude.json`
-    /// so that Claude Code's `/status` command reflects the correct account
-    /// after switching (see issue #175).
-    func applyProfileCredentials(_ profileId: UUID) throws {
-        LoggingService.shared.log("🔄 Applying CLI credentials for profile: \(profileId)")
+    /// Outcome of `switchMainLogin(to:)`.
+    enum MainLoginSwitch: Equatable {
+        /// The shared login now is this profile's (it was written, or already there).
+        case applied
+        /// The keychain already held this profile's login; nothing was written.
+        case alreadyApplied
+        /// Not done, for a reason the policy names. Retry on a later cycle.
+        case refused(MainLoginSwapPolicy.Refusal)
+    }
 
-        let profiles = ProfileStore.shared.loadProfiles()
-        guard let profile = profiles.first(where: { $0.id == profileId }),
-              let jsonData = profile.cliCredentialsJSON else {
-            LoggingService.shared.log("❌ No CLI credentials found for profile: \(profileId)")
+    /// Makes `profile`'s stored main login the shared Claude Code login — the
+    /// one `claude` sessions started without `CLAUDE_CONFIG_DIR` use — when,
+    /// and only when, that is safe:
+    ///
+    /// 1. No Claude Code process is running on the shared login. Every such
+    ///    process holds the login in memory; swapping it under them leaves two
+    ///    holders of one single-use refresh token.
+    /// 2. The keychain holds a login the tracker has captured (compare-and-
+    ///    swap on its fingerprint), or nothing. A login that changed since the
+    ///    last capture — a `/login`, or a rotation by a refresher the tracker
+    ///    does not know about — is never overwritten.
+    /// 3. The write is one in-place `-U` update.
+    ///
+    /// Only after 1 and 2 pass is the stored login refreshed if it has expired:
+    /// at that moment the tracker is its only holder. A stored login that is
+    /// already the keychain login is left entirely alone.
+    ///
+    /// `knownLogins` are the main logins the tracker has captured (every
+    /// profile's `cliCredentialsJSON`), for the compare-and-swap.
+    func switchMainLogin(to profile: Profile, knownLogins: [String]) async throws -> MainLoginSwitch {
+        guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
+            // A pinned entry's login is never copied into the main keychain:
+            // that puts one single-use refresh token in two config dirs.
+            LoggingService.shared.log("switchMainLogin: '\(profile.name)' has no main login of its own; nothing to apply")
             throw ClaudeCodeError.noProfileCredentials
         }
-        // Never copy a pinned entry's login into the main keychain: that puts
-        // one single-use refresh token in two config dirs.
-        guard AutoSwitchPolicy.canBeApplied(profile) else {
-            LoggingService.shared.log("❌ Profile '\(profile.name)' has no main login of its own; not applying its pinned entry")
+
+        let keychainJSON = try? readKeychainCredentials()
+        let keychainFingerprint = keychainJSON.flatMap(systemLoginFingerprint)
+        if let keychainFingerprint, keychainFingerprint == systemLoginFingerprint(storedJSON) {
+            return .alreadyApplied
+        }
+
+        let holders = MainLoginSwapPolicy.sharedLoginHolders(in: runningProcesses())
+        let known = Set(knownLogins.compactMap(systemLoginFingerprint))
+        if let refusal = MainLoginSwapPolicy.refusal(
+            holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known
+        ) {
+            LoggingService.shared.log("switchMainLogin: not switching Claude Code to '\(profile.name)': \(refusal)")
+            return .refused(refusal)
+        }
+
+        // Nothing holds the shared login and the keychain is what we last saw.
+        // The stored login's only holder is this app, so it may be refreshed.
+        guard let jsonData = await refreshStoredMainLoginIfExpired(storedJSON, profileId: profile.id, profileName: profile.name) else {
             throw ClaudeCodeError.noProfileCredentials
         }
 
-        LoggingService.shared.log("📦 Found CLI credentials, writing to keychain and credentials file...")
         try writeSystemCredentials(jsonData)
-        writeCredentialsFile(jsonData)
+        guard let written = try? readKeychainCredentials(),
+              systemLoginFingerprint(written) == systemLoginFingerprint(jsonData) else {
+            LoggingService.shared.logError("switchMainLogin: keychain does not hold the login just written for '\(profile.name)'")
+            throw ClaudeCodeError.keychainWriteFailed(status: -1)
+        }
+        lastSeenSystemLoginFingerprint = systemLoginFingerprint(jsonData)
 
         // Restore the profile's captured oauthAccount (if any) so Claude Code's
         // /status Status tab shows the right email/org/plan for this profile.
+        // No session is running (see 1), so none can write a stale copy back.
         if let storedOAuthAccount = profile.oauthAccountJSON {
             do {
                 try writeOAuthAccount(storedOAuthAccount)
             } catch {
                 LoggingService.shared.logError("Failed to restore oauthAccount (non-fatal)", error: error)
             }
-        } else {
-            LoggingService.shared.log("Profile has no stored oauthAccount — skipping .claude.json update")
         }
 
-        LoggingService.shared.log("✅ Applied profile CLI credentials to system: \(profileId)")
+        LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)'")
+        return .applied
+    }
+
+    /// `switchMainLogin(to:knownLogins:)` for a stored profile, with every
+    /// profile's captured main login as the known set.
+    func switchMainLogin(to profileId: UUID) async throws -> MainLoginSwitch {
+        let profiles = ProfileStore.shared.loadProfiles()
+        guard let profile = profiles.first(where: { $0.id == profileId }) else {
+            throw ClaudeCodeError.noProfileCredentials
+        }
+        return try await switchMainLogin(to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON))
     }
 
     /// Removes CLI credentials from profile (doesn't affect system)
@@ -947,7 +1008,6 @@ class ClaudeCodeSyncService {
     /// supply the exact target (e.g. a hash-suffix entry tied to one Claude Code account) so
     /// rotated tokens from auto-refresh can be written back to the same place Claude Code reads.
     func writeKeychainCredentials(serviceName: String, jsonData: String) throws {
-        guard !AppEnvironment.isRunningTests else { throw ClaudeCodeError.keychainWriteFailed(status: -1) }
         // `-U` already updates an existing entry in place, so the previous delete-then-add
         // pattern is unnecessary and was observed to leave the entry in a partially-overwritten
         // (invalid-JSON) state under concurrent refreshes. Rely on a single atomic `-U` add.
@@ -972,13 +1032,13 @@ class ClaudeCodeSyncService {
         let token_type: String?
     }
 
-    /// Posts the `refresh_token` grant to platform.claude.com and decodes the response.
+    /// Posts the `refresh_token` grant through `tokenRefresher`.
     private func performTokenRefresh(refreshToken: String) async throws -> OAuthRefreshResponse {
-        // Refresh tokens are single-use: a refresh from a test run would
-        // invalidate the login the real tracker and Claude Code are using.
-        guard !AppEnvironment.isRunningTests else {
-            throw ClaudeCodeError.refreshFailed(status: 0, body: "token refresh disabled while running tests")
-        }
+        try await tokenRefresher(refreshToken)
+    }
+
+    /// Posts the `refresh_token` grant to platform.claude.com and decodes the response.
+    static func postTokenRefresh(refreshToken: String) async throws -> OAuthRefreshResponse {
         let clientId = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_CLIENT_ID"]
             ?? Self.defaultOAuthClientID
 
@@ -1008,26 +1068,32 @@ class ClaudeCodeSyncService {
         return try JSONDecoder().decode(OAuthRefreshResponse.self, from: data)
     }
 
-    /// Ensures the given profile's OAuth credentials are usable, refreshing them via the
-    /// `refresh_token` grant if expired (or near-expired). Returns the up-to-date credentials
-    /// JSON on success, or `nil` if the profile has no usable source, no refresh token, or
-    /// the network refresh failed.
+    /// The credentials to read usage with for a profile — READ ONLY. This never
+    /// refreshes a token and never writes a keychain entry.
     ///
-    /// Source-of-truth selection:
-    /// - If `profile.customKeychainServiceName` is set, the Tracker reads the latest tokens
-    ///   directly from that keychain entry. Claude Code rotates tokens into the same entry
-    ///   during normal CLI use, so the read is usually already fresh — no network call needed.
-    /// - Otherwise, falls back to `profile.cliCredentialsJSON` (legacy behavior).
+    /// Every login the tracker can see is kept fresh by whoever owns it:
+    /// - A pinned entry (`profile.customKeychainServiceName`) belongs to the
+    ///   `claude` sessions on that config dir (`cca`, claude-rotate, the cloud
+    ///   watchdog's `claude auth status`); they rotate it. A tracker refresh of
+    ///   the same entry raced theirs, and the loser was logged out.
+    /// - The shared login (the main keychain entry) belongs to the `claude`
+    ///   sessions started without `CLAUDE_CONFIG_DIR`.
+    /// - A stored snapshot of an inactive account's main login is refreshed in
+    ///   exactly one place: `switchMainLogin(to:)`, once it is safe to write.
     ///
-    /// On a successful refresh, the new credentials are written back to BOTH the profile's
-    /// cached JSON AND (when applicable) the custom keychain entry, so Claude Code and the
-    /// Tracker stay in sync.
-    func ensureFreshCredentials(for profileId: UUID, allowRotation: Bool = false) async -> String? {
-        let profiles = ProfileStore.shared.loadProfiles()
-        guard let profile = profiles.first(where: { $0.id == profileId }) else {
+    /// So when the token here has expired, the answer is stale and the caller
+    /// shows last-known usage; it is not refreshed. Returns nil when the profile
+    /// has no credentials at all.
+    func ensureFreshCredentials(for profileId: UUID) async -> String? {
+        guard let profile = ProfileStore.shared.loadProfiles().first(where: { $0.id == profileId }) else {
             return nil
         }
+        return usableCredentials(for: profile, isActive: ProfileStore.shared.loadActiveProfileId() == profileId)
+    }
 
+    /// `ensureFreshCredentials` without the store, for tests and callers that
+    /// already hold the profile.
+    func usableCredentials(for profile: Profile, isActive: Bool) -> String? {
         let customSvc = profile.customKeychainServiceName
         let pinnedJSON = customSvc.flatMap { readKeychainCredentials(serviceName: $0) }
         // A pinned entry whose refresh token is dead cannot be revived from
@@ -1035,160 +1101,32 @@ class ClaudeCodeSyncService {
         // have been renewed with /login — follow that instead.
         let pinIsDead = pinnedJSON.flatMap { extractRefreshToken(from: $0) }.map(deadLogins.isDead) ?? false
 
-        // ACTIVE profile without a pin: Claude Code itself owns this token lineage in
-        // the system keychain and rotates it during use. NEVER refresh it ourselves —
-        // our refresh would consume the refresh token out from under the CLI, making
-        // its next refresh fail with invalid_grant ("Please run /login"). Instead,
-        // READ the system credentials (Claude keeps them fresh) and mirror them into
-        // the profile when they belong to the same account.
-        let isActive = ProfileStore.shared.loadActiveProfileId() == profileId
-
-        // ACTIVE profile with a working pin: usage is read from the pinned
-        // entry below, but Claude Code's main sessions run on a separate login
-        // in the system keychain. Keep the profile's copy of that login current
-        // (it is what a later switch back applies) and notice when it dies.
-        // (Capturing an unexpired one is `captureMainLogin`; only the refresh
-        // of an expired one happens here.)
-        if customSvc != nil, !pinIsDead, isActive,
-           let systemJSON = try? readSystemCredentials(),
-           systemCredentials(systemJSON, belongTo: profile),
-           isTokenExpired(systemJSON) {
-            let own = isOwnMainLogin(systemJSON, for: profile)
-            if own, let updatedJSON = await refreshIdleSystemLogin(systemJSON, profileName: profile.name) {
-                persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON, ownMainLogin: own)
-            }
-        }
-
         if customSvc == nil || pinIsDead, isActive {
-            if let systemJSON = try? readSystemCredentials() {
-                if systemCredentials(systemJSON, belongTo: profile) {
-                    let own = isOwnMainLogin(systemJSON, for: profile)
-                    if !isTokenExpired(systemJSON) {
-                        persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
-                        return systemJSON
-                    }
-                    // System token EXPIRED: Claude Code refreshes ~60s BEFORE expiry
-                    // while in use, so an expired keychain token means the CLI is idle
-                    // (sleep/inactivity — #268). Safe window to take over the rotation
-                    // ONCE — but the rotated lineage MUST be handed back to the system
-                    // keychain (+ mirror file), or the CLI would be left holding a
-                    // consumed refresh token and forced to /login.
-                    if let updatedJSON = await refreshIdleSystemLogin(systemJSON, profileName: profile.name) {
-                        persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON, ownMainLogin: own)
-                        return updatedJSON
-                    }
-                    // Refresh unavailable/failed — return the expired snapshot without
-                    // rotating anything; the CLI recovers it on next use.
-                    return systemJSON
-                }
+            // The shared login, when it is this account's. Claude Code keeps it
+            // fresh while sessions run; expired means idle, and it stays so.
+            if let systemJSON = try? readSystemCredentials(), systemCredentials(systemJSON, belongTo: profile) {
+                persistProfileCredentialsJSON(profileId: profile.id, json: systemJSON, ownMainLogin: isOwnMainLogin(systemJSON, for: profile))
+                return systemJSON
             }
-            // Different account in system, or no system creds — fall back to the cached
-            // snapshot WITHOUT refreshing; never rotate a lineage the CLI may own.
             return profile.cliCredentialsJSON
         }
 
-        var initialJSON: String?
-        if let svc = customSvc {
-            initialJSON = pinnedJSON
-            if initialJSON == nil {
-                LoggingService.shared.logError("ensureFreshCredentials: profile '\(profile.name)' pins keychain '\(svc)' but it was not found")
-            } else if extractRefreshToken(from: initialJSON!) == nil {
-                // Keychain payload exists but is corrupt (e.g. invalid JSON after a prior bad
-                // write). Fall back to the profile's cached plist credentials so we still have
-                // a refresh_token to try — better than going dormant.
-                LoggingService.shared.logError("ensureFreshCredentials: keychain '\(svc)' payload for '\(profile.name)' is unparseable; falling back to plist cliCredentialsJSON")
-                initialJSON = profile.cliCredentialsJSON
-            }
-        } else {
-            initialJSON = profile.cliCredentialsJSON
+        guard let svc = customSvc else {
+            // Inactive and unpinned: the stored snapshot, however old.
+            return profile.cliCredentialsJSON
         }
-
-        guard let cliJSON = initialJSON else {
-            return nil
+        guard let json = pinnedJSON else {
+            LoggingService.shared.logError("usableCredentials: profile '\(profile.name)' pins keychain '\(svc)' but it was not found")
+            return profile.cliCredentialsJSON
         }
-
-        // Fast path: token still valid beyond the leeway window.
-        if let expiryDate = extractTokenExpiry(from: cliJSON),
-           expiryDate.timeIntervalSinceNow > Self.refreshLeewaySeconds {
-            // A pinned entry is NOT mirrored into the profile cache: the cache holds the
-            // account's separate main login, which is what a switch applies.
-            return cliJSON
+        if extractRefreshToken(from: json) == nil {
+            // The entry exists but is unparseable (a half-written payload).
+            LoggingService.shared.logError("usableCredentials: keychain '\(svc)' payload for '\(profile.name)' is unparseable; using the stored snapshot")
+            return profile.cliCredentialsJSON
         }
-
-        // At this point the profile is EITHER pinned to a keychain entry (customSvc != nil)
-        // OR non-active & unpinned — the active/unpinned case already returned above via the
-        // system-keychain branch. For a non-active, unpinned profile the refresh_token lineage
-        // is owned by an external tool (e.g. the `cux` account switcher, or Claude Code's own
-        // keychain rotation). Refreshing here would consume that refresh token out from under
-        // the other tool, forcing its next use to fail with invalid_grant ("Please run /login").
-        // Never rotate a lineage we don't own: return the cached snapshot (even if expired) and
-        // let the display fall back to last-known usage. Pinned profiles are safe to refresh
-        // because we write the rotated tokens back to the shared keychain entry below.
-        // Exception: an *explicit* activation (allowRotation) must refresh even here.
-        // When the user switches to this profile, activateProfile() calls us before the
-        // profile becomes the active one, so it lands in this non-active branch. Skipping
-        // the refresh there applies a stale access token and surfaces a transient E1000
-        // ("session key not found") on every switch. Rotating is fine for an explicit
-        // switch — applyProfileCredentials writes the fresh token straight to the system
-        // keychain that Claude Code / cux read. Only *background* monitoring passes
-        // allowRotation=false to avoid churning idle accounts.
-        if customSvc == nil && !allowRotation {
-            LoggingService.shared.log("ensureFreshCredentials: '\(profile.name)' is non-active & unpinned; skipping refresh to avoid rotating an externally-owned token")
-            return cliJSON
-        }
-
-        guard let refreshToken = extractRefreshToken(from: cliJSON) else {
-            LoggingService.shared.log("ensureFreshCredentials: profile '\(profile.name)' has no refresh token; cannot auto-refresh")
-            return nil
-        }
-
-        // The server already rejected this exact token; it stays rejected until
-        // a /login replaces it. Retrying every cycle only hammers the endpoint.
-        guard !deadLogins.isDead(refreshToken) else {
-            return nil
-        }
-
-        let sourceTag = customSvc.map { "keychain:\($0)" } ?? "plist"
-        LoggingService.shared.log("ensureFreshCredentials: refreshing OAuth token for profile '\(profile.name)' (source=\(sourceTag))")
-
-        let refreshed: OAuthRefreshResponse
-        do {
-            refreshed = try await performTokenRefresh(refreshToken: refreshToken)
-        } catch let ClaudeCodeError.refreshFailed(status, body) {
-            // Surface the error body for diagnosis. 4xx responses never contain access
-            // tokens — only `{ "error": "...", "error_description": "..." }` style payloads —
-            // so logging it is safe.
-            LoggingService.shared.logError("ensureFreshCredentials: refresh failed for '\(profile.name)' (HTTP \(status)) body=\(body)")
-            if DeadLoginTracker.isInvalidGrant(status: status, body: body) {
-                deadLogins.markDead(refreshToken)
-                LoggingService.shared.logError("ensureFreshCredentials: login for '\(profile.name)' is dead — not retrying until its credentials change (/login)")
-            }
-            return nil
-        } catch {
-            LoggingService.shared.logError("ensureFreshCredentials: refresh failed for '\(profile.name)'", error: error)
-            return nil
-        }
-
-        guard let updatedJSON = mergeRefreshedCredentials(into: cliJSON, refreshed: refreshed) else {
-            LoggingService.shared.logError("ensureFreshCredentials: failed to merge refreshed credentials for '\(profile.name)'")
-            return nil
-        }
-
-        // Write back to where the tokens came from: the pinned keychain entry (so Claude
-        // Code's next read there picks them up), or the profile cache when unpinned.
-        if customSvc == nil {
-            persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
-        }
-        if let svc = customSvc {
-            do {
-                try writeKeychainCredentials(serviceName: svc, jsonData: updatedJSON)
-            } catch {
-                LoggingService.shared.logError("ensureFreshCredentials: refreshed but failed to write back to keychain '\(svc)'", error: error)
-            }
-        }
-
-        LoggingService.shared.log("✓ ensureFreshCredentials: refreshed and saved for profile '\(profile.name)'")
-        return updatedJSON
+        // A pinned entry is NOT mirrored into the profile cache: the cache holds
+        // the account's separate main login, which is what a switch applies.
+        return json
     }
 
     /// True when the system (Claude Code) credentials are for the same account as `profile`.
@@ -1396,71 +1334,38 @@ class ClaudeCodeSyncService {
         _ = runSecurityCommand(arguments: ["delete-generic-password", "-s", loginImportServiceName, "-a", NSUserName()])
     }
 
-    /// Refreshes an EXPIRED system login once and hands the rotated tokens
-    /// back to the system keychain (+ mirror file), so Claude Code is not left
-    /// holding a consumed refresh token. Returns the updated credentials, or
-    /// nil if nothing was refreshed. A rejected refresh token is remembered as
-    /// dead and not retried.
-    private func refreshIdleSystemLogin(_ systemJSON: String, profileName: String) async -> String? {
-        // Leave a freshly expired login to Claude Code; see mayRefreshActiveLogin.
-        guard let expiry = extractTokenExpiry(from: systemJSON),
-              AutoSwitchPolicy.mayRefreshActiveLogin(expiresAt: expiry) else { return nil }
-        guard let refreshToken = extractRefreshToken(from: systemJSON), !deadLogins.isDead(refreshToken) else {
-            return nil
-        }
-        do {
-            let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
-            guard let updatedJSON = mergeRefreshedCredentials(into: systemJSON, refreshed: refreshed) else { return nil }
-            do {
-                try writeSystemCredentials(updatedJSON)
-                writeCredentialsFile(updatedJSON)
-            } catch {
-                LoggingService.shared.logError("ensureFreshCredentials: refreshed active-profile tokens but keychain writeback failed — CLI may need /login", error: error)
-            }
-            LoggingService.shared.log("✓ ensureFreshCredentials: refreshed idle active-profile token and wrote back to system keychain")
-            return updatedJSON
-        } catch let ClaudeCodeError.refreshFailed(status, body) where DeadLoginTracker.isInvalidGrant(status: status, body: body) {
-            deadLogins.markDead(refreshToken)
-            LoggingService.shared.logError("ensureFreshCredentials: Claude Code login for '\(profileName)' is dead (invalid_grant) — not retrying until /login")
-        } catch {
-            LoggingService.shared.logError("ensureFreshCredentials: idle active-profile refresh failed (non-fatal)", error: error)
-        }
-        return nil
-    }
-
-    /// Returns the login to write to the main keychain when switching to this
-    /// profile, refreshed if it has expired. For a pinned profile that is its
-    /// own main login — never the pinned entry. While the profile is inactive
-    /// nothing else holds that login, so refreshing it here is safe.
-    func ensureFreshMainLogin(for profileId: UUID) async -> String? {
-        guard let profile = ProfileStore.shared.loadProfiles().first(where: { $0.id == profileId }) else {
-            return nil
-        }
-        guard profile.customKeychainServiceName != nil else {
-            return await ensureFreshCredentials(for: profileId, allowRotation: true)
-        }
-        guard profile.hasOwnMainLogin, let mainJSON = profile.cliCredentialsJSON else { return nil }
-
+    /// The ONE place the tracker refreshes a token: a stored main login about to
+    /// be written into the keychain by `switchMainLogin(to:)`, after that has
+    /// established that no process holds the shared login and the keychain
+    /// holds a different, known login — so this app is the stored login's only
+    /// holder. Returns the login to write (refreshed if it had expired), or nil
+    /// when it cannot be made usable. A rejected refresh token is remembered as
+    /// dead and not retried until a `/login` replaces it.
+    private func refreshStoredMainLoginIfExpired(_ mainJSON: String, profileId: UUID, profileName: String) async -> String? {
         if let expiryDate = extractTokenExpiry(from: mainJSON),
            expiryDate.timeIntervalSinceNow > Self.refreshLeewaySeconds {
             return mainJSON
         }
-        guard let refreshToken = extractRefreshToken(from: mainJSON), !deadLogins.isDead(refreshToken) else {
+        guard let refreshToken = extractRefreshToken(from: mainJSON) else {
+            LoggingService.shared.log("switchMainLogin: stored login for '\(profileName)' has no refresh token")
             return nil
         }
+        guard !deadLogins.isDead(refreshToken) else { return nil }
         do {
             let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
             guard let updatedJSON = mergeRefreshedCredentials(into: mainJSON, refreshed: refreshed) else { return nil }
             persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
-            LoggingService.shared.log("✓ ensureFreshMainLogin: refreshed main login for '\(profile.name)'")
+            LoggingService.shared.log("✓ switchMainLogin: refreshed the stored main login for '\(profileName)' before writing it")
             return updatedJSON
         } catch let ClaudeCodeError.refreshFailed(status, body) {
-            LoggingService.shared.logError("ensureFreshMainLogin: refresh failed for '\(profile.name)' (HTTP \(status)) body=\(body)")
+            // 4xx bodies carry no tokens, only `{ "error": ... }`, so logging is safe.
+            LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)' (HTTP \(status)) body=\(body)")
             if DeadLoginTracker.isInvalidGrant(status: status, body: body) {
                 deadLogins.markDead(refreshToken)
+                LoggingService.shared.logError("switchMainLogin: login for '\(profileName)' is dead — not retrying until /login")
             }
         } catch {
-            LoggingService.shared.logError("ensureFreshMainLogin: refresh failed for '\(profile.name)'", error: error)
+            LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)'", error: error)
         }
         return nil
     }

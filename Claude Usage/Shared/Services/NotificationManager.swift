@@ -323,6 +323,30 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// Tells the user that a switch refused earlier (sessions were holding the
+    /// shared login) has now been applied, so bare `claude` starts on the new
+    /// account from here on.
+    func sendSwitchAppliedLaterNotification(profileName: String, settings: NotificationSettings) {
+        guard settings.enabled else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "notification.switch_applied_later.title".localized(with: profileName)
+        content.body = "notification.switch_applied_later.body".localized(with: profileName)
+        content.sound = .default
+        content.categoryIdentifier = "INFO_ALERT"
+
+        let request = UNNotificationRequest(
+            identifier: "switch_applied_later_\(profileName)_\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send switch-applied-later notification: \(error)")
+            }
+        }
+    }
+
     /// Tells the user a profile switch did NOT reach Claude Code (the keychain
     /// still holds the previous account) and what to do about it.
     func sendSwitchNotAppliedNotification(profileName: String, reason: String, settings: NotificationSettings) {
