@@ -18,12 +18,13 @@ final class SingleRefresherTests: XCTestCase {
     private var keychain: [String: String] = [:]
     private var securityCalls: [[String]] = []
     private var refreshCalls = 0
-    private var processes: [MainLoginSwapPolicy.RunningProcess] = []
+    /// nil = "ps failed", which the swap must treat as unknown (C1).
+    private var processes: [MainLoginSwapPolicy.RunningProcess]? = []
     private var tempDir: URL!
 
     private var savedRunner: ((_ arguments: [String], _ timeout: TimeInterval) -> ClaudeCodeSyncService.SecurityCommandResult?)!
     private var savedRefresher: ((_ refreshToken: String) async throws -> ClaudeCodeSyncService.OAuthRefreshResponse)!
-    private var savedProcesses: (() -> [MainLoginSwapPolicy.RunningProcess])!
+    private var savedProcesses: (() -> [MainLoginSwapPolicy.RunningProcess]?)!
     private var savedCredentialsFile: URL!
 
     override func setUp() {
@@ -95,11 +96,24 @@ final class SingleRefresherTests: XCTestCase {
     private var writes: [[String]] { securityCalls.filter { ClaudeCodeSyncService.isMutatingSecurityVerb($0.first) } }
 
     private func bareClaude(_ pid: Int32) -> MainLoginSwapPolicy.RunningProcess {
-        .init(pid: pid, command: "claude", environment: ["HOME": "/Users/me"])
+        .init(pid: pid, command: "claude", configDir: nil)
     }
 
     private func rotateClaude(_ pid: Int32) -> MainLoginSwapPolicy.RunningProcess {
-        .init(pid: pid, command: "claude", environment: ["CLAUDE_CONFIG_DIR": "/Users/me/.claude-rotate/accounts/goose"])
+        .init(pid: pid, command: "claude", configDir: "/Users/me/.claude-rotate/accounts/goose")
+    }
+
+    /// A security runner whose `find-generic-password` fails the given way
+    /// while everything else behaves; for C2.
+    private func failingFind(_ failure: ClaudeCodeSyncService.SecurityCommandResult?) {
+        let inner = sync.securityCommandRunner
+        sync.securityCommandRunner = { [unowned self] arguments, timeout in
+            if arguments.first == "find-generic-password", arguments.contains(self.mainService) {
+                self.securityCalls.append(arguments)
+                return failure
+            }
+            return inner(arguments, timeout)
+        }
     }
 
     // MARK: - A1: pinned profiles are read-only
@@ -252,10 +266,15 @@ final class SingleRefresherTests: XCTestCase {
 
     func testSwitchIsRefusedWhileHappyRunsClaudeByItsVersionedPath() async throws {
         keychain[mainService] = login("A", expiresIn: 3600)
-        processes = MainLoginSwapPolicy.parsePsOutput("""
-        41200 1 node /Users/me/.npm-global/lib/node_modules/happy-coder/dist/claude_local_launcher.cjs HOME=/Users/me
-        41233 41200 /Users/me/.local/share/claude/versions/2.1.292 --resume 3f2b7a9c-1d2e-4f5a-8b6c-7d8e9f0a1b2c HOME=/Users/me
-        """)
+        processes = MainLoginSwapPolicy.parsePsOutput(
+            commands: """
+            41200 1 node /Users/me/.npm-global/lib/node_modules/happy-coder/dist/claude_local_launcher.cjs
+            41233 41200 /Users/me/.local/share/claude/versions/2.1.292 --resume 3f2b7a9c-1d2e-4f5a-8b6c-7d8e9f0a1b2c
+            """,
+            withEnvironment: """
+            41200 1 node /Users/me/.npm-global/lib/node_modules/happy-coder/dist/claude_local_launcher.cjs HOME=/Users/me
+            41233 41200 /Users/me/.local/share/claude/versions/2.1.292 --resume 3f2b7a9c-1d2e-4f5a-8b6c-7d8e9f0a1b2c HOME=/Users/me
+            """)
         let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
 
         let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
@@ -353,6 +372,148 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertEqual(outcome, .applied(racedHolders: 1))
         XCTAssertEqual(scans, 2, "scanned before and after the write")
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON, "the write itself was legitimate at the time")
+    }
+
+    // MARK: - C1: no process list means refuse, never "no holders"
+
+    func testSwitchIsRefusedWhenProcessesCannotBeListed() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        processes = nil
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: -600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.processListUnavailable))
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testAFailedRescanIsReportedAsUnverified() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+        var scans = 0
+        sync.runningProcesses = { scans += 1; return scans == 1 ? [] : nil }
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: nil))
+    }
+
+    // MARK: - C2: only "not found" is an empty keychain; everything else is unknown
+
+    func testSwitchIsRefusedWhenTheKeychainReadTimesOut() async throws {
+        failingFind(.init(exitCode: -1, stdout: "", stderr: "timeout", timedOut: true))
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: -600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.keychainUnreadable))
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testSwitchIsRefusedWhenSecurityCannotBeLaunched() async throws {
+        failingFind(nil)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.keychainUnreadable))
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testSwitchIsRefusedOnAKeychainReadError() async throws {
+        failingFind(.init(exitCode: 36, stdout: "", stderr: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.", timedOut: false))
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.keychainUnreadable))
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testExit44IsAnEmptyKeychainAndMayBeWritten() async throws {
+        // The default stub answers 44 for a missing entry: this is the empty case.
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [b.cliCredentialsJSON!])
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+    }
+
+    // MARK: - W4: free text in argv never hides a holder
+
+    func testConfigDirMentionedInArgumentsDoesNotHideAHolder() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        let argv = "claude -p ANSWER for cloud run R: set CLAUDE_CONFIG_DIR=/x in the plist --cloud session_1"
+        processes = MainLoginSwapPolicy.parsePsOutput(
+            commands: "500 1 \(argv)",
+            withEnvironment: "500 1 \(argv) HOME=/Users/me TERM=xterm")
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)))
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    // MARK: - W6: a stored login that may be a copy of a pinned lineage is never written
+
+    func testStoredLoginEqualToAPinnedEntryIsRefused() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        let pinnedJSON = login("goose-pinned", expiresIn: 3600)
+        keychain[pinnedService] = pinnedJSON
+        var goose = Profile(name: "goose", cliCredentialsJSON: pinnedJSON, customKeychainServiceName: pinnedService, hasOwnMainLogin: true)
+        goose.mainLoginProvenance = "import"   // even a recorded origin does not excuse an identical token
+
+        let outcome = try await sync.switchMainLogin(to: goose, knownLogins: [keychain[mainService]!, pinnedJSON], pinnedLogins: [pinnedJSON])
+
+        XCTAssertEqual(outcome, .refused(.untrustedStoredLogin(.copyOfPinnedEntry)))
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testPinnedProfilesLoginFromAnOlderBuildIsRefusedUntilReimported() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        keychain[pinnedService] = login("goose-pinned", expiresIn: 3600)
+        let goose = Profile(name: "goose", cliCredentialsJSON: login("goose-main", expiresIn: 3600),
+                            customKeychainServiceName: pinnedService, hasOwnMainLogin: true)
+        XCTAssertNil(goose.mainLoginProvenance, "precondition: no record of where the login came from")
+
+        let outcome = try await sync.switchMainLogin(to: goose, knownLogins: [keychain[mainService]!, goose.cliCredentialsJSON!], pinnedLogins: [keychain[pinnedService]!])
+
+        XCTAssertEqual(outcome, .refused(.untrustedStoredLogin(.unknownProvenance)))
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testPinnedProfilesImportedLoginIsWritten() async throws {
+        keychain[mainService] = login("A", expiresIn: 3600)
+        keychain[pinnedService] = login("goose-pinned", expiresIn: 3600)
+        var goose = Profile(name: "goose", cliCredentialsJSON: login("goose-main", expiresIn: 3600),
+                            customKeychainServiceName: pinnedService, hasOwnMainLogin: true)
+        goose.mainLoginProvenance = "import"
+
+        let outcome = try await sync.switchMainLogin(to: goose, knownLogins: [keychain[mainService]!, goose.cliCredentialsJSON!], pinnedLogins: [keychain[pinnedService]!])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+        XCTAssertEqual(keychain[mainService], goose.cliCredentialsJSON)
+    }
+
+    func testUnpinnedProfilesOlderLoginIsStillWritten() async throws {
+        // No pinned lineage exists for an unpinned account; nothing to be a copy of.
+        keychain[mainService] = login("A", expiresIn: 3600)
+        let b = Profile(name: "B", cliCredentialsJSON: login("B", expiresIn: 3600))
+        XCTAssertNil(b.mainLoginProvenance)
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!], pinnedLogins: [login("goose-pinned", expiresIn: 3600)])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+    }
+
+    func testProvenanceRoundTripsThroughCoding() throws {
+        var p = Profile(name: "p")
+        p.mainLoginProvenance = "import"
+        let data = try JSONEncoder().encode(p)
+        XCTAssertEqual(try JSONDecoder().decode(Profile.self, from: data).mainLoginProvenance, "import")
+        XCTAssertNil(try JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(Profile(name: "old"))).mainLoginProvenance)
     }
 
     // MARK: - A4: no plaintext mirror

@@ -22,6 +22,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Hide dock icon (menu bar app only)
         NSApp.setActivationPolicy(.accessory)
 
+        // One tracker per user. A second instance (an old build left running
+        // beside a new one, say) is a second refresher and writer of the same
+        // Claude Code logins — exactly what this app must never be.
+        if let bundleId = Bundle.main.bundleIdentifier {
+            let pids = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).map(\.processIdentifier)
+            if MainLoginSwapPolicy.shouldQuitAsDuplicateInstance(myPid: ProcessInfo.processInfo.processIdentifier, instancePids: pids) {
+                LoggingService.shared.logError("Another Claude Usage (\(bundleId)) is already running (pids \(pids)); quitting this instance")
+                NSApp.terminate(nil)
+                return
+            }
+        }
+
         warnAboutOtherInstalledCopies()
 
         // Load profiles into ProfileManager (synchronously)

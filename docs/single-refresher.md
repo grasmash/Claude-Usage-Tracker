@@ -19,6 +19,43 @@ Whoever owns a config dir owns its login: `cca`/claude-rotate sessions and the
 cloud watchdog own the pinned entries, bare `claude` sessions own the shared
 one. The tracker only reads them.
 
+## Installing this build (do these in order)
+
+The old build is still a second refresher while it runs, and it keeps
+rewriting `~/.claude/.credentials.json` (last seen 2026-10-10 23:53).
+
+1. **Quit the old tracker** (menu bar → Quit) BEFORE launching the new one.
+   The new build quits itself if another instance with the same bundle id is
+   running, so an old copy left running wins and nothing changes.
+2. **Delete `~/.claude/.credentials.json`.** It is a plaintext copy of a
+   login the old build wrote at switch time; it is stale (the keychain has
+   rotated since) and nothing reads it any more. The tracker never writes it
+   again and only touches its mtime as a reload signal when the file exists.
+3. **Re-import each account's main login with `claude-usage-login`**
+   (`CLAUDE_CONFIG_DIR=~/.claude-import claude`, `/login` as that account,
+   `/exit`). Logins the old build stored for PINNED profiles may be copies of
+   the lineage their `cca` sessions use; this build refuses to write such a
+   login into the shared entry (`MainLoginSwapPolicy.distrust`) until it has
+   been re-imported — the notification says "run claude-usage-login as this
+   account once". Wait for the login session to exit: the import is picked up
+   only once no `claude` runs in `~/.claude-import`.
+4. Install the keychain watcher (`tools/keychain-mdat-watch` in claude-rotate)
+   and check after a day that every `Claude Code-credentials*` item has one
+   writer.
+
+### What to expect on this laptop
+
+While the happy daemon's remote sessions run, a Claude Code without
+`CLAUDE_CONFIG_DIR` is always running (measured 2026-10-11: nine live holders,
+all launched by `claude_local_launcher.cjs` as
+`~/.local/share/claude/versions/<semver>`), so the shared login is always held
+and **the main-login swap will almost never apply on this machine**. That is
+the intended outcome, not a bug: the alternative was a swap under those
+sessions, which is what logged them out. Rotation reaches new work through
+`cca auto` and the cloud launcher, both of which pick the account the tracker
+selected; the menu-bar click still records the selection and will apply the
+shared login on the rare occasion nothing holds it.
+
 ## What auto-switch does now
 
 Rotation means choosing which account's config dir new work uses, never copying

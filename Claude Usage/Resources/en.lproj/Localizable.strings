@@ -977,6 +977,8 @@
 "notification.switch_not_applied.sessions_running" = "%d Claude Code session(s) are running on the shared login, so it stays on %@; switching it under them would log them out. New sessions started with cca use %@. The shared login switches once those sessions end (within a day).";
 "notification.switch_not_applied.unknown_login" = "Claude Code is logged into an account the tracker has not seen yet (a /login it has not caught up with); the shared login stays as it is (last known: %@). The tracker will catch up and retry.";
 "notification.switch_not_applied.not_shared_entry" = "The keychain entry the tracker resolved (%@) is not the shared login's, so it was not written; the shared login stays on %@. Reset the keychain entry in Settings.";
+"notification.switch_not_applied.unverifiable" = "The tracker could not check who holds the shared login (process list or keychain unreadable), so it was not touched; it stays on %@. Retrying.";
+"notification.switch_not_applied.reimport" = "%@'s saved login was stored by an older build and may be a copy of its pinned session's login, so it was not written; the shared login stays on %@. Run claude-usage-login as this account once to re-import it.";
 "notification.shared_login_raced.title" = "Check Claude Code's login: %@";
 "notification.shared_login_raced.body" = "%d Claude Code session(s) started while the shared login was being switched from %@ to %@. If one of them shows \"Login expired\", run /login in it.";
 "notification.switch_applied_later.title" = "Claude Code switched to %@";

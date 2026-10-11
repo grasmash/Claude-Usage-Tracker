@@ -54,8 +54,10 @@ class ClaudeCodeSyncService {
         return try await ClaudeCodeSyncService.postTokenRefresh(refreshToken: refreshToken)
     }
 
-    /// The processes running now, for `MainLoginSwapPolicy`. Tests supply a list.
-    var runningProcesses: () -> [MainLoginSwapPolicy.RunningProcess] = {
+    /// The processes running now, for `MainLoginSwapPolicy`; nil when they
+    /// could not be listed, which the swap treats as "refuse" (C1). Tests
+    /// supply a list.
+    var runningProcesses: () -> [MainLoginSwapPolicy.RunningProcess]? = {
         ClaudeCodeSyncService.listRunningProcesses()
     }
 
@@ -65,24 +67,43 @@ class ClaudeCodeSyncService {
             || verb == "import" || verb == "unlock-keychain"
     }
 
-    /// `ps -axwwE`: every process with its arguments and environment.
-    static func listRunningProcesses() -> [MainLoginSwapPolicy.RunningProcess] {
+    /// Two `ps` listings (plain, and with the environment appended) so the
+    /// environment is read only from after each command line (W4). Returns nil
+    /// — never an empty list — when either `ps` fails to run, exits non-zero,
+    /// or its output cannot be decoded: an empty list would read as "no
+    /// holders" and let a switch proceed blind (C1).
+    static func listRunningProcesses() -> [MainLoginSwapPolicy.RunningProcess]? {
+        guard let commands = runPs(["-axww", "-o", "pid=,ppid=,command="]),
+              let withEnvironment = runPs(["-axwwE", "-o", "pid=,ppid=,command="]) else { return nil }
+        let processes = MainLoginSwapPolicy.parsePsOutput(commands: commands, withEnvironment: withEnvironment)
+        // A machine always has processes; an empty parse means ps changed shape.
+        return processes.isEmpty ? nil : processes
+    }
+
+    private static func runPs(_ arguments: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axwwE", "-o", "pid=,ppid=,command="]
+        process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
         } catch {
-            LoggingService.shared.logError("listRunningProcesses: could not run ps", error: error)
-            return []
+            LoggingService.shared.logError("listRunningProcesses: could not run ps \(arguments.first ?? "")", error: error)
+            return nil
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return [] }
-        return MainLoginSwapPolicy.parsePsOutput(text)
+        guard process.terminationStatus == 0 else {
+            LoggingService.shared.logError("listRunningProcesses: ps \(arguments.first ?? "") exited \(process.terminationStatus)")
+            return nil
+        }
+        // ps output is not guaranteed UTF-8 (arguments can be any bytes).
+        if let text = String(data: data, encoding: .utf8) { return text }
+        if let text = String(data: data, encoding: .isoLatin1) { return text }
+        LoggingService.shared.logError("listRunningProcesses: ps output could not be decoded")
+        return nil
     }
 
     // MARK: - Cached Availability Check
@@ -285,13 +306,15 @@ class ClaudeCodeSyncService {
             "-a", NSUserName(),
             "-w"  // Print password only
         ]) else {
-            // Failed to launch security — treat as "no credentials"
-            return nil
+            // Failed to launch security: UNKNOWN, not "no credentials" (C2).
+            LoggingService.shared.log("readKeychainCredentials: could not run security")
+            throw ClaudeCodeError.keychainReadFailed(status: -1)
         }
 
         if result.timedOut {
+            // UNKNOWN, not "no credentials" (C2): only exit 44 means not found.
             LoggingService.shared.log("readKeychainCredentials: security command timed out")
-            return nil
+            throw ClaudeCodeError.keychainReadFailed(status: -2)
         }
 
         let exitCode = result.exitCode
@@ -773,6 +796,7 @@ class ClaudeCodeSyncService {
 
         profiles[index].cliCredentialsJSON = jsonData
         profiles[index].hasOwnMainLogin = isOwnMainLogin(jsonData, for: profiles[index])
+        profiles[index].mainLoginProvenance = "keychain"
         if let capturedOAuthAccount = capturedOAuthAccount {
             profiles[index].oauthAccountJSON = capturedOAuthAccount
         }
@@ -786,8 +810,9 @@ class ClaudeCodeSyncService {
         /// The shared login was written. `racedHolders` is how many Claude Code
         /// processes on the shared login were found in a re-scan right after
         /// the write: normally 0; more means one started in the window between
-        /// the scan and the write and may hold the login that was replaced.
-        case applied(racedHolders: Int)
+        /// the scan and the write and may hold the login that was replaced;
+        /// nil means the re-scan itself failed, so the window is unverified.
+        case applied(racedHolders: Int?)
         /// The keychain already held this profile's login; nothing was written.
         case alreadyApplied
         /// Not done, for a reason the policy names. Retry on a later cycle.
@@ -829,19 +854,25 @@ class ClaudeCodeSyncService {
     ///
     /// `knownLogins` are the main logins the tracker has captured (every
     /// profile's `cliCredentialsJSON`), for the compare-and-swap.
-    func switchMainLogin(to profile: Profile, knownLogins: [String]) async throws -> MainLoginSwitch {
+    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = []) async throws -> MainLoginSwitch {
+        try await withSwitchMutex {
+            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins)
+        }
+    }
+
+    private func withSwitchMutex<T>(_ body: () async throws -> T) async throws -> T {
         await switchMutex.lock()
         do {
-            let outcome = try await performMainLoginSwitch(to: profile, knownLogins: knownLogins)
+            let result = try await body()
             await switchMutex.unlock()
-            return outcome
+            return result
         } catch {
             await switchMutex.unlock()
             throw error
         }
     }
 
-    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String]) async throws -> MainLoginSwitch {
+    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String]) async throws -> MainLoginSwitch {
         guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
             // A pinned entry's login is never copied into the main keychain:
             // that puts one single-use refresh token in two config dirs.
@@ -858,13 +889,38 @@ class ClaudeCodeSyncService {
             return .refused(.notTheSharedLoginEntry(service: service))
         }
 
-        let keychainJSON = try? readKeychainCredentials()
+        // W6: a stored login that is (or may be) a copy of a pinned lineage is
+        // never written: bare sessions would become that lineage's second holder.
+        if let distrust = MainLoginSwapPolicy.distrust(
+            storedRefreshToken: extractRefreshToken(from: storedJSON),
+            pinnedRefreshTokens: pinnedLogins.compactMap(extractRefreshToken),
+            isPinned: profile.customKeychainServiceName != nil,
+            provenance: profile.mainLoginProvenance
+        ) {
+            LoggingService.shared.logError("switchMainLogin: not writing '\(profile.name)''s stored login: \(distrust); re-import it with claude-usage-login")
+            return .refused(.untrustedStoredLogin(distrust))
+        }
+
+        // C2: only exit 44 (not found) means the entry is empty. A timeout, a
+        // launch failure or any other error means UNKNOWN, never "may write".
+        let keychainJSON: String?
+        do {
+            keychainJSON = try readKeychainCredentials()
+        } catch {
+            LoggingService.shared.logError("switchMainLogin: cannot read the shared keychain entry; refusing", error: error)
+            return .refused(.keychainUnreadable)
+        }
         let keychainFingerprint = keychainJSON.flatMap(systemLoginFingerprint)
         if let keychainFingerprint, keychainFingerprint == systemLoginFingerprint(storedJSON) {
             return .alreadyApplied
         }
 
-        let holders = MainLoginSwapPolicy.sharedLoginHolders(in: runningProcesses())
+        // C1: no process list means no knowledge of holders; refuse.
+        guard let processes = runningProcesses() else {
+            LoggingService.shared.logError("switchMainLogin: cannot list processes; refusing to switch to '\(profile.name)'")
+            return .refused(.processListUnavailable)
+        }
+        let holders = MainLoginSwapPolicy.sharedLoginHolders(in: processes)
         let known = Set(knownLogins.compactMap(systemLoginFingerprint))
         if let refusal = MainLoginSwapPolicy.refusal(
             holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known
@@ -890,9 +946,21 @@ class ClaudeCodeSyncService {
         // Re-scan: a `claude` that started between the scan above and the write
         // read the keychain before or after it, and we cannot tell which. Say so
         // loudly; the caller notifies, and the keychain-mdat log will show it.
-        let raced = MainLoginSwapPolicy.sharedLoginHolders(in: runningProcesses())
-        if !raced.isEmpty {
-            LoggingService.shared.logError("⚠️ switchMainLogin: \(raced.count) Claude Code process(es) on the shared login appeared during the switch to '\(profile.name)' (pids \(raced.map { String($0.pid) }.joined(separator: ","))); one may hold the replaced login")
+        let racedCount: Int?
+        if let after = runningProcesses() {
+            let raced = MainLoginSwapPolicy.sharedLoginHolders(in: after)
+            racedCount = raced.count
+            if !raced.isEmpty {
+                LoggingService.shared.logError("⚠️ switchMainLogin: \(raced.count) Claude Code process(es) on the shared login appeared during the switch to '\(profile.name)' (pids \(raced.map { String($0.pid) }.joined(separator: ","))); one may hold the replaced login")
+                // Tell it to reload: sessions re-read the keychain when the
+                // credentials file's mtime changes, so it converges on the new login.
+                if Self.signalCredentialsReload(at: credentialsFileURL) {
+                    LoggingService.shared.log("switchMainLogin: touched the credentials file so the raced session reloads")
+                }
+            }
+        } else {
+            racedCount = nil
+            LoggingService.shared.logError("⚠️ switchMainLogin: could not re-scan processes after writing '\(profile.name)'; the switch window is unverified")
         }
 
         // Restore the profile's captured oauthAccount (if any) so Claude Code's
@@ -907,17 +975,25 @@ class ClaudeCodeSyncService {
         }
 
         LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)'")
-        return .applied(racedHolders: raced.count)
+        return .applied(racedHolders: racedCount)
     }
 
-    /// `switchMainLogin(to:knownLogins:)` for a stored profile, with every
-    /// profile's captured main login as the known set.
+    /// `switchMainLogin(to:knownLogins:pinnedLogins:)` for a stored profile,
+    /// with every profile's captured main login as the known set and every
+    /// pinned entry's current contents (read-only) for the copy check. The
+    /// store is loaded INSIDE the mutex, so a queued caller sees the login the
+    /// previous switch just refreshed and stored (`.alreadyApplied`), not a
+    /// stale copy it would then mis-read as an unknown keychain login.
     func switchMainLogin(to profileId: UUID) async throws -> MainLoginSwitch {
-        let profiles = ProfileStore.shared.loadProfiles()
-        guard let profile = profiles.first(where: { $0.id == profileId }) else {
-            throw ClaudeCodeError.noProfileCredentials
+        try await withSwitchMutex {
+            let profiles = ProfileStore.shared.loadProfiles()
+            guard let profile = profiles.first(where: { $0.id == profileId }) else {
+                throw ClaudeCodeError.noProfileCredentials
+            }
+            let pinned = Set(profiles.compactMap(\.customKeychainServiceName)).compactMap { readKeychainCredentials(serviceName: $0) }
+            return try await performMainLoginSwitch(
+                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned)
         }
-        return try await switchMainLogin(to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON))
     }
 
     /// Removes CLI credentials from profile (doesn't affect system)
@@ -1131,7 +1207,7 @@ class ClaudeCodeSyncService {
             // The shared login, when it is this account's. Claude Code keeps it
             // fresh while sessions run; expired means idle, and it stays so.
             if let systemJSON = try? readSystemCredentials(), systemCredentials(systemJSON, belongTo: profile) {
-                persistProfileCredentialsJSON(profileId: profile.id, json: systemJSON, ownMainLogin: isOwnMainLogin(systemJSON, for: profile))
+                persistProfileCredentialsJSON(profileId: profile.id, json: systemJSON, ownMainLogin: isOwnMainLogin(systemJSON, for: profile), provenance: "keychain")
                 return systemJSON
             }
             return profile.cliCredentialsJSON
@@ -1192,7 +1268,7 @@ class ClaudeCodeSyncService {
               systemCredentials(systemJSON, belongTo: profile) else { return false }
         let own = isOwnMainLogin(systemJSON, for: profile)
         guard profile.cliCredentialsJSON != systemJSON || profile.hasOwnMainLogin != own else { return false }
-        persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own)
+        persistProfileCredentialsJSON(profileId: profileId, json: systemJSON, ownMainLogin: own, provenance: "keychain")
         return true
     }
 
@@ -1427,15 +1503,18 @@ class ClaudeCodeSyncService {
     /// of clobbering concurrent edits to other profile fields.
     /// `ownMainLogin`, when given, also records whether `json` is the profile's
     /// own main login (see `Profile.hasOwnMainLogin`).
-    private func persistProfileCredentialsJSON(profileId: UUID, json: String, ownMainLogin: Bool? = nil) {
+    private func persistProfileCredentialsJSON(profileId: UUID, json: String, ownMainLogin: Bool? = nil, provenance: String? = nil) {
         var reloaded = ProfileStore.shared.loadProfiles()
         guard let idx = reloaded.firstIndex(where: { $0.id == profileId }) else { return }
         let own = ownMainLogin ?? reloaded[idx].hasOwnMainLogin
-        guard reloaded[idx].cliCredentialsJSON != json || reloaded[idx].hasOwnMainLogin != own else {
+        let origin = provenance ?? reloaded[idx].mainLoginProvenance
+        guard reloaded[idx].cliCredentialsJSON != json || reloaded[idx].hasOwnMainLogin != own
+                || reloaded[idx].mainLoginProvenance != origin else {
             return
         }
         reloaded[idx].cliCredentialsJSON = json
         reloaded[idx].hasOwnMainLogin = own
+        reloaded[idx].mainLoginProvenance = origin
         ProfileStore.shared.saveProfiles(reloaded)
     }
 
@@ -1542,6 +1621,7 @@ class ClaudeCodeSyncService {
 
         profiles[index].cliCredentialsJSON = freshJSON
         profiles[index].hasOwnMainLogin = isOwnMainLogin(freshJSON, for: profiles[index])
+        profiles[index].mainLoginProvenance = "keychain"
         if let freshOAuthAccount = freshOAuthAccount {
             profiles[index].oauthAccountJSON = freshOAuthAccount
         }

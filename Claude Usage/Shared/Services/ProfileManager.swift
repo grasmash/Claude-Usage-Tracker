@@ -452,9 +452,10 @@ class ProfileManager: ObservableObject {
             pendingMainLoginSwitch = false
             lastKeychainIdentity = ClaudeCodeSyncService.shared.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) ?? lastKeychainIdentity
             LoggingService.shared.log("✓ Claude Code's shared login is '\(profile.name)' (written; was '\(previousName)')")
-            if raced > 0 {
+            if raced == nil || raced! > 0 {
+                // nil: the re-scan failed, so the window is unverified; say so the same way.
                 NotificationManager.shared.sendSharedLoginRaceNotification(
-                    profileName: profile.name, previousName: previousName, count: raced, settings: profile.notificationSettings)
+                    profileName: profile.name, previousName: previousName, count: raced ?? 0, settings: profile.notificationSettings)
             } else if announceLater {
                 NotificationManager.shared.sendSwitchAppliedLaterNotification(
                     profileName: profile.name, settings: profile.notificationSettings)
@@ -478,6 +479,14 @@ class ProfileManager: ObservableObject {
                 // Not retryable: the resolved entry will not change by itself.
                 pendingMainLoginSwitch = false
                 text = "notification.switch_not_applied.not_shared_entry".localized(with: service, previousName)
+            case .processListUnavailable, .keychainUnreadable:
+                // Transient; stays pending and is retried. Say it once.
+                guard !announceLater else { return }
+                text = "notification.switch_not_applied.unverifiable".localized(with: previousName)
+            case .untrustedStoredLogin:
+                // Not retryable until the login is re-imported.
+                pendingMainLoginSwitch = false
+                text = "notification.switch_not_applied.reimport".localized(with: profile.name, previousName)
             }
             NotificationManager.shared.sendSwitchNotAppliedNotification(
                 profileName: profile.name, reason: text, settings: profile.notificationSettings)
@@ -559,6 +568,19 @@ class ProfileManager: ObservableObject {
         let sync = ClaudeCodeSyncService.shared
         guard let imported = sync.readImportedLogin() else { return nil }
 
+        // W8: while `claude-usage-login` is still running in the import dir it
+        // holds (and may yet refresh) this login; taking it now would make two
+        // holders. Wait for it to exit. No process list = cannot tell = wait.
+        guard let processes = sync.runningProcesses() else {
+            LoggingService.shared.log("importPendingLogin: cannot list processes; leaving the import in place for now")
+            return nil
+        }
+        let inImportDir = MainLoginSwapPolicy.processes(onConfigDir: ClaudeCodeSyncService.loginImportDirectory.path, in: processes)
+        guard inImportDir.isEmpty else {
+            LoggingService.shared.log("importPendingLogin: claude-usage-login is still running (pid \(inImportDir.map { String($0.pid) }.joined(separator: ","))); importing once it exits")
+            return nil
+        }
+
         guard let index = Self.matchingProfileIndex(in: profiles, oauthAccountJSON: imported.oauthAccount) else {
             LoggingService.shared.log("importPendingLogin: \(Self.email(inOAuthAccountJSON: imported.oauthAccount) ?? "account") is not a known profile; leaving it in place")
             return nil
@@ -568,6 +590,7 @@ class ProfileManager: ObservableObject {
         profile.cliCredentialsJSON = imported.credentials
         profile.oauthAccountJSON = imported.oauthAccount
         profile.hasOwnMainLogin = true
+        profile.mainLoginProvenance = "import"
         profile.cliAccountSyncedAt = Date()
         profiles[index] = profile
         if activeProfile?.id == profile.id { activeProfile = profile }
@@ -631,6 +654,7 @@ class ProfileManager: ObservableObject {
         var adopted = profiles[index]
         adopted.cliCredentialsJSON = systemJSON
         adopted.hasOwnMainLogin = sync.isOwnMainLogin(systemJSON, for: adopted)
+        adopted.mainLoginProvenance = "keychain"
         adopted.oauthAccountJSON = systemAccount ?? adopted.oauthAccountJSON
         adopted.cliAccountSyncedAt = Date()
         adopted.lastUsedAt = Date()

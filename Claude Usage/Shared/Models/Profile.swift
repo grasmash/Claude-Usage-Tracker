@@ -57,6 +57,14 @@ struct Profile: Codable, Identifiable, Equatable {
     /// nil when no launcher is installed.
     var terminalLauncherSlug: String?
 
+    /// Where `cliCredentialsJSON` came from: `import` (a `claude-usage-login`
+    /// in the import dir, so the tracker is its only holder) or `keychain`
+    /// (captured from the shared keychain entry by this build). nil for a login
+    /// an older build stored, which — for a pinned profile — may be a COPY of
+    /// the pinned entry's lineage and is therefore never written back into the
+    /// shared login until re-imported (see `MainLoginSwapPolicy.distrust`).
+    var mainLoginProvenance: String?
+
     /// Serialized `oauthAccount` object from Claude Code's `.claude.json` config file.
     /// Captured at sync time and re-applied during profile switches so that
     /// Claude Code's `/status` command shows the correct account for the active
@@ -165,6 +173,7 @@ struct Profile: Codable, Identifiable, Equatable {
         case customKeychainServiceName
         case hasOwnMainLogin
         case terminalLauncherSlug
+        case mainLoginProvenance
         case oauthAccountJSON
         case claudeUsage, apiUsage
         case iconConfig
@@ -197,6 +206,7 @@ struct Profile: Codable, Identifiable, Equatable {
         customKeychainServiceName = try c.decodeIfPresent(String.self, forKey: .customKeychainServiceName)
         hasOwnMainLogin = try c.decodeIfPresent(Bool.self, forKey: .hasOwnMainLogin) ?? false
         terminalLauncherSlug = try c.decodeIfPresent(String.self, forKey: .terminalLauncherSlug)
+        mainLoginProvenance = try c.decodeIfPresent(String.self, forKey: .mainLoginProvenance)
         oauthAccountJSON = try c.decodeIfPresent(String.self, forKey: .oauthAccountJSON)
         // Usage values are re-fetchable caches — a malformed cache (e.g. written
         // by a different app version) must degrade to nil, never fail the
@@ -237,6 +247,7 @@ struct Profile: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(customKeychainServiceName, forKey: .customKeychainServiceName)
         try c.encode(hasOwnMainLogin, forKey: .hasOwnMainLogin)
         try c.encodeIfPresent(terminalLauncherSlug, forKey: .terminalLauncherSlug)
+        try c.encodeIfPresent(mainLoginProvenance, forKey: .mainLoginProvenance)
         try c.encodeIfPresent(oauthAccountJSON, forKey: .oauthAccountJSON)
         try c.encodeIfPresent(claudeUsage, forKey: .claudeUsage)
         try c.encodeIfPresent(apiUsage, forKey: .apiUsage)

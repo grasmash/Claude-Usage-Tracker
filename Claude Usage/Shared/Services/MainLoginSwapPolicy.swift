@@ -11,53 +11,81 @@ import Foundation
 /// old login writes it back over the new one. So the shared login is rewritten
 /// only when nothing holds it, only over a login the tracker has seen — never
 /// over a `/login` it has not yet captured — and only into the keychain entry
-/// that IS the shared login, never a per-config-dir one.
+/// that IS the shared login, never a per-config-dir one. When any of that
+/// cannot be established (no process list, keychain unreadable) the answer is
+/// refuse, never "probably fine".
 ///
 /// Pure functions over a process list, service names and keychain
 /// fingerprints, so the policy is unit tested without `ps` or the keychain.
 enum MainLoginSwapPolicy {
 
-    /// One running process, as `ps -E` reports it.
+    /// One running process. Only `CLAUDE_CONFIG_DIR` is kept from its
+    /// environment: nothing else is needed, and an environment can carry
+    /// secrets (W11).
     struct RunningProcess: Equatable {
         let pid: Int32
         let ppid: Int32
         let command: String
-        let environment: [String: String]
+        /// `CLAUDE_CONFIG_DIR` as set in the process's environment; nil when
+        /// unset, empty, or the environment could not be read.
+        let configDir: String?
 
-        init(pid: Int32, ppid: Int32 = 1, command: String, environment: [String: String]) {
+        init(pid: Int32, ppid: Int32 = 1, command: String, configDir: String? = nil) {
             self.pid = pid
             self.ppid = ppid
             self.command = command
-            self.environment = environment
+            self.configDir = (configDir?.isEmpty ?? true) ? nil : configDir
         }
     }
 
-    /// Parses `ps -axwwE -o pid=,ppid=,command=` output: one process per line,
-    /// `PID PPID command args… KEY=value KEY=value…`. The environment is
-    /// whatever trailing tokens look like assignments; arguments that happen to
-    /// look like one (`FOO=bar`) are read as environment too, which errs toward
-    /// counting a process as a holder.
-    static func parsePsOutput(_ text: String) -> [RunningProcess] {
-        text.split(separator: "\n").compactMap { line in
-            let tokens = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-            guard tokens.count >= 3, let pid = Int32(tokens[0]), let ppid = Int32(tokens[1]) else { return nil }
-            var command: [String] = []
-            var environment: [String: String] = [:]
-            for token in tokens.dropFirst(2) {
-                if let separator = token.firstIndex(of: "="),
-                   isEnvironmentName(token[token.startIndex..<separator]) {
-                    environment[String(token[token.startIndex..<separator])] = String(token[token.index(after: separator)...])
-                } else {
-                    command.append(token)
+    /// Parses two `ps` listings of the same instant:
+    /// - `commands`: `ps -axww -o pid=,ppid=,command=` — the plain command line;
+    /// - `withEnvironment`: `ps -axwwE -o pid=,ppid=,command=` — the same with
+    ///   the environment appended.
+    ///
+    /// The environment of a process is ONLY what follows its plain command
+    /// line in the second listing. Reading `KEY=value` tokens anywhere in the
+    /// line would let an argument such as `claude -p "… CLAUDE_CONFIG_DIR=/x …"`
+    /// (free text; `cloud answer` passes such text) masquerade as a pinned
+    /// process and escape the holder count (W4). A process whose environment
+    /// cannot be aligned (missing from one listing, line truncated) is kept
+    /// with `configDir == nil`, i.e. it counts as a shared-login holder when
+    /// it is Claude Code — erring toward refusal.
+    static func parsePsOutput(commands: String, withEnvironment: String) -> [RunningProcess] {
+        var plain: [Int32: (ppid: Int32, command: String)] = [:]
+        var order: [Int32] = []
+        for line in commands.split(separator: "\n") {
+            guard let (pid, ppid, rest) = splitLeading(line) else { continue }
+            plain[pid] = (ppid, rest)
+            order.append(pid)
+        }
+        var envRest: [Int32: String] = [:]
+        for line in withEnvironment.split(separator: "\n") {
+            guard let (pid, _, rest) = splitLeading(line) else { continue }
+            envRest[pid] = rest
+        }
+        return order.compactMap { pid in
+            guard let p = plain[pid] else { return nil }
+            var configDir: String?
+            if let full = envRest[pid], full.hasPrefix(p.command) {
+                let envText = full.dropFirst(p.command.count)
+                for token in envText.split(separator: " ") where token.hasPrefix("CLAUDE_CONFIG_DIR=") {
+                    configDir = String(token.dropFirst("CLAUDE_CONFIG_DIR=".count))
                 }
             }
-            return RunningProcess(pid: pid, ppid: ppid, command: command.joined(separator: " "), environment: environment)
+            return RunningProcess(pid: pid, ppid: p.ppid, command: p.command, configDir: configDir)
         }
     }
 
-    private static func isEnvironmentName(_ name: Substring) -> Bool {
-        guard let first = name.first, first == "_" || first.isLetter else { return false }
-        return name.allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
+    /// `PID PPID rest…` with the rest's internal spacing preserved.
+    private static func splitLeading(_ line: Substring) -> (Int32, Int32, String)? {
+        let trimmed = line.drop(while: { $0 == " " })
+        guard let s1 = trimmed.firstIndex(of: " "), let pid = Int32(trimmed[..<s1]) else { return nil }
+        let afterPid = trimmed[s1...].drop(while: { $0 == " " })
+        guard let s2 = afterPid.firstIndex(of: " "), let ppid = Int32(afterPid[..<s2]) else { return nil }
+        let rest = afterPid[s2...].drop(while: { $0 == " " })
+        guard !rest.isEmpty else { return nil }
+        return (pid, ppid, String(rest))
     }
 
     /// `…/claude/versions/<semver>`: Claude Code's native binary as installed
@@ -68,41 +96,61 @@ enum MainLoginSwapPolicy {
 
     /// True for a Claude Code process: the native `claude` binary (by any
     /// path), the updater's versioned binary, or the older
-    /// `node …/@anthropic-ai/claude-code/cli.js` form.
+    /// `node …/@anthropic-ai/claude-code/cli.js` form (the script path is the
+    /// token right after `node`, so only argv0/argv1 are consulted).
     static func isClaudeCode(_ process: RunningProcess) -> Bool {
         let argv = process.command.split(separator: " ").map(String.init)
         guard let argv0 = argv.first else { return false }
         if URL(fileURLWithPath: argv0).lastPathComponent == "claude" { return true }
         if versionedBinary.firstMatch(in: argv0, range: NSRange(argv0.startIndex..., in: argv0)) != nil { return true }
-        return argv.contains { $0.hasSuffix("@anthropic-ai/claude-code/cli.js") }
+        return argv.prefix(2).contains { $0.hasSuffix("@anthropic-ai/claude-code/cli.js") }
     }
 
-    /// True for a process known to launch Claude Code as a child: `happy`
-    /// (`claude_local_launcher.cjs`, the `happy` CLI) and the Claude desktop
-    /// app. Any child of one that is not on its own config dir is counted as a
-    /// holder even when its binary is not recognised, because that is exactly
-    /// where an unrecognised Claude Code is most likely to be.
+    /// True for a process known to launch Claude Code as a child: `happy`'s
+    /// `claude_local_launcher.cjs` or the `happy` CLI itself. Matched ONLY on
+    /// argv0 and path-shaped tokens (containing `/`), so free text in a real
+    /// claude's arguments (`--append-system-prompt "… be happy …"`) never turns
+    /// it into a "launcher" whose MCP children would then count as holders.
+    /// The Claude desktop app is deliberately NOT a launcher: its Electron
+    /// helpers would be permanent "holders" and refuse every switch.
     static func isClaudeLauncher(_ process: RunningProcess) -> Bool {
         let argv = process.command.split(separator: " ").map(String.init)
-        return argv.contains { token in
+        guard let argv0 = argv.first else { return false }
+        let candidates = [argv0] + argv.dropFirst().filter { $0.contains("/") }
+        return candidates.contains { token in
             let base = URL(fileURLWithPath: token).lastPathComponent
-            return token.contains("claude_local_launcher")
-                || base == "happy" || base.hasPrefix("happy.") || token.contains("/happy-coder/")
-                || token.contains("Claude.app/Contents/MacOS/")
+            return base == "claude_local_launcher.cjs" || base == "claude_local_launcher.js"
+                || base == "happy" || base == "happy.mjs" || base == "happy.js" || base == "happy.cjs"
+                || token.contains("/happy-coder/")
         }
     }
 
-    /// The Claude Code processes using the shared login: those started without
-    /// a `CLAUDE_CONFIG_DIR`. A process on a per-account config dir holds that
-    /// dir's own login, which the tracker never touches.
+    /// The Claude Code processes using the shared login: those with no
+    /// `CLAUDE_CONFIG_DIR` (or none we could read). A process on a per-account
+    /// config dir holds that dir's own login, which the tracker never touches.
+    /// A child of a known launcher is counted even when its binary is not
+    /// recognised — that is where an unrecognised Claude Code is most likely
+    /// to be — unless its argv0 is inside an app bundle's `Claude.app/`.
     static func sharedLoginHolders(in processes: [RunningProcess]) -> [RunningProcess] {
         let byPid = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
         return processes.filter { process in
-            let dir = process.environment["CLAUDE_CONFIG_DIR"] ?? ""
-            guard dir.isEmpty else { return false }
+            guard process.configDir == nil else { return false }
             if isClaudeCode(process) { return true }
-            if let parent = byPid[process.ppid], isClaudeLauncher(parent), !isClaudeLauncher(process) { return true }
+            if let parent = byPid[process.ppid], isClaudeLauncher(parent), !isClaudeLauncher(process),
+               !(process.command.split(separator: " ").first?.contains("Claude.app/") ?? false) {
+                return true
+            }
             return false
+        }
+    }
+
+    /// The Claude Code processes running on one specific config dir (W8: an
+    /// import must not be picked up while `claude-usage-login` is still in it).
+    static func processes(onConfigDir dir: String, in processes: [RunningProcess]) -> [RunningProcess] {
+        let target = URL(fileURLWithPath: dir).standardizedFileURL.path
+        return processes.filter { process in
+            guard let d = process.configDir, isClaudeCode(process) else { return false }
+            return URL(fileURLWithPath: d).standardizedFileURL.path == target
         }
     }
 
@@ -112,6 +160,34 @@ enum MainLoginSwapPolicy {
     /// and is never a target for the swap, whatever `resolveServiceName` found.
     static func isSharedLoginServiceName(_ name: String, claudeDirectoryHash: String) -> Bool {
         name == "Claude Code-credentials" || name == "Claude Code-credentials-\(claudeDirectoryHash)"
+    }
+
+    /// Why a stored main login may not be written into the shared entry (W6):
+    /// a profile captured by an older build may hold a COPY of the lineage its
+    /// pinned config dir's sessions use. Writing that copy makes bare sessions
+    /// a second holder of the pinned lineage.
+    enum StoredLoginDistrust: Equatable {
+        /// Its refresh token IS a pinned entry's: a copy, beyond doubt.
+        case copyOfPinnedEntry
+        /// A pinned profile whose stored login predates this build (no record
+        /// of where it came from); it must be re-imported via `claude-usage-login`.
+        case unknownProvenance
+    }
+
+    /// `storedRefreshToken`: the target's stored main login's refresh token;
+    /// `pinnedRefreshTokens`: the refresh tokens of every pinned entry in the
+    /// keychain; `isPinned`/`provenance`: the target profile's pin and the
+    /// recorded origin of its stored login (`import`, `keychain`, or nil for a
+    /// login an older build stored).
+    static func distrust(
+        storedRefreshToken: String?,
+        pinnedRefreshTokens: [String],
+        isPinned: Bool,
+        provenance: String?
+    ) -> StoredLoginDistrust? {
+        if let token = storedRefreshToken, pinnedRefreshTokens.contains(token) { return .copyOfPinnedEntry }
+        if isPinned, provenance == nil { return .unknownProvenance }
+        return nil
     }
 
     /// Why a rewrite of the shared login was not done.
@@ -124,6 +200,13 @@ enum MainLoginSwapPolicy {
         /// The resolved keychain entry is not the shared login's (a pinned,
         /// per-config-dir entry); never written.
         case notTheSharedLoginEntry(service: String)
+        /// `ps` failed, so nothing is known about holders (C1).
+        case processListUnavailable
+        /// The keychain could not be read (timeout, launch failure, error), so
+        /// "empty" cannot be told from "unknown" (C2).
+        case keychainUnreadable
+        /// The stored login may be a copy of a pinned lineage (W6).
+        case untrustedStoredLogin(StoredLoginDistrust)
     }
 
     /// Decides a compare-and-swap of the shared login.
@@ -148,6 +231,13 @@ enum MainLoginSwapPolicy {
             return .unknownKeychainLogin
         }
         return nil
+    }
+
+    /// Only one tracker may run per user: two would be two refreshers and two
+    /// writers of the same logins. `others` are the running applications with
+    /// this bundle identifier; this process must quit when any other exists.
+    static func shouldQuitAsDuplicateInstance(myPid: Int32, instancePids: [Int32]) -> Bool {
+        instancePids.contains { $0 != myPid }
     }
 }
 
