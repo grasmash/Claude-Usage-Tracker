@@ -199,18 +199,20 @@ final class MainLoginSwapPolicyTests: XCTestCase {
     // MARK: - W6: stored logins that may be copies of a pinned lineage
 
     func testIdenticalRefreshTokenIsACopy() {
-        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "r1", pinnedRefreshTokens: ["r0", "r1"], isPinned: true, provenance: "import"), .copyOfPinnedEntry)
-        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "r1", pinnedRefreshTokens: ["r1"], isPinned: false, provenance: nil), .copyOfPinnedEntry)
+        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "r1", pinnedRefreshTokens: ["r0", "r1"], provenance: "import"), .copyOfPinnedEntry)
+        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "r1", pinnedRefreshTokens: ["r1"], provenance: nil), .copyOfPinnedEntry)
     }
 
-    func testPinnedProfileWithoutProvenanceIsDistrusted() {
-        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], isPinned: true, provenance: nil), .unknownProvenance)
+    func testLoginWithoutProvenanceIsDistrustedForEveryProfile() {
+        // W15: a login an older build stored is distrusted whether or not the
+        // profile is pinned, until this build re-captures or re-imports it.
+        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], provenance: nil), .unknownProvenance)
+        XCTAssertEqual(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: [], provenance: nil), .unknownProvenance)
     }
 
-    func testRecordedProvenanceOrNoPinIsTrusted() {
-        XCTAssertNil(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], isPinned: true, provenance: "import"))
-        XCTAssertNil(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], isPinned: true, provenance: "keychain"))
-        XCTAssertNil(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], isPinned: false, provenance: nil))
+    func testRecordedProvenanceIsTrusted() {
+        XCTAssertNil(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], provenance: "import"))
+        XCTAssertNil(MainLoginSwapPolicy.distrust(storedRefreshToken: "main", pinnedRefreshTokens: ["pinned"], provenance: "keychain"))
     }
 
     // MARK: - Compare-and-swap decision

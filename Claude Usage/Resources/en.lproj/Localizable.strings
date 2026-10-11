@@ -981,6 +981,7 @@
 "notification.switch_not_applied.reimport" = "%@'s saved login was stored by an older build and may be a copy of its pinned session's login, so it was not written; the shared login stays on %@. Run claude-usage-login as this account once to re-import it.";
 "notification.shared_login_raced.title" = "Check Claude Code's login: %@";
 "notification.shared_login_raced.body" = "%d Claude Code session(s) started while the shared login was being switched from %@ to %@. If one of them shows \"Login expired\", run /login in it.";
+"notification.shared_login_raced.unverified" = "The shared login was switched from %@ to %@, but the tracker could not verify the result (keychain or process list unreadable right after the write). If a Claude Code session shows \"Login expired\", run /login in it.";
 "notification.switch_applied_later.title" = "Claude Code switched to %@";
 "notification.switch_applied_later.body" = "No session was using the shared login any more, so it now belongs to %@. New terminals without cca start on this account.";
 

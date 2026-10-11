@@ -162,31 +162,32 @@ enum MainLoginSwapPolicy {
         name == "Claude Code-credentials" || name == "Claude Code-credentials-\(claudeDirectoryHash)"
     }
 
-    /// Why a stored main login may not be written into the shared entry (W6):
-    /// a profile captured by an older build may hold a COPY of the lineage its
-    /// pinned config dir's sessions use. Writing that copy makes bare sessions
-    /// a second holder of the pinned lineage.
+    /// Why a stored main login may not be written into the shared entry (W6,
+    /// W15): a login an older build stored may be a COPY of a lineage some
+    /// session holds (a pinned config dir's, or a bare session's that was never
+    /// swapped out under the guard). Writing that copy makes bare sessions a
+    /// second holder of it.
     enum StoredLoginDistrust: Equatable {
         /// Its refresh token IS a pinned entry's: a copy, beyond doubt.
         case copyOfPinnedEntry
-        /// A pinned profile whose stored login predates this build (no record
-        /// of where it came from); it must be re-imported via `claude-usage-login`.
+        /// The stored login predates this build (no record of where it came
+        /// from). It is trusted again once this build re-captures it from the
+        /// shared keychain (`keychain`) or it is re-imported via
+        /// `claude-usage-login` (`import`).
         case unknownProvenance
     }
 
     /// `storedRefreshToken`: the target's stored main login's refresh token;
     /// `pinnedRefreshTokens`: the refresh tokens of every pinned entry in the
-    /// keychain; `isPinned`/`provenance`: the target profile's pin and the
-    /// recorded origin of its stored login (`import`, `keychain`, or nil for a
-    /// login an older build stored).
+    /// keychain; `provenance`: the recorded origin of the stored login
+    /// (`import`, `keychain`, or nil for a login an older build stored).
     static func distrust(
         storedRefreshToken: String?,
         pinnedRefreshTokens: [String],
-        isPinned: Bool,
         provenance: String?
     ) -> StoredLoginDistrust? {
         if let token = storedRefreshToken, pinnedRefreshTokens.contains(token) { return .copyOfPinnedEntry }
-        if isPinned, provenance == nil { return .unknownProvenance }
+        if provenance == nil { return .unknownProvenance }
         return nil
     }
 

@@ -453,9 +453,9 @@ class ProfileManager: ObservableObject {
             lastKeychainIdentity = ClaudeCodeSyncService.shared.accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) ?? lastKeychainIdentity
             LoggingService.shared.log("✓ Claude Code's shared login is '\(profile.name)' (written; was '\(previousName)')")
             if raced == nil || raced! > 0 {
-                // nil: the re-scan failed, so the window is unverified; say so the same way.
+                // nil: the write or the re-scan could not be verified; a separate wording.
                 NotificationManager.shared.sendSharedLoginRaceNotification(
-                    profileName: profile.name, previousName: previousName, count: raced ?? 0, settings: profile.notificationSettings)
+                    profileName: profile.name, previousName: previousName, count: raced, settings: profile.notificationSettings)
             } else if announceLater {
                 NotificationManager.shared.sendSwitchAppliedLaterNotification(
                     profileName: profile.name, settings: profile.notificationSettings)

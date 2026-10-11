@@ -889,18 +889,6 @@ class ClaudeCodeSyncService {
             return .refused(.notTheSharedLoginEntry(service: service))
         }
 
-        // W6: a stored login that is (or may be) a copy of a pinned lineage is
-        // never written: bare sessions would become that lineage's second holder.
-        if let distrust = MainLoginSwapPolicy.distrust(
-            storedRefreshToken: extractRefreshToken(from: storedJSON),
-            pinnedRefreshTokens: pinnedLogins.compactMap(extractRefreshToken),
-            isPinned: profile.customKeychainServiceName != nil,
-            provenance: profile.mainLoginProvenance
-        ) {
-            LoggingService.shared.logError("switchMainLogin: not writing '\(profile.name)''s stored login: \(distrust); re-import it with claude-usage-login")
-            return .refused(.untrustedStoredLogin(distrust))
-        }
-
         // C2: only exit 44 (not found) means the entry is empty. A timeout, a
         // launch failure or any other error means UNKNOWN, never "may write".
         let keychainJSON: String?
@@ -913,6 +901,20 @@ class ClaudeCodeSyncService {
         let keychainFingerprint = keychainJSON.flatMap(systemLoginFingerprint)
         if let keychainFingerprint, keychainFingerprint == systemLoginFingerprint(storedJSON) {
             return .alreadyApplied
+        }
+
+        // W6/W15: a stored login that is (or may be) a copy of a lineage someone
+        // else holds is never written: bare sessions would become that lineage's
+        // second holder. Only a login this build captured (`keychain`) or
+        // imported (`import`) is trusted; anything an older build stored must be
+        // re-imported or re-captured first.
+        if let distrust = MainLoginSwapPolicy.distrust(
+            storedRefreshToken: extractRefreshToken(from: storedJSON),
+            pinnedRefreshTokens: pinnedLogins.compactMap(extractRefreshToken),
+            provenance: profile.mainLoginProvenance
+        ) {
+            LoggingService.shared.logError("switchMainLogin: not writing '\(profile.name)''s stored login: \(distrust); re-import it with claude-usage-login")
+            return .refused(.untrustedStoredLogin(distrust))
         }
 
         // C1: no process list means no knowledge of holders; refuse.
@@ -936,10 +938,27 @@ class ClaudeCodeSyncService {
         }
 
         try writeSystemCredentials(jsonData)
-        guard let written = try? readKeychainCredentials(),
-              systemLoginFingerprint(written) == systemLoginFingerprint(jsonData) else {
-            LoggingService.shared.logError("switchMainLogin: keychain does not hold the login just written for '\(profile.name)'")
-            throw ClaudeCodeError.keychainWriteFailed(status: -1)
+        // Verify the write. A read that THROWS (timeout, launch failure) after a
+        // write that succeeded is not a failed write: retry once, and if it still
+        // cannot be read, report the switch as applied-but-unverified rather than
+        // raise a false "apply failed" (which would also clear pending wrongly).
+        var verified = false
+        for attempt in 1...2 {
+            do {
+                let written = try readKeychainCredentials()
+                guard let written, systemLoginFingerprint(written) == systemLoginFingerprint(jsonData) else {
+                    LoggingService.shared.logError("switchMainLogin: keychain does not hold the login just written for '\(profile.name)'")
+                    throw ClaudeCodeError.keychainWriteFailed(status: -1)
+                }
+                verified = true
+                break
+            } catch let error as ClaudeCodeError {
+                if case .keychainWriteFailed = error { throw error }
+                LoggingService.shared.logError("switchMainLogin: post-write read failed (attempt \(attempt)) for '\(profile.name)'", error: error)
+            }
+        }
+        if !verified {
+            LoggingService.shared.logError("⚠️ switchMainLogin: wrote '\(profile.name)' but could not read the entry back; the switch is UNVERIFIED")
         }
         lastSeenSystemLoginFingerprint = systemLoginFingerprint(jsonData)
 
@@ -975,7 +994,7 @@ class ClaudeCodeSyncService {
         }
 
         LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)'")
-        return .applied(racedHolders: racedCount)
+        return .applied(racedHolders: verified ? racedCount : nil)
     }
 
     /// `switchMainLogin(to:knownLogins:pinnedLogins:)` for a stored profile,

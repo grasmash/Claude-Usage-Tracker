@@ -31,6 +31,12 @@ rewriting `~/.claude/.credentials.json` (last seen 2026-10-10 23:53).
    login the old build wrote at switch time; it is stale (the keychain has
    rotated since) and nothing reads it any more. The tracker never writes it
    again and only touches its mtime as a reload signal when the file exists.
+   Note the trade-off: with the file gone, the reload touch after a raced
+   switch has nothing to touch, so the race notification ("Check Claude
+   Code's login") becomes the only mitigation for a session that started in
+   the switch window. If you would rather keep the reload signal, replace the
+   file with an EMPTY one (`: > ~/.claude/.credentials.json`) instead of
+   deleting it; the tracker only ever changes its mtime.
 3. **Re-import each account's main login with `claude-usage-login`**
    (`CLAUDE_CONFIG_DIR=~/.claude-import claude`, `/login` as that account,
    `/exit`). Logins the old build stored for PINNED profiles may be copies of
@@ -46,8 +52,9 @@ rewriting `~/.claude/.credentials.json` (last seen 2026-10-10 23:53).
 ### What to expect on this laptop
 
 While the happy daemon's remote sessions run, a Claude Code without
-`CLAUDE_CONFIG_DIR` is always running (measured 2026-10-11: nine live holders,
-all launched by `claude_local_launcher.cjs` as
+`CLAUDE_CONFIG_DIR` is always running (measured 2026-10-11: nine live holders —
+five terminal sessions, three happy-daemon SDK binaries and one spawned by
+`claude_local_launcher.cjs`, the daemon-side ones running as
 `~/.local/share/claude/versions/<semver>`), so the shared login is always held
 and **the main-login swap will almost never apply on this machine**. That is
 the intended outcome, not a bug: the alternative was a swap under those
@@ -154,6 +161,11 @@ user. It cannot see:
   check; the keychain-mdat log shows whether two writers followed.
 - Short-lived probes (`claude auth status`, `claude -p`) that start and exit
   between cycles.
+- (W14) An environment VALUE that itself contains ` CLAUDE_CONFIG_DIR=`
+  (e.g. `FOO="x CLAUDE_CONFIG_DIR=/y"`): `ps -E` prints the environment as a
+  flat string, so that token is read as the config dir and the process is
+  not counted. Nothing in this setup produces such a value; it is noted, not
+  handled.
 
 ## Tests
 

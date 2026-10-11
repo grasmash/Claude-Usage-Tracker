@@ -25,10 +25,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // One tracker per user. A second instance (an old build left running
         // beside a new one, say) is a second refresher and writer of the same
         // Claude Code logins — exactly what this app must never be.
-        if let bundleId = Bundle.main.bundleIdentifier {
+        // (Never under tests: the test host IS this app, and a tracker running
+        // beside a test run must not kill the host. The early return above
+        // already covers it; this guard keeps that true if the order changes.)
+        if !AppEnvironment.isRunningTests, let bundleId = Bundle.main.bundleIdentifier {
             let pids = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).map(\.processIdentifier)
             if MainLoginSwapPolicy.shouldQuitAsDuplicateInstance(myPid: ProcessInfo.processInfo.processIdentifier, instancePids: pids) {
                 LoggingService.shared.logError("Another Claude Usage (\(bundleId)) is already running (pids \(pids)); quitting this instance")
+                let alert = NSAlert()
+                alert.messageText = "Another Claude Usage is already running"
+                alert.informativeText = "Only one copy may run: two would both refresh and rewrite the same Claude Code logins. Quit the other one first (menu bar → Quit), then launch this one again."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Quit")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
                 NSApp.terminate(nil)
                 return
             }

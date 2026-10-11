@@ -350,10 +350,17 @@ class NotificationManager: NotificationServiceProtocol {
     /// A Claude Code process appeared on the shared login during the switch;
     /// it may hold the replaced login. Loud, and not gated on the profile's
     /// notification setting: the user has to check that session.
-    func sendSharedLoginRaceNotification(profileName: String, previousName: String, count: Int, settings: NotificationSettings) {
+    /// `count == nil`: the switch could not be verified at all (the post-write
+    /// read or the process re-scan failed), which gets its own wording rather
+    /// than "0 sessions".
+    func sendSharedLoginRaceNotification(profileName: String, previousName: String, count: Int?, settings: NotificationSettings) {
         let content = UNMutableNotificationContent()
         content.title = "notification.shared_login_raced.title".localized(with: profileName)
-        content.body = "notification.shared_login_raced.body".localized(with: count, previousName, profileName)
+        if let count {
+            content.body = "notification.shared_login_raced.body".localized(with: count, previousName, profileName)
+        } else {
+            content.body = "notification.shared_login_raced.unverified".localized(with: previousName, profileName)
+        }
         content.sound = .defaultCritical
         content.categoryIdentifier = "INFO_ALERT"
         content.interruptionLevel = .timeSensitive
