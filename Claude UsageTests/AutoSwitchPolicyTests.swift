@@ -464,6 +464,19 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [current], after: current, usingFable: false, blockedBeyondFable: true), .none)
     }
 
+    func testFableHeadroomIsAnApplicableFreshAccountUnderAllThreeLimits() {
+        let spent = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        let weeklyGone = makeProfile("B", usage: makeUsage(session: 10, weekly: 100, fable: 10))
+        let stale = makeProfile("C", usage: makeUsage(session: 10, weekly: 10, fable: 10, updatedAt: Date().addingTimeInterval(-3600)))
+        let ok = makeProfile("D", usage: makeUsage(session: 10, weekly: 10, fable: 10))
+        let rolled = makeProfile("E", usage: makeUsage(session: 10, weekly: 10, fable: 100, fableResetIn: -60))
+
+        XCTAssertFalse(AutoSwitchPolicy.anyProfileHasFableHeadroom([spent, weeklyGone, stale]))
+        XCTAssertTrue(AutoSwitchPolicy.anyProfileHasFableHeadroom([spent, ok]))
+        XCTAssertTrue(AutoSwitchPolicy.anyProfileHasFableHeadroom([rolled]), "a Fable window that reset is headroom again")
+        XCTAssertFalse(AutoSwitchPolicy.anyProfileHasFableHeadroom([ok], isLoginDead: { _ in true }))
+    }
+
     private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {
         Profile(
             name: name,

@@ -278,12 +278,19 @@ enum MainLoginSwapPolicy {
     /// records each live session in `sessions/<pid>.json` (`sessionId`), and
     /// the transcript is `projects/<project>/<sessionId>.jsonl`. nil when
     /// either is missing or has no real reply yet.
+    /// Claude Code session ids are UUIDs: only `[A-Za-z0-9-]` is followed into
+    /// a file name (no `.`, `/`, spaces or anything that could leave the dir).
+    static func isSessionIdShaped(_ id: String) -> Bool {
+        !id.isEmpty && id.count <= 128 && id.unicodeScalars.allSatisfy {
+            ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0) || $0 == "-"
+        }
+    }
+
     static func holderModel(pid: Int32, sessionsDirectory: URL, projectsDirectory: URL) -> String? {
         let record = sessionsDirectory.appendingPathComponent("\(pid).json")
         guard let data = try? Data(contentsOf: record),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sessionId = json["sessionId"] as? String, !sessionId.isEmpty,
-              !sessionId.contains("/") else { return nil }
+              let sessionId = json["sessionId"] as? String, isSessionIdShaped(sessionId) else { return nil }
         guard let projects = try? FileManager.default.contentsOfDirectory(
             at: projectsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
         for dir in projects {

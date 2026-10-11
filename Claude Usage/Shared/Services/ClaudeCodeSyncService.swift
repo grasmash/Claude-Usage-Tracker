@@ -71,6 +71,13 @@ class ClaudeCodeSyncService {
             projectsDirectory: Constants.ClaudePaths.projectsDirectory)
     }
 
+    /// True when Claude Code sessions hold the shared login and every one of
+    /// them is on Fable (per holder, from its own transcript).
+    func sharedLoginHoldersAllOnFable() -> Bool {
+        guard let processes = runningProcesses() else { return false }
+        return MainLoginSwapPolicy.allHoldersOnFable(MainLoginSwapPolicy.sharedLoginHolders(in: processes), modelOf: holderModel)
+    }
+
     static func isMutatingSecurityVerb(_ verb: String?) -> Bool {
         guard let verb else { return false }
         return verb.hasPrefix("add-") || verb.hasPrefix("delete-") || verb.hasPrefix("set-")

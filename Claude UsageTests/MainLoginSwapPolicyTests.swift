@@ -281,6 +281,23 @@ final class MainLoginSwapPolicyTests: XCTestCase {
 
     // MARK: - Is Fable in use by the sessions holding the shared login?
 
+    func testASessionIdOfAnyOtherShapeIsNotFollowed() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions")
+        let projects = root.appendingPathComponent("projects")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: projects.appendingPathComponent("p"), withIntermediateDirectories: true)
+        for name in ["...jsonl", "a b.jsonl"] {   // what ".." and "a b" would resolve to
+            try #"{"type":"assistant","message":{"model":"claude-fable-5-1","content":[]}}"#.write(
+                to: projects.appendingPathComponent("p/\(name)"), atomically: true, encoding: .utf8)
+        }
+        for (pid, id) in [(1, ".."), (2, "a b"), (3, "x\\y"), (4, "")] {
+            try #"{"sessionId":"\#(id)"}"#.write(to: sessions.appendingPathComponent("\(pid).json"), atomically: true, encoding: .utf8)
+            XCTAssertNil(MainLoginSwapPolicy.holderModel(pid: Int32(pid), sessionsDirectory: sessions, projectsDirectory: projects), id)
+        }
+    }
+
     func testFableIsInUseOnlyWhenEveryHolderIsOnFable() {
         let holders: [MainLoginSwapPolicy.RunningProcess] = [
             .init(pid: 1, command: "claude", configDir: nil), .init(pid: 2, command: "claude", configDir: nil)]

@@ -407,6 +407,43 @@ class NotificationManager: NotificationServiceProtocol {
         }
     }
 
+    /// The Opus fallback was applied (`applied`) or ended.
+    func sendModelFallbackNotification(applied: Bool, movedTo: String?) {
+        let content = UNMutableNotificationContent()
+        if applied {
+            content.title = "notification.no_fable_headroom.title".localized
+            content.body = movedTo.map { "notification.model_fallback.applied_moved".localized(with: $0) }
+                ?? "notification.model_fallback.applied".localized
+        } else {
+            content.title = "notification.model_fallback.restored.title".localized
+            content.body = "notification.model_fallback.restored".localized
+        }
+        content.sound = applied ? .defaultCritical : .default
+        content.categoryIdentifier = "INFO_ALERT"
+        content.interruptionLevel = applied ? .timeSensitive : .active
+        post(content, id: "model_fallback_\(applied)")
+    }
+
+    /// The Opus fallback was wanted but settings.json could not be edited.
+    func sendModelFallbackFailedNotification(reason: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "notification.no_fable_headroom.title".localized
+        content.body = "notification.model_fallback.failed".localized(with: reason)
+        content.sound = .defaultCritical
+        content.categoryIdentifier = "INFO_ALERT"
+        content.interruptionLevel = .timeSensitive
+        post(content, id: "model_fallback_failed")
+    }
+
+    private func post(_ content: UNMutableNotificationContent, id: String) {
+        let request = UNNotificationRequest(identifier: "\(id)_\(Date().timeIntervalSince1970)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                LoggingService.shared.logError("Failed to send \(id) notification: \(error)")
+            }
+        }
+    }
+
     /// Tells the user the shared login was switched off a spent account, but the
     /// sessions stranded on it could not be told to reload.
     func sendStrandedSessionsNotSignalledNotification(profileName: String, previousName: String, settings: NotificationSettings) {

@@ -136,6 +136,19 @@ enum AutoSwitchPolicy {
         return .none
     }
 
+    /// True when some account could run Fable now: applicable, not paused, not
+    /// logged out, observed recently, and under its session, weekly and Fable
+    /// weekly limits. Ends the Opus fallback (`ModelFallback.restore`).
+    static func anyProfileHasFableHeadroom(
+        _ profiles: [Profile], now: Date = Date(), isLoginDead: (Profile) -> Bool = { _ in false }
+    ) -> Bool {
+        profiles.contains { p in
+            guard !p.isPaused, canBeApplied(p), !isLoginDead(p),
+                  let usage = p.claudeUsage, !usage.isStale(now: now) else { return false }
+            return !usage.isLimitReached(usingFable: true)
+        }
+    }
+
     // MARK: - Claude Code model selection
 
     /// True when a Claude Code model setting (alias like `fable`, or a full id

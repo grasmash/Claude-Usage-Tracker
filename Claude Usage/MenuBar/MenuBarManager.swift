@@ -1139,6 +1139,7 @@ class MenuBarManager: NSObject, ObservableObject {
                     self.checkAutoSwitchIfNeeded(usage: activeUsage, currentProfile: activeProfile)
                 }
                 self.checkAutoSwitchForDeadLogin()
+                self.restoreModelIfFableIsBack()
                 self.writeAutoSwitchStatus()
             }
         }
@@ -1292,6 +1293,7 @@ class MenuBarManager: NSObject, ObservableObject {
 
                         // Check if auto-switch should trigger
                         self.checkAutoSwitchIfNeeded(usage: newUsage, currentProfile: profile)
+                        self.restoreModelIfFableIsBack()
                     }
                 }
 
@@ -1503,14 +1505,12 @@ class MenuBarManager: NSObject, ObservableObject {
         case .profile(let p):
             nextProfile = p
         case .profileWithoutFable(let p):
-            LoggingService.shared.log("AutoSwitch: no account has Fable headroom; '\(currentProfile.name)' is blocked beyond Fable, so moving to '\(p.name)' (sessions need /model opus)")
-            NotificationManager.shared.sendNoFableHeadroomNotification(
-                fromProfile: currentProfile.name, movedTo: p.name, settings: currentProfile.notificationSettings)
+            LoggingService.shared.log("AutoSwitch: no account has Fable headroom; '\(currentProfile.name)' is blocked beyond Fable, so moving to '\(p.name)'")
+            fallBackToOpusIfHoldersOnFable(currentProfile: currentProfile, movedTo: p.name)
             nextProfile = p
         case .noFableHeadroom:
-            LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit its Fable limit and no account has Fable headroom; staying (sessions need /model opus)")
-            NotificationManager.shared.sendNoFableHeadroomNotification(
-                fromProfile: currentProfile.name, movedTo: nil, settings: currentProfile.notificationSettings)
+            LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit its Fable limit and no account has Fable headroom; staying")
+            fallBackToOpusIfHoldersOnFable(currentProfile: currentProfile, movedTo: nil)
             return
         case .none:
             let limits = usingFable ? "session/weekly/Fable" : "session/weekly"
@@ -1581,8 +1581,7 @@ class MenuBarManager: NSObject, ObservableObject {
         switch target {
         case .profile(let p): nextProfile = p
         case .profileWithoutFable(let p):
-            NotificationManager.shared.sendNoFableHeadroomNotification(
-                fromProfile: currentProfile.name, movedTo: p.name, settings: currentProfile.notificationSettings)
+            fallBackToOpusIfHoldersOnFable(currentProfile: currentProfile, movedTo: p.name)
             nextProfile = p
         case .noFableHeadroom, .none:
             LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead but no other profile is available, staying put")
@@ -1591,6 +1590,48 @@ class MenuBarManager: NSObject, ObservableObject {
 
         LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead, switching to '\(nextProfile.name)'")
         performAutoSwitch(from: currentProfile, to: nextProfile)
+    }
+
+    // MARK: - Opus fallback (operator, 2026-10-11: "App switches default to Opus")
+
+    /// No account has Fable headroom. When every session on the shared login is
+    /// on Fable, set Claude Code's default model to Opus (`ModelFallback`);
+    /// otherwise, or when the settings file cannot be edited, just notify.
+    private func fallBackToOpusIfHoldersOnFable(currentProfile: Profile, movedTo: String?) {
+        guard ClaudeCodeSyncService.shared.sharedLoginHoldersAllOnFable() else {
+            LoggingService.shared.log("ModelFallback: not every session on the shared login is on Fable; default model left alone")
+            return
+        }
+        switch ModelFallback().applyOpus() {
+        case .applied(let previous):
+            LoggingService.shared.log("ModelFallback: no Fable headroom; Claude Code's default model set to Opus (was \(previous ?? "unset"))")
+            NotificationManager.shared.sendModelFallbackNotification(applied: true, movedTo: movedTo)
+        case .alreadyApplied:
+            break
+        case .failed(let reason):
+            LoggingService.shared.logError("ModelFallback: could not set the default model to Opus: \(reason)")
+            NotificationManager.shared.sendModelFallbackFailedNotification(reason: reason)
+        }
+    }
+
+    /// Ends the Opus fallback once any account can run Fable again (a Fable
+    /// window reset, or headroom elsewhere). Restores only the tracker's own edit.
+    private func restoreModelIfFableIsBack() {
+        let fallback = ModelFallback()
+        guard fallback.isActive,
+              AutoSwitchPolicy.anyProfileHasFableHeadroom(
+                profileManager.profiles, isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)) else { return }
+        switch fallback.restore() {
+        case .restored:
+            LoggingService.shared.log("ModelFallback: Fable available again; default model restored")
+            NotificationManager.shared.sendModelFallbackNotification(applied: false, movedTo: nil)
+        case .userChanged:
+            LoggingService.shared.log("ModelFallback: Fable available again, but the default model was changed by the user; left alone")
+        case .nothingToRestore:
+            break
+        case .failed(let reason):
+            LoggingService.shared.logError("ModelFallback: could not restore the default model (will retry): \(reason)")
+        }
     }
 
     private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile) {
