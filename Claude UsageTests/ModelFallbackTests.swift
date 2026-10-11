@@ -90,7 +90,7 @@ final class ModelFallbackTests: XCTestCase {
     func testCompactAndEmptyObjects() throws {
         try write(#"{"a":1}"#)
         XCTAssertEqual(fallback.applyOpus(), .applied(previous: nil))
-        XCTAssertEqual(try text(), #"{"model": "opus", "a":1}"#)
+        XCTAssertEqual(try text(), #"{"model": "opus","a":1}"#)
         XCTAssertEqual(fallback.restore(), .restored)
         XCTAssertEqual(try text(), #"{"a":1}"#)
 
@@ -99,6 +99,22 @@ final class ModelFallbackTests: XCTestCase {
         XCTAssertEqual(try json()["model"] as? String, ModelFallback.opusModel)
         XCTAssertEqual(fallback.restore(), .restored)
         XCTAssertEqual(try text(), "{}")
+    }
+
+    func testCRLFAndSpacedObjectsRoundTripByteExact() throws {
+        for before in ["{\r\n  \"a\": 1,\r\n  \"b\": [1, 2]\r\n}\r\n", #"{ "a": 1 }"#, "{ }", "{\n\t\"a\": true\n}"] {
+            try write(before)
+            XCTAssertEqual(fallback.applyOpus(), .applied(previous: nil), before)
+            XCTAssertEqual(try json()["model"] as? String, ModelFallback.opusModel, before)
+            XCTAssertEqual(fallback.restore(), .restored, before)
+            XCTAssertEqual(try text(), before, "restore puts back the exact bytes: \(before.debugDescription)")
+        }
+    }
+
+    func testCRLFInsertUsesTheFilesLineEnding() throws {
+        try write("{\r\n  \"a\": 1\r\n}")
+        _ = fallback.applyOpus()
+        XCTAssertEqual(try text(), "{\r\n  \"model\": \"opus\",\r\n  \"a\": 1\r\n}")
     }
 
     func testRemovingTheLastMemberLeavesTheRestIntact() throws {

@@ -92,6 +92,12 @@ class MenuBarManager: NSObject, ObservableObject {
 
     // Track which profiles have already triggered auto-switch (prevents repeated firing)
     private var autoSwitchDecider = AutoSwitchDecider()
+    /// An auto-switch is between its decision and activateProfile finishing.
+    private var autoSwitchInFlight = false
+    /// `.switchFirst` already logged in this episode.
+    private var switchFirstLogged = false
+    /// The fallback wait reason last logged, so each is logged once.
+    private var lastLoggedRestoreWait: AutoSwitchPolicy.WaitReason?
     /// Profiles already auto-switched away from because their login died.
     private var deadLoginSwitchedProfileIds: Set<UUID> = []
     /// Dead-login profiles already reported as having no way out (once per episode).
@@ -1483,6 +1489,9 @@ class MenuBarManager: NSObject, ObservableObject {
         var current = currentProfile
         current.claudeUsage = usage
 
+        // A switch is already under way: let it land before deciding again.
+        guard !autoSwitchInFlight, !profileManager.isSwitchingProfile else { return }
+
         // Re-runs the target search every tick while stuck, so another account
         // freeing up is picked up on the next tick; notifies once per episode.
         let nextProfile: Profile
@@ -1622,16 +1631,32 @@ class MenuBarManager: NSObject, ObservableObject {
         let fallback = ModelFallback()
         guard fallback.isActive else { return }
         let active = profileManager.activeProfile
-        switch AutoSwitchPolicy.fableRestoreAction(
+        let action = AutoSwitchPolicy.fableRestoreAction(
             profiles: profileManager.profiles, activeId: active?.id,
             isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
-        ) {
-        case .wait:
+        )
+        if action != .switchFirst { switchFirstLogged = false }
+        if case .wait = action {} else { lastLoggedRestoreWait = nil }
+        switch action {
+        case .wait(let reason):
+            if lastLoggedRestoreWait != reason {
+                lastLoggedRestoreWait = reason
+                switch reason {
+                case .noHeadroom:
+                    LoggingService.shared.log("ModelFallback: no account has Fable headroom yet; default model stays Opus")
+                case .activeUnverifiable:
+                    LoggingService.shared.log("ModelFallback: the active account's usage is stale, or it is paused or cannot be applied; not restoring or switching until it can be read")
+                }
+            }
             return
         case .switchFirst:
-            if let id = active?.id {
-                autoSwitchDecider.reset(id)
-                deadLoginSwitchedProfileIds.remove(id)
+            // Re-arm only while no switch is in flight (activeProfile is set at
+            // the END of activateProfile, and this runs on two paths per refresh).
+            guard !autoSwitchInFlight, !profileManager.isSwitchingProfile, let id = active?.id else { return }
+            autoSwitchDecider.reset(id)
+            deadLoginSwitchedProfileIds.remove(id)
+            if !switchFirstLogged {
+                switchFirstLogged = true
                 LoggingService.shared.log("ModelFallback: another account has Fable headroom; switching to it before restoring the default model")
             }
             return
@@ -1654,6 +1679,8 @@ class MenuBarManager: NSObject, ObservableObject {
     }
 
     private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile) {
+        guard !autoSwitchInFlight, !profileManager.isSwitchingProfile, currentProfile.id != nextProfile.id else { return }
+        autoSwitchInFlight = true
         let fromName = currentProfile.name
         let toName = nextProfile.name
         let notificationSettings = currentProfile.notificationSettings
@@ -1661,7 +1688,16 @@ class MenuBarManager: NSObject, ObservableObject {
             await profileManager.activateProfile(nextProfile.id, selectedBy: "auto")
 
             await MainActor.run {
-                // Send notification
+                self.autoSwitchInFlight = false
+                // Announce only a switch that actually landed.
+                guard AutoSwitchPolicy.switchLanded(
+                    fromId: currentProfile.id, targetId: nextProfile.id,
+                    activeIdAfter: self.profileManager.activeProfile?.id
+                ) else {
+                    LoggingService.shared.log("AutoSwitch: switch to '\(toName)' did not change the active profile; not announced, retried next tick")
+                    self.autoSwitchDecider.reset(currentProfile.id)
+                    return
+                }
                 NotificationManager.shared.sendAutoSwitchNotification(
                     fromProfile: fromName,
                     toProfile: toName,

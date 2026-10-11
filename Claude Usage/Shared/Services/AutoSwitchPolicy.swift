@@ -158,18 +158,39 @@ enum AutoSwitchPolicy {
         /// Claude Code back on Fable on a Fable-spent account.
         case switchFirst
         /// No account can run Fable yet.
-        case wait
+        case wait(WaitReason)
+    }
+
+    enum WaitReason: Equatable {
+        /// No account can run Fable yet.
+        case noHeadroom
+        /// The active account's reading is stale, or it is paused or cannot be
+        /// applied: the tracker cannot tell whether it has Fable headroom, so it
+        /// neither restores nor re-arms a switch.
+        case activeUnverifiable
+    }
+
+    /// True when an auto-switch actually moved the active profile from `fromId`
+    /// to the target. activateProfile returns early (no change) while another
+    /// switch is in flight, and a re-armed tick may target the profile that is
+    /// already active; neither is announced.
+    static func switchLanded(fromId: UUID, targetId: UUID, activeIdAfter: UUID?) -> Bool {
+        fromId != targetId && activeIdAfter == targetId
     }
 
     static func fableRestoreAction(
         profiles: [Profile], activeId: UUID?, now: Date = Date(), isLoginDead: (Profile) -> Bool = { _ in false }
     ) -> FableRestoreAction {
-        if let active = profiles.first(where: { $0.id == activeId }),
-           anyProfileHasFableHeadroom([active], now: now, isLoginDead: isLoginDead) {
+        guard let active = profiles.first(where: { $0.id == activeId }),
+              !active.isPaused, canBeApplied(active),
+              let usage = active.claudeUsage, !usage.isStale(now: now) else {
+            return .wait(.activeUnverifiable)
+        }
+        if anyProfileHasFableHeadroom([active], now: now, isLoginDead: isLoginDead) {
             return .restore
         }
         let others = profiles.filter { $0.id != activeId }
-        return anyProfileHasFableHeadroom(others, now: now, isLoginDead: isLoginDead) ? .switchFirst : .wait
+        return anyProfileHasFableHeadroom(others, now: now, isLoginDead: isLoginDead) ? .switchFirst : .wait(.noHeadroom)
     }
 
     // MARK: - Claude Code model selection

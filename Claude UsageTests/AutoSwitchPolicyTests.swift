@@ -496,8 +496,8 @@ final class AutoSwitchPolicyTests: XCTestCase {
     func testWaitWhenNoAccountHasFableHeadroom() {
         let active = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100))
         let other = makeProfile("B", usage: makeUsage(session: 10, weekly: 100, fable: 10))
-        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id), .wait)
-        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active], activeId: nil), .wait)
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id), .wait(.noHeadroom))
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active], activeId: nil), .wait(.activeUnverifiable))
     }
 
     // MARK: - Stuck with no free account: retry every tick (2026-10-11 6:05 PM)
@@ -567,6 +567,27 @@ final class AutoSwitchPolicyTests: XCTestCase {
         let b = makeProfile("B", usage: makeUsage(session: 10, weekly: 10))
         var decider = AutoSwitchDecider()
         XCTAssertEqual(decider.decide(current: a, profiles: [a, b], usingFable: false), .stay)
+    }
+
+    func testAnActiveAccountTheTrackerCannotVouchForWaitsEvenIfAnotherHasHeadroom() {
+        let other = makeProfile("B", usage: makeUsage(session: 10, weekly: 10, fable: 10))
+        let stale = makeProfile("A", usage: makeUsage(session: 10, weekly: 10, fable: 100, updatedAt: Date().addingTimeInterval(-3600)))
+        var paused = makeProfile("P", usage: makeUsage(session: 10, weekly: 10, fable: 100))
+        paused.isPaused = true
+        let unapplicable = Profile(name: "U", claudeUsage: makeUsage(session: 10, weekly: 10, fable: 100))
+
+        for active in [stale, paused, unapplicable] {
+            XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id),
+                           .wait(.activeUnverifiable), active.name)
+        }
+    }
+
+    func testASwitchIsAnnouncedOnlyWhenTheActiveProfileActuallyChangedToTheTarget() {
+        let a = UUID(), b = UUID(), c = UUID()
+        XCTAssertTrue(AutoSwitchPolicy.switchLanded(fromId: a, targetId: b, activeIdAfter: b))
+        XCTAssertFalse(AutoSwitchPolicy.switchLanded(fromId: a, targetId: b, activeIdAfter: a), "activateProfile bailed (switch in flight)")
+        XCTAssertFalse(AutoSwitchPolicy.switchLanded(fromId: b, targetId: b, activeIdAfter: b), "already on the target: no second notice")
+        XCTAssertFalse(AutoSwitchPolicy.switchLanded(fromId: a, targetId: b, activeIdAfter: c))
     }
 
     private func makeProfile(_ name: String, usage: ClaudeUsage?) -> Profile {

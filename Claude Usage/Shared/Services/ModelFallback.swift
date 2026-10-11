@@ -239,21 +239,19 @@ extension ModelFallback {
                 if let i = model {
                     b.replaceSubrange(members[i].valueStart..<members[i].valueEnd, with: literal)
                 } else if let first = members.first {
-                    let between = b[(openBrace + 1)..<first.keyStart]
+                    // Repeat the exact whitespace before the first key (newline
+                    // style, indent, or a single space), so CRLF files and
+                    // `{ "a": 1 }` keep their shape and a restore is byte-exact.
+                    let between = Array(b[(openBrace + 1)..<first.keyStart])
                     let pair = Array(#""model": "#.utf8) + literal + [UInt8(ascii: ",")]
-                    if let nl = between.lastIndex(of: UInt8(ascii: "\n")) {
-                        let indent = Array(b[(nl + 1)..<first.keyStart])
-                        b.insert(contentsOf: [UInt8(ascii: "\n")] + indent + pair, at: openBrace + 1)
-                    } else {
-                        b.insert(contentsOf: pair + [UInt8(ascii: " ")], at: openBrace + 1)
-                    }
+                    b.insert(contentsOf: between + pair, at: openBrace + 1)
                 } else {
                     b.insert(contentsOf: Array(#""model": "#.utf8) + literal, at: openBrace + 1)
                 }
             } else if let i = model {
                 let m = members[i]
                 if members.count == 1 {
-                    b.removeSubrange((openBrace + 1)..<closeBrace)
+                    b.removeSubrange(m.keyStart..<m.valueEnd)
                 } else if i + 1 < members.count {
                     b.removeSubrange(m.keyStart..<members[i + 1].keyStart)
                 } else if let prevComma = members[i - 1].comma {
