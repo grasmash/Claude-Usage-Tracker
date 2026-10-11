@@ -211,6 +211,61 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertTrue(writes.isEmpty)
     }
 
+    // MARK: - A3b: sessions stranded on a spent login do not block the switch
+    //
+    // 2026-10-11 15:45Z: the shared login (littlewing) hit its weekly limit with
+    // ten bare `claude` sessions on it. Auto-switch chose madmatter, but the
+    // swap was refused as `sessionsRunning(count: 10)` on every retry, so every
+    // session sat on "You've hit your weekly limit" until a manual /login.
+    // Sessions on a spent login can make no request; holding them there
+    // protects nothing.
+
+    func testSwitchProceedsWhenTheSessionsAreStrandedOnASpentLogin() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = [bareClaude(500), bareClaude(501)]
+        let b = imported("B", login("B", expiresIn: 3600))
+        let creds = sync.credentialsFileURL
+        FileManager.default.createFile(atPath: creds.path, contents: Data())
+        let past = Date().addingTimeInterval(-3600)
+        try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: creds.path)
+
+        let outcome = try await sync.switchMainLogin(
+            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [a])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0), "the stranded sessions were there before the write; none raced it")
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+        XCTAssertEqual(writes.count, 1, "exactly one in-place write: \(writes)")
+        let mtime = try FileManager.default.attributesOfItem(atPath: creds.path)[.modificationDate] as? Date
+        XCTAssertGreaterThan(mtime ?? past, past, "the stranded sessions are told to reload onto B")
+    }
+
+    func testSessionsStillBlockTheSwitchWhenTheSpentLoginIsNotTheSharedOne() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = [bareClaude(500)]
+        let b = imported("B", login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(
+            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [login("C", expiresIn: 3600)])
+
+        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)), "A has headroom: its sessions are working")
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testASpentLoginNeverOverridesTheCompareAndSwap() async throws {
+        keychain[mainService] = login("fresh-login", expiresIn: 3600)
+        processes = [bareClaude(500)]
+        let a = login("A", expiresIn: 3600)
+        let b = imported("B", login("B", expiresIn: 3600))
+
+        let outcome = try await sync.switchMainLogin(
+            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [a])
+
+        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)), "the keychain is not the spent login A")
+        XCTAssertTrue(writes.isEmpty)
+    }
+
     func testSwitchIsRefusedOverALoginTheTrackerNeverCaptured() async throws {
         keychain[mainService] = login("fresh-login", expiresIn: 3600)
         let b = imported("B", login("B", expiresIn: 3600))

@@ -220,18 +220,40 @@ enum MainLoginSwapPolicy {
     ///   so a login that rotated or changed since the last capture (another
     ///   refresher exists, or the user ran `/login`) is never overwritten.
     ///
+    /// - `keychainLoginSpent`: the keychain login's account is at a limit (or
+    ///   its login is dead). Its sessions are stranded: every request they make
+    ///   is refused, so holding them there protects nothing, and leaving them
+    ///   is the outage auto-switch exists to prevent (2026-10-11: ten sessions
+    ///   sat on a spent weekly limit while the swap was refused each cycle).
+    ///   Running sessions then do not block; the compare-and-swap still does.
+    ///
     /// Returns nil when the rewrite may proceed. An empty keychain may always
     /// be written: there is nothing to clobber.
     static func refusal(
         holders: Int,
         keychainFingerprint: String?,
-        knownFingerprints: Set<String>
+        knownFingerprints: Set<String>,
+        keychainLoginSpent: Bool = false
     ) -> Refusal? {
-        if holders > 0 { return .sessionsRunning(count: holders) }
+        if holders > 0 && !keychainLoginSpent { return .sessionsRunning(count: holders) }
         if let current = keychainFingerprint, !knownFingerprints.contains(current) {
             return .unknownKeychainLogin
         }
         return nil
+    }
+
+    /// The stored main logins of every account Claude Code cannot use right
+    /// now: a session, weekly (or, on Fable, Fable weekly) window at 100% that
+    /// has not reset yet, or a dead login. The reading need not be fresh: a
+    /// spent window stays spent until its reset time, which the effective
+    /// percentages already honour, and the tracker stops polling an account
+    /// once it is no longer the active profile.
+    static func spentLogins(in profiles: [Profile], usingFable: Bool, isLoginDead: (Profile) -> Bool) -> [String] {
+        profiles.compactMap { profile in
+            guard let json = profile.cliCredentialsJSON else { return nil }
+            let atLimit = profile.claudeUsage?.isLimitReached(usingFable: usingFable) ?? false
+            return atLimit || isLoginDead(profile) ? json : nil
+        }
     }
 
     /// Only one tracker may run per user: two would be two refreshers and two

@@ -237,6 +237,71 @@ final class MainLoginSwapPolicyTests: XCTestCase {
         XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 1, keychainFingerprint: "x", knownFingerprints: []), .sessionsRunning(count: 1))
     }
 
+    func testSessionsOnASpentKeychainLoginDoNotBlock() {
+        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 10, keychainFingerprint: "a", knownFingerprints: ["a", "b"], keychainLoginSpent: true))
+    }
+
+    func testASpentLoginStillNeedsTheKeychainToBeAsLastSeen() {
+        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 2, keychainFingerprint: "rotated", knownFingerprints: ["a"], keychainLoginSpent: true), .unknownKeychainLogin)
+    }
+
+    // MARK: - Which stored logins are spent
+
+    func testSpentLoginsAreThoseAtALimitWhoseWindowHasNotReset() {
+        let weekly = profile("weekly", spentUsage(weekly: 100))
+        let session = profile("session", spentUsage(session: 100))
+        let headroom = profile("headroom", spentUsage(weekly: 99))
+        let rolledOver = profile("rolled", spentUsage(weekly: 100, weeklyResetIn: -60))
+        let unread = Profile(name: "unread", cliCredentialsJSON: "json-unread")
+
+        let spent = MainLoginSwapPolicy.spentLogins(
+            in: [weekly, session, headroom, rolledOver, unread], usingFable: false, isLoginDead: { _ in false })
+
+        XCTAssertEqual(spent, ["json-weekly", "json-session"])
+    }
+
+    func testAnOldReadingOfASpentWindowStillCounts() {
+        // The tracker stops polling an account once it is no longer the active
+        // profile; a 100% weekly window stays spent until its reset regardless.
+        let old = profile("old", spentUsage(weekly: 100, updatedAt: Date().addingTimeInterval(-3 * 3600)))
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [old], usingFable: false, isLoginDead: { _ in false }), ["json-old"])
+    }
+
+    func testASpentFableQuotaCountsOnlyWhenClaudeCodeRunsFable() {
+        let fable = profile("fable", spentUsage(fable: 100))
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: true, isLoginDead: { _ in false }), ["json-fable"])
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], usingFable: false, isLoginDead: { _ in false }), [])
+    }
+
+    func testADeadLoginIsSpent() {
+        let dead = profile("dead", spentUsage(weekly: 10))
+        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [dead], usingFable: false, isLoginDead: { $0.name == "dead" }), ["json-dead"])
+    }
+
+    private func profile(_ name: String, _ usage: ClaudeUsage) -> Profile {
+        var p = Profile(name: name, cliCredentialsJSON: "json-\(name)")
+        p.claudeUsage = usage
+        return p
+    }
+
+    private func spentUsage(
+        session: Double = 0, weekly: Double = 0, fable: Double = 0,
+        weeklyResetIn: TimeInterval = 86400, updatedAt: Date = Date()
+    ) -> ClaudeUsage {
+        ClaudeUsage(
+            sessionTokensUsed: 0, sessionLimit: 0, sessionPercentage: session,
+            sessionResetTime: Date().addingTimeInterval(3600),
+            weeklyTokensUsed: 0, weeklyLimit: 1_000_000, weeklyPercentage: weekly,
+            weeklyResetTime: Date().addingTimeInterval(weeklyResetIn),
+            opusWeeklyTokensUsed: 0, opusWeeklyPercentage: 0,
+            sonnetWeeklyTokensUsed: 0, sonnetWeeklyPercentage: 0, sonnetWeeklyResetTime: nil,
+            designWeeklyTokensUsed: 0, designWeeklyPercentage: 0, designWeeklyResetTime: nil,
+            fableWeeklyTokensUsed: 0, fableWeeklyPercentage: fable,
+            fableWeeklyResetTime: Date().addingTimeInterval(86400),
+            costUsed: nil, costLimit: nil, costCurrency: nil,
+            lastUpdated: updatedAt, userTimezone: .current)
+    }
+
     // MARK: - One tracker per user
 
     func testQuitsWhenAnotherInstanceRuns() {

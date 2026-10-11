@@ -841,7 +841,10 @@ class ClaudeCodeSyncService {
     ///
     /// 1. No Claude Code process is running on the shared login. Every such
     ///    process holds the login in memory; swapping it under them leaves two
-    ///    holders of one single-use refresh token.
+    ///    holders of one single-use refresh token. Exception: when the shared
+    ///    login's account is spent (in `spentLogins`: at a limit, or dead), its
+    ///    sessions are stranded and can make no request, so they do not block;
+    ///    they are told to reload onto the new login after the write.
     /// 2. The keychain holds a login the tracker has captured (compare-and-
     ///    swap on its fingerprint), or nothing. A login that changed since the
     ///    last capture — a `/login`, or a rotation by a refresher the tracker
@@ -854,9 +857,9 @@ class ClaudeCodeSyncService {
     ///
     /// `knownLogins` are the main logins the tracker has captured (every
     /// profile's `cliCredentialsJSON`), for the compare-and-swap.
-    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = []) async throws -> MainLoginSwitch {
+    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], spentLogins: [String] = []) async throws -> MainLoginSwitch {
         try await withSwitchMutex {
-            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins)
+            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, spentLogins: spentLogins)
         }
     }
 
@@ -872,7 +875,7 @@ class ClaudeCodeSyncService {
         }
     }
 
-    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String]) async throws -> MainLoginSwitch {
+    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String], spentLogins: [String]) async throws -> MainLoginSwitch {
         guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
             // A pinned entry's login is never copied into the main keychain:
             // that puts one single-use refresh token in two config dirs.
@@ -924,11 +927,17 @@ class ClaudeCodeSyncService {
         }
         let holders = MainLoginSwapPolicy.sharedLoginHolders(in: processes)
         let known = Set(knownLogins.compactMap(systemLoginFingerprint))
+        // Sessions on a spent login are stranded, not working: they do not block.
+        let keychainLoginSpent = keychainFingerprint.map { Set(spentLogins.compactMap(systemLoginFingerprint)).contains($0) } ?? false
         if let refusal = MainLoginSwapPolicy.refusal(
-            holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known
+            holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known,
+            keychainLoginSpent: keychainLoginSpent
         ) {
             LoggingService.shared.log("switchMainLogin: not switching Claude Code to '\(profile.name)': \(refusal)")
             return .refused(refusal)
+        }
+        if !holders.isEmpty {
+            LoggingService.shared.log("switchMainLogin: \(holders.count) Claude Code session(s) are stranded on a spent login; switching them to '\(profile.name)'")
         }
 
         // Nothing holds the shared login and the keychain is what we last saw.
@@ -965,9 +974,16 @@ class ClaudeCodeSyncService {
         // Re-scan: a `claude` that started between the scan above and the write
         // read the keychain before or after it, and we cannot tell which. Say so
         // loudly; the caller notifies, and the keychain-mdat log will show it.
+        // Stranded sessions (on a spent login) were there before the write and
+        // are expected; tell them to reload onto the new login now.
+        if !holders.isEmpty, Self.signalCredentialsReload(at: credentialsFileURL) {
+            LoggingService.shared.log("switchMainLogin: touched the credentials file so the \(holders.count) stranded session(s) reload onto '\(profile.name)'")
+        }
+
         let racedCount: Int?
         if let after = runningProcesses() {
-            let raced = MainLoginSwapPolicy.sharedLoginHolders(in: after)
+            let before = Set(holders.map(\.pid))
+            let raced = MainLoginSwapPolicy.sharedLoginHolders(in: after).filter { !before.contains($0.pid) }
             racedCount = raced.count
             if !raced.isEmpty {
                 LoggingService.shared.logError("⚠️ switchMainLogin: \(raced.count) Claude Code process(es) on the shared login appeared during the switch to '\(profile.name)' (pids \(raced.map { String($0.pid) }.joined(separator: ","))); one may hold the replaced login")
@@ -984,7 +1000,7 @@ class ClaudeCodeSyncService {
 
         // Restore the profile's captured oauthAccount (if any) so Claude Code's
         // /status Status tab shows the right email/org/plan for this profile.
-        // No session is running (see 1), so none can write a stale copy back.
+        // No working session is running (see 1); a stranded one reloads.
         if let storedOAuthAccount = profile.oauthAccountJSON {
             do {
                 try writeOAuthAccount(storedOAuthAccount)
@@ -1010,8 +1026,10 @@ class ClaudeCodeSyncService {
                 throw ClaudeCodeError.noProfileCredentials
             }
             let pinned = Set(profiles.compactMap(\.customKeychainServiceName)).compactMap { readKeychainCredentials(serviceName: $0) }
+            let spent = MainLoginSwapPolicy.spentLogins(
+                in: profiles, usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(), isLoginDead: isLoginDead(for:))
             return try await performMainLoginSwitch(
-                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned)
+                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned, spentLogins: spent)
         }
     }
 
