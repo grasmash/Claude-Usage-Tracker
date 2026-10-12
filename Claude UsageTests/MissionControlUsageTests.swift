@@ -369,9 +369,37 @@ final class MissionControlUsageTests: XCTestCase {
         own.fableWeeklyResetTime = nil                           // unknown
         XCTAssertNil(McUsage.usage(from: r, over: own, now: now))
         XCTAssertNil(McUsage.usage(from: r, over: nil, now: now))
+        // An hours-old PARTIAL Fable value (window in force) is not certain any more:
+        // never carried under a fresh timestamp.
+        own.fableWeeklyResetTime = now.addingTimeInterval(2 * 86400)
+        for partial in [60.0, 0.0] {
+            own.fableWeeklyPercentage = partial
+            XCTAssertNil(McUsage.usage(from: r, over: own, now: now), "own Fable \(partial)%")
+        }
         // A measured Fable value is still taken as measured.
         XCTAssertEqual(McUsage.usage(from: reading("a", sampledAt: now.addingTimeInterval(-60), fable: 5), over: own, now: now)?
             .fableWeeklyPercentage, 5)
+    }
+
+    func testANullFableMcReadingOverAStalePartialFableProfileInventsNoFableHeadroom() throws {
+        let rotate = try XCTUnwrap(McUsage.parseRotateConfig(rotateConfig(), home: home))
+        let current = applicable(email: "matt@example.com", usage: usage(weekly: 100, updatedAt: now))
+        // goose: own reading 4h old, Fable 60% with its window in force.
+        var own = usage(weekly: 20, updatedAt: now.addingTimeInterval(-4 * 3600))
+        own.fableWeeklyPercentage = 60
+        own.fableWeeklyResetTime = now.addingTimeInterval(2 * 86400)
+        let goose = applicable(email: "goose@example.com", usage: own)
+
+        let updates = McUsage.overlay(profiles: [current, goose], activeProfileId: current.id,
+                                      readings: [reading("goose", sampledAt: now.addingTimeInterval(-60), weekly: 20, fable: nil)],
+                                      rotate: rotate, now: now)
+        var after = [current, goose]
+        for u in updates { after[after.firstIndex { $0.id == u.profileId }!].claudeUsage = u.usage }
+
+        XCTAssertTrue(updates.isEmpty, "the own (stale) reading stands")
+        XCTAssertFalse(AutoSwitchPolicy.anyProfileHasFableHeadroom([after[1]], now: now),
+                       "a stale 60% must not become fresh Fable headroom (would fire .switchFirst)")
+        XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: after, activeId: current.id, now: now), .wait(.noHeadroom))
     }
 
     func testTheClientRefusesRedirects() {

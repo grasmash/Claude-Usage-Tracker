@@ -198,15 +198,18 @@ enum McUsage {
         // Fable: mc's fable window is often null (its laptop lane posts none). A
         // missing Fable reading is NOT "0% Fable": under a fresh timestamp that
         // would fabricate Fable headroom and defeat the fresh-only Opus fallback.
-        // Carry the profile's own Fable reading only while its window is still in
-        // force at mc's sample time; otherwise take nothing and let the profile's
-        // own reading stand.
+        // The profile's own Fable value is carried under mc's timestamp only when
+        // it is certain to still hold: SPENT (>= 100%) with its window still in
+        // force at mc's sample time. An older partial value (60%, 0%) may have
+        // moved since; dressing it as fresh would invent headroom, so the mc
+        // reading is not taken and the profile's own (stale) reading stands.
         let fablePct: Double
         let fableReset: Date?
         if let pct = reading.fablePct {
             fablePct = pct
             fableReset = reading.fableResetsAt
-        } else if let existing, let reset = existing.fableWeeklyResetTime, reset > sampled {
+        } else if let existing, existing.fableWeeklyPercentage >= 100,
+                  let reset = existing.fableWeeklyResetTime, reset > sampled {
             fablePct = existing.fableWeeklyPercentage
             fableReset = reset
         } else {
