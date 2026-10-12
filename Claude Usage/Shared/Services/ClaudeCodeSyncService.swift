@@ -1552,9 +1552,21 @@ class ClaudeCodeSyncService {
 
     /// Deletes the import dir's keychain entry locally. This is NOT a logout:
     /// nothing is revoked, the login lives on in the profile.
-    func clearImportedLogin() {
-        guard !AppEnvironment.isRunningTests else { return }
-        _ = runSecurityCommand(arguments: ["delete-generic-password", "-s", loginImportServiceName, "-a", NSUserName()])
+    /// Returns true only when the item is verified gone afterwards: a login
+    /// left in the import dir is a second copy of the profile's lineage, which
+    /// `storedLoginForUsage`'s holder scan would (correctly) refuse to refresh.
+    @discardableResult
+    func clearImportedLogin() -> Bool {
+        guard !AppEnvironment.isRunningTests else { return false }
+        let delete = runSecurityCommand(arguments: ["delete-generic-password", "-s", loginImportServiceName, "-a", NSUserName()])
+        let check = runSecurityCommand(arguments: ["find-generic-password", "-s", loginImportServiceName, "-a", NSUserName()])
+        let gone = check.map { !$0.timedOut && $0.exitCode == 44 } ?? false
+        if gone {
+            LoggingService.shared.log("clearImportedLogin: import dir's keychain item removed (verified)")
+        } else {
+            LoggingService.shared.logError("clearImportedLogin: import dir's keychain item may still exist (delete exit \(delete.map { String($0.exitCode) } ?? "none"), check exit \(check.map { String($0.exitCode) } ?? "none")); the login has two copies until it is removed")
+        }
+        return gone
     }
 
     /// The ONE place the tracker refreshes a token: a stored main login about to
@@ -1604,9 +1616,15 @@ class ClaudeCodeSyncService {
     /// provably its only holder:
     /// - the profile is not active, the login is its own (`canBeApplied`) and
     ///   of known origin (`import` or `keychain`), and not known dead;
+    /// - the shared login is provably ANOTHER account's (by identity, not just
+    ///   by token): see `sharedLoginMayBeThisAccount`;
     /// - its refresh token is in NO Claude Code keychain item (every
-    ///   `Claude Code-credentials*` entry is listed and read) and not in the
-    ///   plaintext credentials file. Claude Code posts only the refresh token
+    ///   `Claude Code-credentials*` entry is listed and read; an item that is
+    ///   unreadable, unparsable or vanishes mid-check is a refusal) and not in
+    ///   `~/.claude/.credentials.json` / `credentials.json`, the plaintext
+    ///   fallback Claude Code reads only when it has no keychain item. Other
+    ///   config dirs' plaintext files are not checked: on macOS Claude Code
+    ///   keeps those logins in the keychain. Claude Code posts only the refresh token
     ///   it finds in its storage at that moment (it re-reads under its refresh
     ///   lock and adopts whatever is there), so a token in none of them has no
     ///   other holder. A list that cannot be made, or an item that cannot be
@@ -1628,6 +1646,10 @@ class ClaudeCodeSyncService {
                 return nil
             }
             guard !self.deadLogins.isDead(refreshToken) else { return nil }
+            if let why = await self.sharedLoginMayBeThisAccount(current) {
+                LoggingService.shared.log("storedLoginForUsage: not refreshing '\(current.name)': \(why)")
+                return nil
+            }
             if let holder = self.claudeCodeHolder(ofRefreshToken: refreshToken) {
                 LoggingService.shared.log("storedLoginForUsage: not refreshing '\(current.name)': \(holder)")
                 return nil
@@ -1666,15 +1688,44 @@ class ClaudeCodeSyncService {
                 return "keychain item '\(service)' could not be read"
             }
             if result.timedOut { return "reading keychain item '\(service)' timed out" }
-            if result.exitCode == 44 { continue }   // gone since the list: holds nothing
+            // Listed but gone (exit 44): it changed under us, so what it held is unknown. Refuse rather than
+            // reason about who read it before it went; the next cycle sees a settled keychain.
+            if result.exitCode == 44 { return "keychain item '\(service)' disappeared while being checked" }
             guard result.exitCode == 0 else { return "keychain item '\(service)' could not be read (exit \(result.exitCode))" }
             let json = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            if extractRefreshToken(from: json) == refreshToken { return "keychain item '\(service)' holds it" }
+            // A payload with no parsable refresh token (half-written, truncated) may be this lineage: unknown.
+            guard let held = extractRefreshToken(from: json) else { return "keychain item '\(service)' holds no readable login" }
+            if held == refreshToken { return "keychain item '\(service)' holds it" }
         }
-        if let file = readCredentialsFile(), extractRefreshToken(from: file) == refreshToken {
-            return "the credentials file holds it"
+        if let file = readCredentialsFile() {
+            guard let held = extractRefreshToken(from: file) else { return "the credentials file holds no readable login" }
+            if held == refreshToken { return "the credentials file holds it" }
         }
         return nil
+    }
+
+    /// Why the SHARED login may be this profile's account, or nil when it is
+    /// provably another account's (or there is none). A switch that was
+    /// refused can leave the shared item on an inactive account whose sessions
+    /// have since rotated it past the stored copy: the stored refresh token is
+    /// then in no item, yet it is a spent rotation of a live lineage. So match
+    /// by account identity as well as by token, and treat "cannot tell" as a
+    /// refusal.
+    private func sharedLoginMayBeThisAccount(_ profile: Profile) async -> String? {
+        let system: String?
+        do { system = try readSystemCredentials() } catch { return "the shared login could not be read" }
+        guard let system else { return nil }
+        if let token = extractRefreshToken(from: system), token == profile.cliCredentialsJSON.flatMap(extractRefreshToken) {
+            return "the shared login is this stored login"
+        }
+        await resolveLoginAccount(credentials: system)
+        guard let systemIdentity = loginAccountIdentity(credentials: system, configOAuthAccount: readOAuthAccount()) else {
+            return "the shared login's account is unknown"
+        }
+        guard let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) else {
+            return "this profile's account is unknown"
+        }
+        return systemIdentity == profileIdentity ? "the shared login is this account (possibly a newer rotation)" : nil
     }
 
     /// True when the login Claude Code's main sessions use (or would use after

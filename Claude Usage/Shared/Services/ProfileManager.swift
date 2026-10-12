@@ -399,7 +399,7 @@ class ProfileManager: ObservableObject {
     /// Saves made from the in-memory list must not undo credential updates
     /// `ClaudeCodeSyncService` wrote straight to the store (rotated tokens, a
     /// captured main login). Pull those fields in before such a save.
-    private func reloadStoredCredentialState() {
+    func reloadStoredCredentialState() {
         let stored = profileStore.loadProfiles()
         for index in profiles.indices {
             guard let fresh = stored.first(where: { $0.id == profiles[index].id }) else { continue }

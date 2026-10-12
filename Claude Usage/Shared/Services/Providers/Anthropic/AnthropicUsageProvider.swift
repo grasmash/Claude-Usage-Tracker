@@ -80,6 +80,11 @@ final class AnthropicUsageProvider: UsageProviderService {
                let storedJSON = await ClaudeCodeSyncService.shared.storedLoginForUsage(profile, isActive: false),
                !ClaudeCodeSyncService.shared.isTokenExpired(storedJSON),
                let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: storedJSON) {
+                if storedJSON != profile.cliCredentialsJSON {
+                    // Refreshed and saved to the store: pull it into the in-memory profiles now, so a
+                    // save from them can never put the spent copy back.
+                    await ProfileManager.shared.reloadStoredCredentialState()
+                }
                 return try await apiService.fetchUsageData(oauthAccessToken: accessToken)
             }
         }

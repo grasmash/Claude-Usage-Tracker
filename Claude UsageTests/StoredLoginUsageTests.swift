@@ -33,6 +33,7 @@ final class StoredLoginUsageTests: XCTestCase {
     private var savedLoader: ((UUID) -> Profile?)!
     private var savedPersister: ((UUID, String) -> Void)!
     private var savedCredentialsFile: URL!
+    private var savedFetchUuid: ((String) async -> String?)!
 
     override func setUp() {
         super.setUp()
@@ -43,6 +44,14 @@ final class StoredLoginUsageTests: XCTestCase {
         savedLoader = sync.storedProfileLoader
         savedPersister = sync.storedLoginPersister
         savedCredentialsFile = sync.credentialsFileURL
+        savedFetchUuid = sync.fetchLoginAccountUuid
+        // Whose login an access token is: "access-main-*" is another account, "access-stored-*" and
+        // "access-newer-*" are goose's own (a newer rotation in the shared item is still goose).
+        sync.fetchLoginAccountUuid = { at in
+            at.hasPrefix("access-main-") || at.hasPrefix("access-other-") ? "u-main"
+                : at.hasPrefix("access-stored-") || at.hasPrefix("access-newer-") ? "u-goose" : nil
+        }
+        sync.setResolvedServiceNameForTesting(mainService)
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         keychain = [:]
@@ -80,6 +89,8 @@ final class StoredLoginUsageTests: XCTestCase {
     }
 
     override func tearDown() {
+        sync.setResolvedServiceNameForTesting(nil)
+        sync.fetchLoginAccountUuid = savedFetchUuid
         sync.securityCommandRunner = savedRunner
         sync.tokenRefresher = savedRefresher
         sync.claudeCodeServiceLister = savedLister
@@ -105,6 +116,7 @@ final class StoredLoginUsageTests: XCTestCase {
         var p = Profile(name: "gooseappai@gmail.com", cliCredentialsJSON: stored, customKeychainServiceName: pinnedService)
         p.hasOwnMainLogin = own
         p.mainLoginProvenance = provenance
+        p.oauthAccountJSON = #"{"accountUuid":"u-goose","emailAddress":"gooseappai@gmail.com"}"#
         profileTemplate = p
         return p
     }
@@ -251,5 +263,46 @@ final class StoredLoginUsageTests: XCTestCase {
         _ = sync.usableCredentials(for: goose(stored: login("stored", expiresIn: -600)), isActive: false)
         XCTAssertEqual(refreshCalls, 0)
         XCTAssertTrue(writes.isEmpty)
+    }
+
+    // MARK: - Gate criticals (2026-10-11 re-gate)
+
+    /// A refused switch can leave the shared login on this INACTIVE account,
+    /// rotated past the stored copy by the sessions using it. The stored copy's
+    /// refresh token then appears nowhere, yet it is a spent rotation of a live
+    /// lineage: posting it is reuse. The shared login being this account's,
+    /// by identity, is a refusal.
+    func testTheSharedItemHoldingANewerRotationOfThisAccountBlocksTheRefresh() async {
+        keychain[mainService] = login("newer", expiresIn: 3600)   // goose, one rotation ahead
+        let r = await sync.storedLoginForUsage(goose(stored: login("stored", expiresIn: -600)), isActive: false)
+        XCTAssertNil(r)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testASharedLoginWhoseAccountCannotBeToldBlocksTheRefresh() async {
+        sync.fetchLoginAccountUuid = { at in at.hasPrefix("access-stored-") ? "u-goose" : nil }
+        keychain[mainService] = login("unknown", expiresIn: 3600)
+        let p = goose(stored: login("stored", expiresIn: -600))
+        var noIdentity = p
+        noIdentity.oauthAccountJSON = nil
+        let r = await sync.storedLoginForUsage(noIdentity, isActive: false)
+        XCTAssertNil(r, "no identity for the profile: cannot prove the shared login is another account's")
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testAnItemWithNoParsableRefreshTokenBlocksTheRefresh() async {
+        keychain[mainService] = login("main", expiresIn: 3600)
+        keychain[otherDirService] = "{not json"
+        let r = await sync.storedLoginForUsage(goose(stored: login("stored", expiresIn: -600)), isActive: false)
+        XCTAssertNil(r, "an unreadable payload may be this lineage, half-written")
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testAnItemGoneBetweenListAndReadBlocksTheRefresh() async {
+        keychain[mainService] = login("main", expiresIn: 3600)
+        listed = [mainService, otherDirService]   // listed, but reads back exit 44
+        let r = await sync.storedLoginForUsage(goose(stored: login("stored", expiresIn: -600)), isActive: false)
+        XCTAssertNil(r)
+        XCTAssertEqual(refreshCalls, 0)
     }
 }
