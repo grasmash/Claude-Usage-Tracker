@@ -1088,3 +1088,4 @@
 "mc_usage.save" = "Enregistrer";
 "mc_usage.clear" = "Effacer";
 "mc_usage.status" = "Dernière récupération : %@";
+"mc_usage.keychain_failed" = "Impossible d'enregistrer le jeton dans le trousseau ; l'utilisation via mission control reste désactivée.";

@@ -1110,3 +1110,4 @@
 "mc_usage.save" = "保存";
 "mc_usage.clear" = "消去";
 "mc_usage.status" = "最終取得: %@";
+"mc_usage.keychain_failed" = "トークンをキーチェーンに保存できませんでした。mission control の使用量はオフのままです。";

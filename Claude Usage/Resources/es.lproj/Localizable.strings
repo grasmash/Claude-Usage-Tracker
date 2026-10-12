@@ -1091,3 +1091,4 @@
 "mc_usage.save" = "Guardar";
 "mc_usage.clear" = "Borrar";
 "mc_usage.status" = "Última consulta: %@";
+"mc_usage.keychain_failed" = "No se pudo guardar el token en el llavero; el uso de mission control sigue desactivado.";

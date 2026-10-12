@@ -1096,3 +1096,4 @@
 "mc_usage.save" = "保存";
 "mc_usage.clear" = "清除";
 "mc_usage.status" = "上次获取：%@";
+"mc_usage.keychain_failed" = "无法将令牌保存到钥匙串；mission control 用量保持关闭。";

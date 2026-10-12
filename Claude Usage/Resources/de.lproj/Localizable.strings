@@ -1110,3 +1110,4 @@
 "mc_usage.save" = "Speichern";
 "mc_usage.clear" = "Löschen";
 "mc_usage.status" = "Letzter Abruf: %@";
+"mc_usage.keychain_failed" = "Token konnte nicht im Schlüsselbund gespeichert werden; Mission-Control-Nutzung bleibt aus.";

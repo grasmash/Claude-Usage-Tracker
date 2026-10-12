@@ -1096,3 +1096,4 @@
 "mc_usage.save" = "儲存";
 "mc_usage.clear" = "清除";
 "mc_usage.status" = "上次取得：%@";
+"mc_usage.keychain_failed" = "無法將權杖儲存到鑰匙圈；mission control 用量維持關閉。";

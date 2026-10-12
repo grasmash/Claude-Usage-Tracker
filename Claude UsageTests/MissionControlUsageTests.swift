@@ -12,7 +12,7 @@ import XCTest
 final class MissionControlUsageTests: XCTestCase {
 
     private let home = "/Users/tester"
-    private let token = "mca_SECRET-token-value-1234567890"
+    private let token = "mcu_SECRET-token-value-1234567890"
     private var now: Date!
 
     override func setUp() {
@@ -106,10 +106,10 @@ final class MissionControlUsageTests: XCTestCase {
         XCTAssertEqual(rotate.first { $0.name == "littlewing" }?.dir, "\(home)/.claude-rotate/accounts/littlewing")
     }
 
-    func testParsesMcThroughputAccounts() throws {
-        let readings = try XCTUnwrap(McUsage.parseThroughput(throughputJSON([
+    func testParsesMcAccountUsage() throws {
+        let readings = try XCTUnwrap(McUsage.parseAccountUsage(accountUsageJSON([
             account("littlewing", sampledAt: now.addingTimeInterval(-60), session: 3, weekly: 0, fable: 12),
-            #"{"name":"nousage","working_jobs":0,"sessions":0,"completed_in_window":0,"usage":null}"#,
+            #"{"name":"nousage","usage":null}"#,
             account("noweekly", sampledAt: now, session: 3, weekly: nil, fable: nil),
         ])))
         XCTAssertEqual(readings.map(\.account), ["littlewing"])   // incomplete readings stay unknown
@@ -118,8 +118,8 @@ final class MissionControlUsageTests: XCTestCase {
         XCTAssertEqual(r.weeklyPct, 0)
         XCTAssertEqual(r.fablePct, 12)
         XCTAssertEqual(r.sampledAt.timeIntervalSince1970, now.addingTimeInterval(-60).timeIntervalSince1970, accuracy: 1)
-        XCTAssertNil(McUsage.parseThroughput(Data("not json".utf8)))
-        XCTAssertNil(McUsage.parseThroughput(Data(#"{"no_accounts":true}"#.utf8)))
+        XCTAssertNil(McUsage.parseAccountUsage(Data("not json".utf8)))
+        XCTAssertNil(McUsage.parseAccountUsage(Data(#"{"no_accounts":true}"#.utf8)))
     }
 
     // MARK: - Freshness precedence
@@ -212,7 +212,7 @@ final class MissionControlUsageTests: XCTestCase {
             (Data(#"{"error":"unauthenticated"}"#.utf8), http(401)),
             (Data(#"{"error":"boom"}"#.utf8), http(500)),
             (Data("<html>".utf8), http(200)),           // unparseable
-            (throughputJSON([account("goose", sampledAt: now.addingTimeInterval(-60), session: 0, weekly: 0, fable: 0)]),
+            (accountUsageJSON([account("goose", sampledAt: now.addingTimeInterval(-60), session: 0, weekly: 0, fable: 0)]),
              URLResponse(url: URL(string: "https://mc.example")!, mimeType: nil, expectedContentLength: 0, textEncodingName: nil)),
         ]
         for failure in failures {
@@ -232,7 +232,7 @@ final class MissionControlUsageTests: XCTestCase {
         let config = try XCTUnwrap(McUsageClient.Config(baseURL: "https://mc.example", token: token))
         var clock = now!
         var fail = false
-        let body = throughputJSON([account("goose", sampledAt: now.addingTimeInterval(-60), session: 0, weekly: 0, fable: 0)])
+        let body = accountUsageJSON([account("goose", sampledAt: now.addingTimeInterval(-60), session: 0, weekly: 0, fable: 0)])
         let client = McUsageClient(transport: { _ in
             if fail { throw URLError(.notConnectedToInternet) }
             return (body, self.http(200))
@@ -250,7 +250,7 @@ final class MissionControlUsageTests: XCTestCase {
         let config = try XCTUnwrap(McUsageClient.Config(baseURL: "https://mc.example:8443/", token: token))
         var seen: [URLRequest] = []
         var clock = now!
-        let body = throughputJSON([account("goose", sampledAt: now.addingTimeInterval(-60), session: 0, weekly: 0, fable: 0)])
+        let body = accountUsageJSON([account("goose", sampledAt: now.addingTimeInterval(-60), session: 0, weekly: 0, fable: 0)])
         let client = McUsageClient(transport: { req in seen.append(req); return (body, self.http(200)) },
                                    log: { _ in }, minInterval: 60, now: { clock })
 
@@ -262,7 +262,7 @@ final class MissionControlUsageTests: XCTestCase {
 
         let req = try XCTUnwrap(seen.first)
         XCTAssertEqual(req.httpMethod, "GET")
-        XCTAssertEqual(req.url?.absoluteString, "https://mc.example:8443/v1/throughput?window=1h")
+        XCTAssertEqual(req.url?.absoluteString, "https://mc.example:8443/v1/accounts/usage")
         XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer \(token)")
         XCTAssertFalse(req.url?.absoluteString.contains(token) ?? true)
         XCTAssertNil(req.httpBody)
@@ -274,7 +274,7 @@ final class MissionControlUsageTests: XCTestCase {
         let config = try XCTUnwrap(McUsageClient.Config(baseURL: "https://mc.example", token: token))
         struct Leaky: LocalizedError { let t: String; var errorDescription: String? { "failed with \(t)" } }
         let responses: [() throws -> (Data, URLResponse)] = [
-            { (self.throughputJSON([self.account("goose", sampledAt: self.now, session: 0, weekly: 0, fable: 0)]), self.http(200)) },
+            { (self.accountUsageJSON([self.account("goose", sampledAt: self.now, session: 0, weekly: 0, fable: 0)]), self.http(200)) },
             { (Data("unknown token \(self.token)".utf8), self.http(401)) },   // a server echoing the token
             { (Data("bad \(self.token)".utf8), self.http(200)) },
             { throw Leaky(t: self.token) },                                   // an error whose text holds it
@@ -400,14 +400,83 @@ final class MissionControlUsageTests: XCTestCase {
 
     private func account(_ name: String, sampledAt: Date, session: Double?, weekly: Double?, fable: Double?) -> String {
         let r = sampledAt.addingTimeInterval(3600)
-        return #"{"name":"\#(name)","working_jobs":0,"sessions":0,"completed_in_window":0,"usage":{"sampled_at":"\#(iso(sampledAt))","paused":false,"session":\#(window(session, r, 18000)),"weekly":\#(window(weekly, r, 604800)),"fable":\#(window(fable, r, 604800))}}"#
+        return #"{"name":"\#(name)","usage":{"sampled_at":"\#(iso(sampledAt))","paused":false,"session":\#(window(session, r, 18000)),"weekly":\#(window(weekly, r, 604800)),"fable":\#(window(fable, r, 604800))}}"#
     }
 
-    private func throughputJSON(_ accounts: [String]) -> Data {
-        Data(#"{"window":{"name":"1h","from":"x","to":"y"},"generated_at":"y","hosts":[],"accounts":[\#(accounts.joined(separator: ","))]}"#.utf8)
+    private func accountUsageJSON(_ accounts: [String]) -> Data {
+        Data(#"{"accounts":[\#(accounts.joined(separator: ","))]}"#.utf8)
     }
 
     private func http(_ status: Int) -> HTTPURLResponse {
-        HTTPURLResponse(url: URL(string: "https://mc.example/v1/throughput")!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        HTTPURLResponse(url: URL(string: "https://mc.example/v1/accounts/usage")!, statusCode: status, httpVersion: nil, headerFields: nil)!
+    }
+}
+
+/// The mc token lives in the app's own keychain item, never in UserDefaults:
+/// the prefs domain is cleartext, and mc's laptop `usage` lane runs
+/// `defaults export` on it, which would ship the token to mc itself.
+final class MissionControlTokenStorageTests: XCTestCase {
+
+    private let token = "mcu_SECRET-storage-token-0987654321"
+
+    func testTheTokenIsAbsentFromUserDefaultsAndFromADefaultsExport() throws {
+        let store = SharedDataStore.shared
+        let saved = store.missionControlTokenStore
+        defer { store.missionControlTokenStore = saved }
+        var held: String?
+        store.missionControlTokenStore = .init(load: { held }, save: { held = $0; return true })
+
+        XCTAssertTrue(store.saveMissionControlToken("  \(token)\n"))
+        XCTAssertEqual(held, token, "the token went to the token store")
+        XCTAssertEqual(store.loadMissionControlToken(), token)
+        XCTAssertNotNil(store.missionControlConfig())
+
+        let defaults = AppEnvironment.userDefaults
+        defaults.synchronize()
+        let flat = defaults.dictionaryRepresentation().map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+        XCTAssertFalse(flat.contains(token))
+        XCTAssertFalse(flat.contains("SECRET"))
+
+        // What mc's usage_push actually runs, against the domain the store writes.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        p.arguments = ["export", AppEnvironment.testDefaultsSuiteName, "-"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        try p.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let exported = String(decoding: data, as: UTF8.self)
+        XCTAssertFalse(exported.contains(token), "token in defaults export")
+        XCTAssertFalse(exported.contains("SECRET"))
+    }
+
+    func testAKeychainRefusalStoresTheTokenNowhereAndLeavesTheFeatureOff() {
+        let store = SharedDataStore.shared
+        let saved = store.missionControlTokenStore
+        defer { store.missionControlTokenStore = saved }
+        store.missionControlTokenStore = .init(load: { nil }, save: { _ in false })
+        XCTAssertFalse(store.saveMissionControlToken(token))
+        XCTAssertEqual(store.loadMissionControlToken(), "")
+        XCTAssertNil(store.missionControlConfig())
+        XCTAssertFalse(AppEnvironment.userDefaults.dictionaryRepresentation().values.contains { "\($0)".contains(token) })
+    }
+
+    func testClearingTheTokenTurnsTheFeatureOff() {
+        let store = SharedDataStore.shared
+        let saved = store.missionControlTokenStore
+        defer { store.missionControlTokenStore = saved }
+        var held: String?
+        store.missionControlTokenStore = .init(load: { held }, save: { held = $0; return true })
+        store.saveMissionControlToken(token)
+        store.saveMissionControlToken("")
+        XCTAssertNil(held)
+        XCTAssertNil(store.missionControlConfig())
+    }
+
+    func testTheKeychainItemIsTheAppsOwnNeverAClaudeCodeEntry() {
+        XCTAssertEqual(KeychainService.missionControlTokenService, "com.claudeusagetracker.mission-control-token")
+        XCTAssertFalse(KeychainService.missionControlTokenService.hasPrefix("Claude Code-credentials"))
     }
 }

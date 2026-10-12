@@ -76,7 +76,8 @@ class SharedDataStore {
 
         // Mission control (inactive profiles' usage)
         static let missionControlURL = "missionControlURL"
-        static let missionControlToken = "missionControlToken"
+        /// Never written: the token lives in the keychain. Only ever removed.
+        static let legacyMissionControlToken = "missionControlToken"
 
         // Popover Settings
         static let popoverShowRemainingTime = "popoverShowRemainingTime" // legacy bool key
@@ -641,19 +642,47 @@ class SharedDataStore {
         defaults.string(forKey: Keys.missionControlURL) ?? Self.defaultMissionControlURL
     }
 
-    /// The mc token pasted in Settings. Stored with the app's other settings;
-    /// never logged. Empty or absent = the feature is off.
-    func saveMissionControlToken(_ token: String) {
-        let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty {
-            defaults.removeObject(forKey: Keys.missionControlToken)
-        } else {
-            defaults.set(t, forKey: Keys.missionControlToken)
+    /// Where the mc token lives: the app's own keychain item
+    /// (`KeychainService.missionControlTokenService`), never UserDefaults.
+    /// Under tests an in-memory store, so no test ever touches the keychain.
+    struct McTokenStore {
+        var load: () -> String?
+        var save: (String?) -> Bool
+
+        static let keychain = McTokenStore(
+            load: { KeychainService.shared.loadMissionControlToken() },
+            save: { KeychainService.shared.saveMissionControlToken($0) })
+
+        static func memory() -> McTokenStore {
+            final class Box { var value: String? }
+            let box = Box()
+            return McTokenStore(load: { box.value }, save: { box.value = $0; return true })
         }
     }
 
+    var missionControlTokenStore: McTokenStore = AppEnvironment.isRunningTests ? .memory() : .keychain {
+        didSet { cachedMissionControlToken = nil }
+    }
+
+    /// Read once, then kept in memory: the refresh tick asks every cycle.
+    private var cachedMissionControlToken: String?
+
+    /// Saves the mc token pasted in Settings (empty clears it). Returns false
+    /// when the keychain refused it; the token is then NOT stored anywhere.
+    @discardableResult
+    func saveMissionControlToken(_ token: String) -> Bool {
+        // A build of this branch before the keychain move kept it in defaults.
+        defaults.removeObject(forKey: Keys.legacyMissionControlToken)
+        let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        cachedMissionControlToken = nil
+        return missionControlTokenStore.save(t.isEmpty ? nil : t)
+    }
+
     func loadMissionControlToken() -> String {
-        defaults.string(forKey: Keys.missionControlToken) ?? ""
+        if let cached = cachedMissionControlToken { return cached }
+        let t = missionControlTokenStore.load() ?? ""
+        cachedMissionControlToken = t
+        return t
     }
 
     /// The mc fetch config, or nil (feature off) when no token is set or the

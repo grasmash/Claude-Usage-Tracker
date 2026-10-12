@@ -1110,3 +1110,4 @@
 "mc_usage.save" = "Salvar";
 "mc_usage.clear" = "Limpar";
 "mc_usage.status" = "Última busca: %@";
+"mc_usage.keychain_failed" = "Não foi possível salvar o token nas Chaves; o uso via mission control continua desligado.";

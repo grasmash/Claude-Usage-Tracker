@@ -1108,3 +1108,4 @@
 "mc_usage.save" = "Lưu";
 "mc_usage.clear" = "Xóa";
 "mc_usage.status" = "Lần lấy gần nhất: %@";
+"mc_usage.keychain_failed" = "Không thể lưu mã vào chuỗi khóa; mức dùng từ mission control vẫn tắt.";

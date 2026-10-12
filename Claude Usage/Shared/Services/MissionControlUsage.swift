@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// One account's usage as mission control (mc) last stored it: mc's
-/// `getThroughput` `accounts[].usage` (AccountUsage). Only complete readings
+/// `listAccountUsage` (`GET /v1/accounts/usage`) `accounts[].usage` (AccountUsage). Only complete readings
 /// (session AND weekly known) are kept.
 struct McUsageReading: Equatable {
     let account: String
@@ -23,7 +23,8 @@ struct McUsageReading: Equatable {
 /// shelved after three gates found logout-class paths
 /// (docs/stored-login-refresh-shelved.md on fix/usage-all-accounts). mc's
 /// `usage-self` lane on littlewing reads each account read-only every 5 min
-/// with no refresh code at all. This file only ever READS mc over one GET; it
+/// with no refresh code at all. This file only ever READS mc over one GET
+/// (`/v1/accounts/usage`, callable with a read-only `mcu_` usage token); it
 /// holds no login and never touches a token of any account.
 ///
 /// Rules (each pinned by MissionControlUsageTests):
@@ -53,10 +54,10 @@ enum McUsage {
 
     // MARK: - mc response
 
-    /// `getThroughput` body -> complete readings; nil when the body is not a
-    /// throughput response at all. An account listed twice is dropped (which
+    /// `listAccountUsage` body (`{accounts:[{name, usage}]}`) -> complete
+    /// readings; nil when the body is not that shape at all. An account listed twice is dropped (which
     /// of the two is right is unknowable).
-    static func parseThroughput(_ data: Data) -> [McUsageReading]? {
+    static func parseAccountUsage(_ data: Data) -> [McUsageReading]? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let accounts = json["accounts"] as? [[String: Any]] else { return nil }
         var out: [McUsageReading] = []
@@ -247,7 +248,7 @@ enum McUsage {
     }
 }
 
-/// One read-only GET of mc's `getThroughput`, throttled. Every failure is "no
+/// One read-only GET of mc's `listAccountUsage`, throttled. Every failure is "no
 /// readings". The token is sent only in the Authorization header and never
 /// appears in a log line or in `lastStatus`.
 final class McUsageClient {
@@ -269,8 +270,9 @@ final class McUsageClient {
             self.token = t
         }
 
-        var throughputURL: URL? {
-            URL(string: baseURL.absoluteString + "/v1/throughput?window=1h")
+        /// mc's `listAccountUsage`: the only route an `mcu_` usage token may call.
+        var accountUsageURL: URL? {
+            URL(string: baseURL.absoluteString + "/v1/accounts/usage")
         }
     }
 
@@ -321,7 +323,7 @@ final class McUsageClient {
     /// `minInterval` of the last attempt, the last attempt's outcome is reused
     /// (a failure stays a failure: [] — never an older success).
     func fetchReadings(config: Config?) async -> [McUsageReading] {
-        guard let config, let url = config.throughputURL else {
+        guard let config, let url = config.accountUsageURL else {
             set(status: "Not configured", readings: [], at: nil)
             return []
         }
@@ -349,7 +351,7 @@ final class McUsageClient {
                     outcome = "Mission control answered HTTP \(http.statusCode)"
                 } else if data.count > Self.maxBodyBytes {
                     outcome = "Mission control response too large"
-                } else if let parsed = McUsage.parseThroughput(data) {
+                } else if let parsed = McUsage.parseAccountUsage(data) {
                     readings = parsed
                     outcome = "OK: \(parsed.count) account reading\(parsed.count == 1 ? "" : "s")"
                 } else {

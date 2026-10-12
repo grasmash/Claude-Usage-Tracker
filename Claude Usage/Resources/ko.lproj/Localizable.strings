@@ -1119,3 +1119,4 @@
 "mc_usage.save" = "저장";
 "mc_usage.clear" = "지우기";
 "mc_usage.status" = "마지막 조회: %@";
+"mc_usage.keychain_failed" = "토큰을 키체인에 저장할 수 없습니다. mission control 사용량은 꺼진 상태로 유지됩니다.";

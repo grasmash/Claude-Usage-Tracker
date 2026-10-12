@@ -1102,3 +1102,4 @@
 "mc_usage.save" = "Kaydet";
 "mc_usage.clear" = "Temizle";
 "mc_usage.status" = "Son alma: %@";
+"mc_usage.keychain_failed" = "Belirteç anahtar zincirine kaydedilemedi; mission control kullanımı kapalı kalır.";

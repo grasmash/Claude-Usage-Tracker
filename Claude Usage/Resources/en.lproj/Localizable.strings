@@ -1128,10 +1128,11 @@
 "popover.reading.stale_idle" = "Reading %@ old. Normal for an account that is not active: it is read again when it is next used, and auto-switch can still switch to it. No action needed.";
 "popover.reading.stale_idle_mc" = "Reading %@ old (last from mission control). Normal for an account that is not active: auto-switch can still switch to it. No action needed.";
 "mc_usage.title" = "Mission control usage";
-"mc_usage.subtitle" = "Fresh usage for inactive accounts from mission control's read-only usage lane. Leave the token empty to turn this off.";
+"mc_usage.subtitle" = "Fresh usage for inactive accounts from mission control's read-only usage lane, with a read-only mcu_ usage token. Leave the token empty to turn this off.";
 "mc_usage.url" = "Mission control URL";
 "mc_usage.token" = "Token";
 "mc_usage.token_saved" = "Token saved";
 "mc_usage.save" = "Save";
 "mc_usage.clear" = "Clear";
 "mc_usage.status" = "Last fetch: %@";
+"mc_usage.keychain_failed" = "Could not save the token to the keychain; mission control usage stays off.";

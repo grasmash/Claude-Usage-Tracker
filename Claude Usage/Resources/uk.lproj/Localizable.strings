@@ -1105,3 +1105,4 @@
 "mc_usage.save" = "Зберегти";
 "mc_usage.clear" = "Очистити";
 "mc_usage.status" = "Останнє отримання: %@";
+"mc_usage.keychain_failed" = "Не вдалося зберегти токен у зв'язці ключів; використання з mission control лишається вимкненим.";

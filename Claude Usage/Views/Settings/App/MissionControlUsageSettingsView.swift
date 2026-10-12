@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Settings for reading INACTIVE profiles' usage from mission control (see
-/// `McUsage`). The token is pasted here and stored with the app's settings;
-/// it is never shown again, logged, or put in a URL. No token = feature off.
+/// `McUsage`). The token is pasted here and stored in the app's own keychain
+/// item (never UserDefaults); it is never shown again, logged, or put in a URL. No token = feature off.
 struct MissionControlUsageSettingsView: View {
     @State private var url: String = SharedDataStore.shared.loadMissionControlURL()
     @State private var tokenDraft: String = ""
@@ -23,13 +23,14 @@ struct MissionControlUsageSettingsView: View {
                 Text("mc_usage.token".localized)
                     .font(DesignTokens.Typography.caption)
                 HStack {
-                    SecureField(hasToken ? "mc_usage.token_saved".localized : "mca_…", text: $tokenDraft)
+                    SecureField(hasToken ? "mc_usage.token_saved".localized : "mcu_…", text: $tokenDraft)
                         .textFieldStyle(.roundedBorder)
                     Button("mc_usage.save".localized) {
                         saveURL()
-                        SharedDataStore.shared.saveMissionControlToken(tokenDraft)
+                        let saved = SharedDataStore.shared.saveMissionControlToken(tokenDraft)
                         tokenDraft = ""
                         hasToken = !SharedDataStore.shared.loadMissionControlToken().isEmpty
+                        if !saved { status = "mc_usage.keychain_failed".localized }
                     }
                     .disabled(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     if hasToken {

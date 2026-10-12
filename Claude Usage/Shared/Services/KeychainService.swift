@@ -175,6 +175,35 @@ class KeychainService {
         case codexCredentialsJSON = "codex-credentials"
     }
 
+    // MARK: - Mission control token (the app's own item)
+
+    /// The app's OWN generic-password item for the mission control usage
+    /// token. Never a `Claude Code-credentials*` entry. Kept out of
+    /// UserDefaults because the prefs domain is cleartext and mc's laptop
+    /// `usage` lane runs `defaults export` on it.
+    static let missionControlTokenService = "com.claudeusagetracker.mission-control-token"
+    static let missionControlTokenAccount = "usage-token"
+
+    /// Saves (or, for nil/empty, deletes) the mc token. True when the keychain
+    /// now holds the requested state. Never falls back to the plist.
+    @discardableResult
+    func saveMissionControlToken(_ token: String?) -> Bool {
+        guard let token, !token.isEmpty else {
+            return deleteItem(service: Self.missionControlTokenService, account: Self.missionControlTokenAccount)
+        }
+        do {
+            try saveItem(token, service: Self.missionControlTokenService, account: Self.missionControlTokenAccount)
+            return true
+        } catch {
+            LoggingService.shared.log("Keychain: could not save the mission control token")
+            return false
+        }
+    }
+
+    func loadMissionControlToken() -> String? {
+        (try? loadItem(service: Self.missionControlTokenService, account: Self.missionControlTokenAccount)) ?? nil
+    }
+
     /// Single service for all per-profile secrets; the account encodes profile + field.
     private static let profileSecretsService = "com.claudeusagetracker.profile-credentials"
 
