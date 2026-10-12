@@ -1053,7 +1053,12 @@ class ClaudeCodeSyncService {
         // A hand-off under working holders: remember who may still carry the
         // replaced lineage, so it is not refreshed until they have released it.
         if keychainLoginNearLimit, !holders.isEmpty, let replaced = keychainFingerprint {
-            recordHandoff(MainLoginSwapPolicy.HandoffRecord(fingerprint: replaced, holderPids: holders.map(\.pid), at: Date()))
+            var started: [String: Date] = [:]
+            for holder in holders {
+                if case .running(let at?) = holderProcess(holder.pid) { started[String(holder.pid)] = at }
+            }
+            recordHandoff(MainLoginSwapPolicy.HandoffRecord(
+                fingerprint: replaced, holderPids: holders.map(\.pid), at: Date(), holderStartTimes: started))
         }
 
         // Stranded sessions (on a spent login) were there before the write and
@@ -1111,7 +1116,7 @@ class ClaudeCodeSyncService {
     /// store is loaded INSIDE the mutex, so a queued caller sees the login the
     /// previous switch just refreshed and stored (`.alreadyApplied`), not a
     /// stale copy it would then mis-read as an unknown keychain login.
-    func switchMainLogin(to profileId: UUID) async throws -> MainLoginSwitch {
+    func switchMainLogin(to profileId: UUID, handoff: Bool = false) async throws -> MainLoginSwitch {
         try await withSwitchMutex {
             let profiles = ProfileStore.shared.loadProfiles()
             guard let profile = profiles.first(where: { $0.id == profileId }) else {
@@ -1120,12 +1125,25 @@ class ClaudeCodeSyncService {
             let pinned = Set(profiles.compactMap(\.customKeychainServiceName)).compactMap { readKeychainCredentials(serviceName: $0) }
             let spent = MainLoginSwapPolicy.spentLogins(in: profiles, isLoginDead: isLoginDead(for:))
             let usingFable = AutoSwitchPolicy.isClaudeCodeUsingFable() || ModelFallback().isActive
-            let nearLimit = SharedDataStore.shared.loadAutoSwitchProactiveEnabled()
-                ? MainLoginSwapPolicy.nearLimitLogins(in: profiles, usingFable: usingFable) : []
+            let nearLimit = Self.nearLimitLoginsForSwitch(
+                profiles: profiles, handoff: handoff,
+                proactiveEnabled: SharedDataStore.shared.loadAutoSwitchProactiveEnabled(), usingFable: usingFable)
             return try await performMainLoginSwitch(
                 to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned, spentLogins: spent,
                 fableSpentLogins: MainLoginSwapPolicy.fableSpentLogins(in: profiles), nearLimitLogins: nearLimit)
         }
+    }
+
+    /// The near-limit logins a switch may move working sessions off.
+    static func nearLimitLoginsForSwitch(
+        profiles: [Profile], handoff: Bool, proactiveEnabled: Bool, usingFable: Bool, now: Date = Date()
+    ) -> [String] {
+        // Only an automatic hand-off may move working sessions off a login
+        // that is merely NEAR its limit. A switch the user clicked, or the
+        // 100% path (whose login is spent and listed in `spentLogins`), keeps
+        // the rule that running sessions block the swap.
+        guard handoff, proactiveEnabled else { return [] }
+        return MainLoginSwapPolicy.nearLimitLogins(in: profiles, usingFable: usingFable, now: now)
     }
 
     /// Removes CLI credentials from profile (doesn't affect system)
@@ -1717,9 +1735,7 @@ class ClaudeCodeSyncService {
         // session's memory; refreshing it here would be a second use of its
         // single-use refresh token. Wait until every holder has released it.
         if let fingerprint = systemLoginFingerprint(mainJSON), let record = handoffRecord(for: fingerprint) {
-            let released = MainLoginSwapPolicy.lineageReleased(
-                record, alive: Self.processIsAlive, lastRequestAt: { self.holderLastRequestAt(pid: $0) })
-            guard released else {
+            guard lineageIsReleased(record) else {
                 LoggingService.shared.log("switchMainLogin: '\(profileName)''s stored login was handed off under \(record.holderPids.count) working session(s) and not every one has released it yet; not refreshing it (retried next tick)")
                 return nil
             }
@@ -1764,7 +1780,10 @@ class ClaudeCodeSyncService {
     }
 
     func recordHandoff(_ record: MainLoginSwapPolicy.HandoffRecord) {
-        var records = loadHandoffRecords().filter { $0.fingerprint != record.fingerprint }
+        // Expired records hold nothing back any more (`handoffRecordTTL`); drop them.
+        var records = loadHandoffRecords().filter {
+            $0.fingerprint != record.fingerprint && record.at.timeIntervalSince($0.at) <= MainLoginSwapPolicy.handoffRecordTTL
+        }
         records.append(record)
         saveHandoffRecords(records)
         LoggingService.shared.log("switchMainLogin: recorded hand-off of the replaced login under \(record.holderPids.count) working session(s); it is not refreshed until they release it")
@@ -1783,14 +1802,62 @@ class ClaudeCodeSyncService {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
-    /// When a holder last made a request: its transcript's modification time
-    /// (`sessions/<pid>.json` -> `projects/<project>/<sessionId>.jsonl`).
-    func holderLastRequestAt(pid: Int32) -> Date? {
+    /// Where Claude Code records live sessions and transcripts. Tests point
+    /// these at a temporary directory.
+    var sessionsDirectory: URL = Constants.ClaudePaths.claudeDirectory.appendingPathComponent("sessions")
+    var projectsDirectory: URL = Constants.ClaudePaths.projectsDirectory
+
+    /// A recorded holder's pid as seen now (exited, or running since when).
+    var holderProcess: (Int32) -> MainLoginSwapPolicy.HolderProcess = { pid in
+        if let started = ProcessListing.startTime(pid: pid) { return .running(startedAt: started) }
+        return ClaudeCodeSyncService.processIsAlive(pid) ? .running(startedAt: nil) : .gone
+    }
+
+    /// The last part of a transcript read for the release proof: enough for
+    /// the requests since a hand-off without reading a long session whole.
+    static let transcriptTailBytes = 1 << 20
+
+    /// Whether a holder made a request after `at` that was answered, from its
+    /// own transcript (`sessions/<pid>.json` -> `projects/<project>/<sessionId>.jsonl`).
+    func holderRequestedAfter(pid: Int32, at: Date) -> Bool {
         guard let transcript = MainLoginSwapPolicy.holderTranscriptURL(
-            pid: pid,
-            sessionsDirectory: Constants.ClaudePaths.claudeDirectory.appendingPathComponent("sessions"),
-            projectsDirectory: Constants.ClaudePaths.projectsDirectory) else { return nil }
-        return try? transcript.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            pid: pid, sessionsDirectory: sessionsDirectory, projectsDirectory: projectsDirectory),
+              let handle = try? FileHandle(forReadingFrom: transcript) else { return false }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return false }
+        let offset = size > UInt64(Self.transcriptTailBytes) ? size - UInt64(Self.transcriptTailBytes) : 0
+        guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return false }
+        return MainLoginSwapPolicy.transcriptShowsAnsweredRequest(after: at, transcript: text)
+    }
+
+    /// Whether every holder of a handed-off lineage has released it.
+    func lineageIsReleased(_ record: MainLoginSwapPolicy.HandoffRecord, now: Date = Date()) -> Bool {
+        MainLoginSwapPolicy.lineageReleased(
+            record, now: now, process: holderProcess, requestedAfter: { self.holderRequestedAfter(pid: $0, at: $1) })
+    }
+
+    /// True while `profile`'s stored login was handed off under working
+    /// holders that have not released it AND it needs a refresh before it can
+    /// be written: a switch to it would refuse to refresh and throw, every
+    /// tick, so it is not a switch target until released.
+    func isHeldByHandoff(_ profile: Profile, now: Date = Date()) -> Bool {
+        guard let json = profile.cliCredentialsJSON, let fingerprint = systemLoginFingerprint(json),
+              let record = handoffRecord(for: fingerprint) else { return false }
+        if let expiry = extractTokenExpiry(from: json), expiry.timeIntervalSince(now) > Self.refreshLeewaySeconds {
+            return false   // usable as stored: the switch writes it without a refresh
+        }
+        return !lineageIsReleased(record, now: now)
+    }
+
+    /// Not a switch target now: a dead login, or a stored login held back by
+    /// an unreleased hand-off that would need a refresh.
+    func isUnavailableAsTarget(for profile: Profile) -> Bool {
+        isLoginDead(for: profile) || isHeldByHandoff(profile)
+    }
+
+    func resetHandoffRecordsForTesting() {
+        handoffRecordsInMemory = []
     }
 
     /// True when the login Claude Code's main sessions use (or would use after

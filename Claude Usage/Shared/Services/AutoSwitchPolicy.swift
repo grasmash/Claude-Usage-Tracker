@@ -107,7 +107,7 @@ enum AutoSwitchPolicy {
             guard !isLoginDead(candidate) else { continue }
 
             guard let usage = candidate.claudeUsage,
-                  !usage.isLimitReached(usingFable: usingFable) else { continue }
+                  !usage.isLimitReached(usingFable: usingFable, now: now) else { continue }
 
             if !usage.isStale(now: now) {
                 return candidate
@@ -137,8 +137,8 @@ enum AutoSwitchPolicy {
     /// The highest window in force that could stop Claude Code: session,
     /// weekly, and the Fable weekly only while Fable is in use.
     static func bindingPercentage(_ usage: ClaudeUsage, usingFable: Bool, now: Date = Date()) -> Double {
-        var binding = max(usage.effectiveSessionPercentage, usage.effectiveWeeklyPercentage)
-        if usingFable { binding = max(binding, usage.effectiveFableWeeklyPercentage) }
+        var binding = max(usage.effectiveSessionPercentage(now: now), usage.effectiveWeeklyPercentage(now: now))
+        if usingFable { binding = max(binding, usage.effectiveFableWeeklyPercentage(now: now)) }
         return binding
     }
 
@@ -186,9 +186,20 @@ enum AutoSwitchPolicy {
     /// Staying put makes `switchLanded` false, so the decider re-arms and the
     /// next tick skips the now-dead target (probe D, gate on 2070d8b).
     static func activateAfterMainLoginSwitch(
-        _ outcome: Result<ClaudeCodeSyncService.MainLoginSwitch, Error>, selectedBy: String
+        _ outcome: Result<ClaudeCodeSyncService.MainLoginSwitch, Error>, selectedBy: String, handoff: Bool = false
     ) -> Bool {
         guard selectedBy == "auto" else { return true }
+        // A proactive hand-off moves the tracker only when the shared login was
+        // actually written. Otherwise the sessions stay on the near-limit
+        // account; a tracker that moved anyway stops reading it (its reading
+        // goes stale) and, believing it already switched, never rescues the
+        // sessions when that account then hits 100%. Retried next tick.
+        if handoff {
+            switch outcome {
+            case .success(.applied), .success(.alreadyApplied): return true
+            default: return false
+            }
+        }
         switch outcome {
         case .failure:
             return false
@@ -243,7 +254,7 @@ enum AutoSwitchPolicy {
         profiles.contains { p in
             guard !p.isPaused, canBeApplied(p), !isLoginDead(p),
                   let usage = p.claudeUsage, !usage.isStale(now: now) else { return false }
-            return !usage.isLimitReached(usingFable: true)
+            return !usage.isLimitReached(usingFable: true, now: now)
         }
     }
 
@@ -424,14 +435,14 @@ struct AutoSwitchDecider {
         current: Profile, profiles: [Profile], usingFable: Bool, now: Date = Date(),
         isLoginDead: (Profile) -> Bool = { _ in false }
     ) -> Decision {
-        guard let usage = current.claudeUsage, usage.isLimitReached(usingFable: usingFable) else {
+        guard let usage = current.claudeUsage, usage.isLimitReached(usingFable: usingFable, now: now) else {
             reset(current.id)   // a window reset ends the episode
             return decideHandoff(current: current, profiles: profiles, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
         }
         guard !switched.contains(current.id) else { return .stay }
 
         switch AutoSwitchPolicy.switchTarget(
-            in: profiles, after: current, usingFable: usingFable, blockedBeyondFable: usage.isLimitReached,
+            in: profiles, after: current, usingFable: usingFable, blockedBeyondFable: usage.isLimitReached(now: now),
             now: now, isLoginDead: isLoginDead
         ) {
         case .profile(let p):
@@ -472,9 +483,9 @@ struct AutoSwitchDecider {
     static func bindingWindowReset(_ usage: ClaudeUsage, usingFable: Bool, now: Date) -> Date {
         let binding = AutoSwitchPolicy.bindingPercentage(usage, usingFable: usingFable, now: now)
         var reset = usage.sessionResetTime
-        if usage.effectiveWeeklyPercentage == binding { reset = usage.weeklyResetTime }
-        if usingFable, usage.effectiveFableWeeklyPercentage == binding, let f = usage.fableWeeklyResetTime { reset = f }
-        if usage.effectiveSessionPercentage == binding { reset = usage.sessionResetTime }
+        if usage.effectiveWeeklyPercentage(now: now) == binding { reset = usage.weeklyResetTime }
+        if usingFable, usage.effectiveFableWeeklyPercentage(now: now) == binding, let f = usage.fableWeeklyResetTime { reset = f }
+        if usage.effectiveSessionPercentage(now: now) == binding { reset = usage.sessionResetTime }
         return Date(timeIntervalSince1970: (reset.timeIntervalSince1970 / 60).rounded(.down) * 60)
     }
 

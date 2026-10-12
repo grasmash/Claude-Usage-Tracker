@@ -1094,6 +1094,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "Прочитано mission control %@ тому (цей обліковий запис неактивний).";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@: потрібен вхід. Запустіть claude-usage-login у Терміналі й увійдіть як %@. До того автоперемикання пропускає цей обліковий запис.";
 "popover.reading.stale_idle" = "Показник %@ тому. Для неактивного облікового запису це нормально: його буде прочитано знову під час наступного використання, і автоперемикання все одно може на нього перейти. Нічого робити не треба.";
 "popover.reading.stale_idle_mc" = "Показник %@ тому (останній від mission control). Для неактивного облікового запису це нормально: автоперемикання все одно може на нього перейти. Нічого робити не треба.";

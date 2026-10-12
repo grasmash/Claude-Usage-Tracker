@@ -28,6 +28,8 @@ final class SingleRefresherTests: XCTestCase {
     private var savedRefresher: ((_ refreshToken: String) async throws -> ClaudeCodeSyncService.OAuthRefreshResponse)!
     private var savedProcesses: (() -> [MainLoginSwapPolicy.RunningProcess]?)!
     private var savedCredentialsFile: URL!
+    private var savedSessionsDirectory: URL!
+    private var savedProjectsDirectory: URL!
 
     override func setUp() {
         super.setUp()
@@ -37,8 +39,13 @@ final class SingleRefresherTests: XCTestCase {
         savedHolderModel = sync.holderModel
         holderModels = [:]
         savedCredentialsFile = sync.credentialsFileURL
+        savedSessionsDirectory = sync.sessionsDirectory
+        savedProjectsDirectory = sync.projectsDirectory
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        sync.sessionsDirectory = tempDir.appendingPathComponent("sessions")
+        sync.projectsDirectory = tempDir.appendingPathComponent("projects")
+        sync.resetHandoffRecordsForTesting()
 
         keychain = [:]
         securityCalls = []
@@ -88,6 +95,9 @@ final class SingleRefresherTests: XCTestCase {
         sync.runningProcesses = savedProcesses
         sync.holderModel = savedHolderModel
         sync.credentialsFileURL = savedCredentialsFile
+        sync.sessionsDirectory = savedSessionsDirectory
+        sync.projectsDirectory = savedProjectsDirectory
+        sync.resetHandoffRecordsForTesting()
         try? FileManager.default.removeItem(at: tempDir)
         super.tearDown()
     }
@@ -830,5 +840,162 @@ final class SingleRefresherTests: XCTestCase {
         defer { if let previousActive { ProfileStore.shared.saveActiveProfileId(previousActive) } }
 
         XCTAssertTrue(sync.isLoginDead(for: b), "A's login in the keychain is not proven to be B's; B is judged by the login a switch would apply")
+    }
+
+    // MARK: - Gate fix 3a: a hand-off under working holders records them
+
+    /// The swap moved working sessions off a near-limit login: the replaced
+    /// lineage is written down with its holders, so it is not refreshed until
+    /// they release it. (Mutant: drop `recordHandoff` -> this fails.)
+    func testHandoffUnderWorkingHoldersWritesAndRecordsTheHandoff() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = [bareClaude(500), bareClaude(501)]
+        let b = imported("B", login("B", expiresIn: 3600))
+        FileManager.default.createFile(atPath: sync.credentialsFileURL.path, contents: Data())
+
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!], nearLimitLogins: [a])
+
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON, "the hand-off wrote B")
+        let record = sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))
+        XCTAssertEqual(record?.holderPids.sorted(), [500, 501], "A's lineage is held back until 500 and 501 release it")
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testNoHandoffIsRecordedWhenNothingHeldTheLogin() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = []
+        let b = imported("B", login("B", expiresIn: 3600))
+        _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!], nearLimitLogins: [a])
+        XCTAssertNil(sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a))))
+    }
+
+    // MARK: - Gate fix 3b: an unreleased hand-off blocks the refresh
+
+    /// B's lineage was handed off under a session that is still alive and has
+    /// made no request since; B's stored login has expired. Switching back to
+    /// B must not refresh it (a second use of a single-use refresh token).
+    /// (Mutant: drop the `lineageIsReleased` guard -> the refresher is called.)
+    func testUnreleasedHandoffBlocksTheRefreshOfTheStoredLogin() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = []
+        let bJSON = login("B", expiresIn: -600)
+        let b = imported("B", bJSON)
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(bJSON)), holderPids: [getpid()], at: Date()))
+
+        do {
+            _ = try await sync.switchMainLogin(to: b, knownLogins: [a, bJSON])
+            XCTFail("the switch cannot proceed without a usable login")
+        } catch {}
+
+        XCTAssertEqual(refreshCalls, 0, "the held lineage was refreshed")
+        XCTAssertTrue(writes.isEmpty, "\(writes)")
+        XCTAssertEqual(keychain[mainService], a)
+    }
+
+    // MARK: - Gate fix 4: held back + expired = not a candidate
+
+    func testHeldBackExpiredLoginIsNotASwitchCandidate() throws {
+        let bJSON = login("B", expiresIn: -600)
+        let b = imported("B", bJSON)
+        let cJSON = login("C", expiresIn: 3600)
+        let c = imported("C", cJSON)
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: b), "no record: B is a candidate (the switch refreshes it)")
+
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(bJSON)), holderPids: [getpid()], at: Date()))
+        XCTAssertTrue(sync.isUnavailableAsTarget(for: b),
+                      "held back and expired: switching to it would throw every tick (a notification storm)")
+
+        // A held-back login that has NOT expired needs no refresh: still a candidate.
+        let freshB = imported("B2", login("B2", expiresIn: 3600))
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(freshB.cliCredentialsJSON!)), holderPids: [getpid()], at: Date()))
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: freshB))
+
+        // The policy skips it and picks C.
+        var active = Profile(name: "A", cliCredentialsJSON: login("A", expiresIn: 3600))
+        active.claudeUsage = Self.usage(session: 100)
+        var bp = b; bp.claudeUsage = Self.usage(session: 0)
+        var cp = c; cp.claudeUsage = Self.usage(session: 10)
+        XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [active, bp, cp], after: active, usingFable: false, blockedBeyondFable: true,
+                                                     isLoginDead: sync.isUnavailableAsTarget(for:)), .profile(cp))
+    }
+
+    // MARK: - Gate fix 2: what "released" means
+
+    /// A response streamed AFTER the swap to a request sent BEFORE it moves the
+    /// transcript's mtime past the record, but proves nothing: that session
+    /// never re-read the login.
+    func testAStreamedReplyToAnEarlierRequestDoesNotReleaseTheLineage() throws {
+        let at = Date().addingTimeInterval(-60)
+        try writeTranscript(pid: getpid(), entries: [("user", at.addingTimeInterval(-30)), ("assistant", at.addingTimeInterval(10))])
+        let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: at)
+        XCTAssertFalse(sync.lineageIsReleased(record))
+    }
+
+    func testANewRequestAfterTheSwapThatWasAnsweredReleasesTheLineage() throws {
+        let at = Date().addingTimeInterval(-60)
+        try writeTranscript(pid: getpid(), entries: [("user", at.addingTimeInterval(-30)), ("assistant", at.addingTimeInterval(-20)),
+                                                       ("user", at.addingTimeInterval(5)), ("assistant", at.addingTimeInterval(8))])
+        let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: at)
+        XCTAssertTrue(sync.lineageIsReleased(record))
+    }
+
+    func testARequestAfterTheSwapStillInFlightDoesNotReleaseIt() throws {
+        let at = Date().addingTimeInterval(-60)
+        try writeTranscript(pid: getpid(), entries: [("assistant", at.addingTimeInterval(-20)), ("user", at.addingTimeInterval(5))])
+        let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: at)
+        XCTAssertFalse(sync.lineageIsReleased(record))
+    }
+
+    /// pids recycle: a live process whose start time is not the holder's is
+    /// not the holder; the holder exited.
+    func testARecycledPidDoesNotHoldTheLineage() {
+        let record = MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: "f", holderPids: [getpid()], at: Date().addingTimeInterval(-60),
+            holderStartTimes: ["\(getpid())": Date(timeIntervalSince1970: 1_000)])
+        XCTAssertTrue(sync.lineageIsReleased(record))
+    }
+
+    func testTheSameLiveHolderWithNoNewRequestStillHoldsIt() throws {
+        let started = try XCTUnwrap(ProcessListing.startTime(pid: getpid()))
+        let record = MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: "f", holderPids: [getpid()], at: Date().addingTimeInterval(-60),
+            holderStartTimes: ["\(getpid())": started])
+        XCTAssertFalse(sync.lineageIsReleased(record))
+    }
+
+    /// A record never pins a lineage for ever.
+    func testAHandoffRecordExpires() {
+        let record = MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: "f", holderPids: [getpid()], at: Date().addingTimeInterval(-MainLoginSwapPolicy.handoffRecordTTL - 60))
+        XCTAssertTrue(sync.lineageIsReleased(record))
+    }
+
+    private func writeTranscript(pid: Int32, entries: [(String, Date)]) throws {
+        let sessionId = UUID().uuidString.lowercased()
+        let sessions = sync.sessionsDirectory, project = sync.projectsDirectory.appendingPathComponent("-tmp-proj")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"pid":\#(pid),"sessionId":"\#(sessionId)"}"#.write(to: sessions.appendingPathComponent("\(pid).json"), atomically: true, encoding: .utf8)
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let lines = entries.map { #"{"type":"\#($0.0)","timestamp":"\#(f.string(from: $0.1))","message":{"role":"\#($0.0)","content":"x"}}"# }
+        try (lines.joined(separator: "\n") + "\n").write(to: project.appendingPathComponent("\(sessionId).jsonl"), atomically: true, encoding: .utf8)
+    }
+
+    private static func usage(session: Double) -> ClaudeUsage {
+        let now = Date()
+        return ClaudeUsage(
+            sessionTokensUsed: 0, sessionLimit: 100000, sessionPercentage: session, sessionResetTime: now.addingTimeInterval(3600),
+            weeklyTokensUsed: 0, weeklyLimit: 1000000, weeklyPercentage: 0, weeklyResetTime: now.addingTimeInterval(86400),
+            opusWeeklyTokensUsed: 0, opusWeeklyPercentage: 0, sonnetWeeklyTokensUsed: 0, sonnetWeeklyPercentage: 0, sonnetWeeklyResetTime: nil,
+            designWeeklyTokensUsed: 0, designWeeklyPercentage: 0, designWeeklyResetTime: nil,
+            fableWeeklyTokensUsed: 0, fableWeeklyPercentage: 0, fableWeeklyResetTime: nil,
+            costUsed: nil, costLimit: nil, costCurrency: nil, lastUpdated: now, userTimezone: .current)
     }
 }

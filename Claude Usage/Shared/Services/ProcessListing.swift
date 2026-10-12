@@ -37,8 +37,17 @@ enum ProcessListing {
                 }
             }
             guard !command.isEmpty else { continue }
-            out.append(MainLoginSwapPolicy.RunningProcess(pid: pid, ppid: Int32(info.pbi_ppid), command: command, configDir: nil))
+            out.append(MainLoginSwapPolicy.RunningProcess(pid: pid, ppid: Int32(info.pbi_ppid), command: command, configDir: nil, argvKnown: false))
         }
         return out
+    }
+
+    /// When `pid` started, or nil when there is no such process (or it cannot
+    /// be read). With the pid, it identifies a process across pid reuse.
+    static func startTime(pid: Int32) -> Date? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000)
     }
 }

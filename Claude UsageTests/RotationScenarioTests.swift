@@ -59,8 +59,8 @@ final class RotationScenarioTests: XCTestCase {
         XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 3, keychainFingerprint: "mad", knownFingerprints: ["mad"], keychainLoginNearLimit: true))
         // ... and the replaced lineage is not refreshable until the holders release it.
         let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "mad", holderPids: [1, 2, 3], at: now)
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, alive: { _ in true }, lastRequestAt: { _ in now.addingTimeInterval(-1) }))
-        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, alive: { _ in true }, lastRequestAt: { _ in now.addingTimeInterval(1) }))
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, now: now, process: { _ in .running(startedAt: nil) }, requestedAfter: { _, _ in false }))
+        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, now: now, process: { _ in .running(startedAt: nil) }, requestedAfter: { _, _ in true }))
 
         // Had the hand-off been refused (proactive off), 100% still switches.
         var strict = AutoSwitchDecider(proactive: false)
@@ -123,7 +123,7 @@ final class RotationScenarioTests: XCTestCase {
         let stale = profile("littlewing", session: 0, weekly: 100, weeklyResetIn: 3 * 86400, age: 7 * 3600)
         let t = tick(&decider, active: active, profiles: [active, stale])
         XCTAssertEqual(t.decision, .noTarget(notify: true))
-        XCTAssertEqual(t.nextLine, "next: none · earliest littlewing? \(fmt(stale.claudeUsage!.weeklyResetTime))")
+        XCTAssertEqual(t.nextLine, "next: littlewing · \(fmt(stale.claudeUsage!.weeklyResetTime))")
     }
 
     func testD_StaleReadingWhoseWindowPassedIsPresumedFree_Replay2359() {
@@ -214,6 +214,64 @@ final class RotationScenarioTests: XCTestCase {
         var littlewing = profile("littlewing", session: 3, weekly: 3)
         littlewing.oauthAccountJSON = #"{"accountUuid":"u-littlewing","emailAddress":"littlewing@x.com"}"#
         XCTAssertNil(sync.usageAccessToken(fromSharedLogin: madmatterLogin, for: littlewing))
+    }
+
+    // MARK: - H. replay: 2026-10-12 2:49 PM to 5:10 PM — everything spent, the status line says who is next and when
+
+    /// App log: 2:49:45 PM littlewing hit its session limit, switched to matt.
+    /// 2:56 PM to 5:10 PM "All profiles at session/weekly limit or
+    /// unavailable". 5:10:18 PM "matt hit weekly limit, switching to
+    /// littlewing": the switch landed the moment littlewing's window reset.
+    /// For those two hours nothing told the operator "next: littlewing at
+    /// 5:10 PM". A spent window's reset time is a recorded fact, however old
+    /// the reading, and it is where the switcher goes: NEXT names it.
+    func testH_EverythingSpentNamesTheEarliestResetUntilTheSwitchLands() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = et
+        func at(_ hour: Int, _ minute: Int, _ second: Int = 0, day: Int = 12) -> Date {
+            calendar.date(from: DateComponents(year: 2026, month: 10, day: day, hour: hour, minute: minute, second: second))!
+        }
+        func reading(session: Double, sessionReset: Date, weekly: Double, weeklyReset: Date, read: Date) -> ClaudeUsage {
+            var u = usage(session: session, weekly: weekly)
+            u.sessionResetTime = sessionReset
+            u.weeklyResetTime = weeklyReset
+            u.fableWeeklyResetTime = weeklyReset
+            u.lastUpdated = read
+            return u
+        }
+        // littlewing: session spent at 2:49:45 PM, resets 5:10 PM; never read again (it is not active).
+        var littlewing = profile("littlewing", session: 0, weekly: 0)
+        littlewing.claudeUsage = reading(session: 100, sessionReset: at(17, 10), weekly: 60, weeklyReset: at(15, 0, day: 17), read: at(14, 49, 45))
+        // goose: weekly spent until Saturday, read by mission control a minute ago at every tick.
+        var goose = profile("goose", session: 0, weekly: 0)
+        var decider = AutoSwitchDecider()
+
+        var matt = profile("matt", session: 0, weekly: 0)
+        for (tick, expectNotify) in [(at(14, 56), true), (at(15, 30), false), (at(17, 9, 30), false)] {
+            matt.claudeUsage = reading(session: 20, sessionReset: tick.addingTimeInterval(3600), weekly: 100, weeklyReset: at(14, 59, day: 17), read: tick)
+            goose.claudeUsage = reading(session: 0, sessionReset: tick.addingTimeInterval(3600), weekly: 100, weeklyReset: at(14, 0, day: 17), read: tick.addingTimeInterval(-60))
+            let profiles = [littlewing, matt, goose]
+
+            XCTAssertEqual(decider.decide(current: matt, profiles: profiles, usingFable: false, now: tick), .noTarget(notify: expectNotify))
+            let status = AutoSwitchStatus.build(profiles: profiles, activeId: matt.id, now: tick)
+            let time: (Date) -> String = { AutoSwitchStatus.americanTime($0, now: tick, timeZone: self.et) }
+            XCTAssertTrue(status.stuck)
+            XCTAssertEqual(status.nextLine(timeFormatter: time), "next: littlewing · 5:10 PM",
+                           "at \(time(tick)): the earliest reset is named, fresh reading or not")
+            let state = status.stateFileContents(timeFormatter: time)
+            for expected in ["STUCK=1", "NEXT=next: littlewing · 5:10 PM", "NEXT_KIND=limited", "NEXT_NAME=littlewing", "NEXT_AT=5:10 PM"] {
+                XCTAssertTrue(state.split(separator: "\n").contains(Substring(expected)), "\(expected) missing at \(time(tick)):\n\(state)")
+            }
+        }
+
+        // 5:10:18 PM: littlewing's window has reset; the switch lands there.
+        let landed = at(17, 10, 18)
+        matt.claudeUsage = reading(session: 20, sessionReset: landed.addingTimeInterval(3600), weekly: 100, weeklyReset: at(14, 59, day: 17), read: landed)
+        goose.claudeUsage = reading(session: 0, sessionReset: landed.addingTimeInterval(3600), weekly: 100, weeklyReset: at(14, 0, day: 17), read: landed.addingTimeInterval(-60))
+        XCTAssertEqual(decider.decide(current: matt, profiles: [littlewing, matt, goose], usingFable: false, now: landed),
+                       .switchTo(littlewing, withoutFable: false))
+        let status = AutoSwitchStatus.build(profiles: [littlewing, matt, goose], activeId: matt.id, now: landed)
+        XCTAssertEqual(status.nextLine { _ in "" }, "next: littlewing? (ready)")
     }
 
     // MARK: - Fixtures

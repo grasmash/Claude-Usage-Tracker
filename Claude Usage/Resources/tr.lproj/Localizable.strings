@@ -1091,6 +1091,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "%@ önce mission control tarafından okundu (bu hesap etkin değil).";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@: oturum açılması gerekiyor. Terminal'de claude-usage-login çalıştırın ve %@ olarak oturum açın. O zamana kadar otomatik geçiş bu hesabı atlar.";
 "popover.reading.stale_idle" = "Okuma %@ önce. Etkin olmayan bir hesap için normal: bir sonraki kullanımda yeniden okunur ve otomatik geçiş yine bu hesaba geçebilir. İşlem gerekmez.";
 "popover.reading.stale_idle_mc" = "Okuma %@ önce (sonuncusu mission control'den). Etkin olmayan bir hesap için normal: otomatik geçiş yine bu hesaba geçebilir. İşlem gerekmez.";

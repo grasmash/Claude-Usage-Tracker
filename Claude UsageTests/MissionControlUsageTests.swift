@@ -456,9 +456,9 @@ final class MissionControlUsageTests: XCTestCase {
                        updatedAt: Date) -> ClaudeUsage {
         ClaudeUsage(
             sessionTokensUsed: 0, sessionLimit: 0, sessionPercentage: session,
-            sessionResetTime: Date().addingTimeInterval(3600),
+            sessionResetTime: now.addingTimeInterval(3600),
             weeklyTokensUsed: 0, weeklyLimit: 1_000_000, weeklyPercentage: weekly,
-            weeklyResetTime: Date().addingTimeInterval(weeklyResetIn),
+            weeklyResetTime: now.addingTimeInterval(weeklyResetIn),
             opusWeeklyTokensUsed: 0, opusWeeklyPercentage: 0,
             sonnetWeeklyTokensUsed: 0, sonnetWeeklyPercentage: 0, sonnetWeeklyResetTime: nil,
             designWeeklyTokensUsed: 0, designWeeklyPercentage: 0, designWeeklyResetTime: nil,

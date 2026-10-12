@@ -1085,6 +1085,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "mission control 于 %@ 前读取（此账户未激活）。";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@：需要登录。在终端运行 claude-usage-login，并以 %@ 登录。在此之前自动切换会跳过此账户。";
 "popover.reading.stale_idle" = "读数来自 %@ 前。未激活的账户这是正常的：下次使用时会重新读取，自动切换仍可切换到它。无需操作。";
 "popover.reading.stale_idle_mc" = "读数来自 %@ 前（最后一次来自 mission control）。未激活的账户这是正常的：自动切换仍可切换到它。无需操作。";

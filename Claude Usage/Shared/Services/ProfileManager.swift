@@ -245,7 +245,10 @@ class ProfileManager: ObservableObject {
 
     /// `selectedBy` is recorded in the selection file: `auto` for a switch the
     /// tracker made (limit reached, dead login), `user` for a click.
-    func activateProfile(_ id: UUID, selectedBy: String = "user") async {
+    /// `handoff`: an automatic PROACTIVE hand-off (the active account is near,
+    /// not at, its limit): only it may move working sessions off a near-limit
+    /// login, and only a written login moves the tracker.
+    func activateProfile(_ id: UUID, selectedBy: String = "user", handoff: Bool = false) async {
         guard !switchingSemaphore else {
             LoggingService.shared.log("Profile switch already in progress, ignoring")
             return
@@ -303,10 +306,17 @@ class ProfileManager: ObservableObject {
             pendingMainLoginPrevious = previousName
             let result: Result<ClaudeCodeSyncService.MainLoginSwitch, Error>
             do {
-                let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id)
+                let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id, handoff: handoff)
                 // Reload: the switch may have refreshed and stored the login.
                 profiles = profileStore.loadProfiles()
-                handleMainLoginSwitch(outcome, for: updatedProfile, previousName: previousName, announceLater: false)
+                if handoff, case .refused(let reason) = outcome {
+                    // A refused hand-off changes nothing and is retried next
+                    // tick: no "not applied" notice per attempt, and nothing
+                    // left pending (the tracker stays where the sessions are).
+                    LoggingService.shared.log("AutoSwitch: hand-off to '\(updatedProfile.name)' refused (\(reason)); staying on '\(previousName)', retried next tick")
+                } else {
+                    handleMainLoginSwitch(outcome, for: updatedProfile, previousName: previousName, announceLater: false)
+                }
                 result = .success(outcome)
             } catch {
                 pendingMainLoginSwitch = false
@@ -320,8 +330,9 @@ class ProfileManager: ObservableObject {
             }
             // An automatic switch whose login could not be applied does not move
             // the tracker: see `AutoSwitchPolicy.activateAfterMainLoginSwitch`.
-            guard AutoSwitchPolicy.activateAfterMainLoginSwitch(result, selectedBy: selectedBy) else {
+            guard AutoSwitchPolicy.activateAfterMainLoginSwitch(result, selectedBy: selectedBy, handoff: handoff) else {
                 LoggingService.shared.log("AutoSwitch: '\(updatedProfile.name)' could not take the shared login; the active profile stays '\(previousName)'")
+                if handoff { pendingMainLoginSwitch = false }
                 switchingSemaphore = false
                 isSwitchingProfile = false
                 return
@@ -379,12 +390,8 @@ class ProfileManager: ObservableObject {
             }
         }
 
-        // Update profile name in statusline config
-        do {
-            try StatuslineService.shared.updateProfileNameInConfig(updated.name)
-        } catch {
-            LoggingService.shared.logError("Failed to update statusline profile name (non-fatal)", error: error)
-        }
+        // The status line's account name and its usage figures change together.
+        StatuslineService.shared.activeAccountChanged(to: updated)
 
         switchingSemaphore = false
         isSwitchingProfile = false

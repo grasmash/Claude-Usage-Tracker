@@ -240,6 +240,11 @@ final class AutoStartSessionService {
         return try parseUsageResponse(data)  // (usage, hasOpenWindow)
     }
 
+    /// The usage response parser, for tests.
+    func parseUsageResponseForTesting(_ data: Data) throws -> ClaudeUsage {
+        try parseUsageResponse(data).usage
+    }
+
     private func parseUsageResponse(_ data: Data) throws -> (usage: ClaudeUsage, hasOpenWindow: Bool) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AppError(code: .apiParsingFailed, message: "Failed to parse usage data", isRecoverable: false)
@@ -306,6 +311,12 @@ final class AutoStartSessionService {
             }
         }
 
+        // Fable: legacy `seven_day_fable`, overridden by a Fable/Mythos entry in
+        // `limits[]` (what newer responses send, and what mc reads). This
+        // reading is stored with a fresh timestamp, so a missing Fable value
+        // here would read as 0% Fable used: invented headroom.
+        let fable = Self.fableWindow(in: json, parse: parseUtilization)
+
         let weeklyLimit = Constants.weeklyLimit
         let weeklyTokens = Int(Double(weeklyLimit) * (weeklyPercentage / 100.0))
         let opusTokens = Int(Double(weeklyLimit) * (opusPercentage / 100.0))
@@ -328,9 +339,9 @@ final class AutoStartSessionService {
             designWeeklyTokensUsed: 0,
             designWeeklyPercentage: 0,
             designWeeklyResetTime: nil,
-            fableWeeklyTokensUsed: 0,
-            fableWeeklyPercentage: 0,
-            fableWeeklyResetTime: nil,
+            fableWeeklyTokensUsed: Int(Double(weeklyLimit) * (fable.percent / 100.0)),
+            fableWeeklyPercentage: fable.percent,
+            fableWeeklyResetTime: fable.resetsAt,
             costUsed: nil,
             costLimit: nil,
             costCurrency: nil,
@@ -338,6 +349,36 @@ final class AutoStartSessionService {
             userTimezone: .current
         )
         return (usage, hasOpenWindow)
+    }
+
+    /// The Fable weekly window of a usage response, read the way mc's
+    /// `parse_usage_fable` reads it: `seven_day_fable`, then any
+    /// `limits[]` entry of kind `weekly_scoped` whose model id contains, or
+    /// display name is, "fable"/"mythos" (that entry wins when it has a percent).
+    static func fableWindow(in json: [String: Any], parse: (Any) -> Double) -> (percent: Double, resetsAt: Date?) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        func date(_ value: Any?) -> Date? {
+            guard let text = value as? String else { return nil }
+            return formatter.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+        }
+        var percent = 0.0
+        var resetsAt: Date?
+        if let legacy = json["seven_day_fable"] as? [String: Any], let utilization = legacy["utilization"] {
+            percent = parse(utilization)
+            resetsAt = date(legacy["resets_at"])
+        }
+        for limit in json["limits"] as? [[String: Any]] ?? [] {
+            guard limit["kind"] as? String == "weekly_scoped",
+                  let model = (limit["scope"] as? [String: Any])?["model"] as? [String: Any],
+                  let value = limit["percent"], !(value is NSNull) else { continue }
+            let id = (model["id"] as? String)?.lowercased() ?? ""
+            let name = (model["display_name"] as? String)?.lowercased() ?? ""
+            guard ["fable", "mythos"].contains(where: { name == $0 || id.contains($0) }) else { continue }
+            percent = parse(value)
+            resetsAt = date(limit["resets_at"]) ?? resetsAt
+        }
+        return (percent, resetsAt)
     }
 
     private func parseUtilization(_ value: Any) -> Double {

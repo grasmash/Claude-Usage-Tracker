@@ -7,6 +7,10 @@ class MenuBarManager: NSObject, ObservableObject {
     private var statusBarUIManager: StatusBarUIManager?
     private var refreshTimer: Timer?
     @Published private(set) var usage: ClaudeUsage = .empty
+    /// The active account was just switched to and has no proven reading yet:
+    /// the menu bar shows the plain logo ("not measured"), never the previous
+    /// account's figures and never a 0% it did not read.
+    @Published private(set) var activeReadingPending = false
     @Published private(set) var status: ClaudeStatus = .unknown
     @Published private(set) var apiUsage: APIUsage?
     @Published private(set) var isRefreshing: Bool = false
@@ -380,10 +384,13 @@ class MenuBarManager: NSObject, ObservableObject {
 
         // 1. Load saved data from new profile (for immediate display)
         await MainActor.run {
-            if let savedUsage = profile.claudeUsage {
-                self.usage = savedUsage
-            } else {
+            switch ActiveAccountReading.forNewlyActive(profile) {
+            case .proven(let reading):
+                self.usage = reading
+                self.activeReadingPending = false
+            case .notMeasured:
                 self.usage = .empty
+                self.activeReadingPending = true
             }
 
             if let savedAPIUsage = profile.apiUsage {
@@ -392,6 +399,10 @@ class MenuBarManager: NSObject, ObservableObject {
                 self.apiUsage = nil
             }
         }
+
+        // The status line's NEXT is relative to the active account: rewrite it
+        // with the switch, not a refresh later.
+        writeAutoSwitchStatus()
 
         // 2. Update refresh interval with profile's setting
         restartAutoRefreshWithInterval(profile.refreshInterval)
@@ -725,7 +736,8 @@ class MenuBarManager: NSObject, ObservableObject {
             // Single profile mode - use the standard update
             statusBarUIManager?.updateAllButtons(
                 usage: usage,
-                apiUsage: apiUsage
+                apiUsage: apiUsage,
+                readingPending: activeReadingPending
             )
         }
     }
@@ -1080,6 +1092,7 @@ class MenuBarManager: NSObject, ObservableObject {
                         // If this is the active profile, also update the manager's usage
                         if profile.id == self.profileManager.activeProfile?.id {
                             self.usage = newUsage
+                            self.activeReadingPending = false
 
                             // Write statusline cache for instant CLI rendering (Claude Code only)
                             if profile.provider.descriptor.capabilities.cliAccountSync,
@@ -1316,6 +1329,7 @@ class MenuBarManager: NSObject, ObservableObject {
                         return
                     }
                     self.usage = newUsage
+                    self.activeReadingPending = false
                     self.profileManager.saveClaudeUsage(newUsage, for: saveTo)
 
                     // Write statusline cache for instant CLI rendering (Claude Code only)
@@ -1572,7 +1586,7 @@ class MenuBarManager: NSObject, ObservableObject {
         let nextProfile: Profile
         switch autoSwitchDecider.decide(
             current: current, profiles: profiles, usingFable: usingFable,
-            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+            isLoginDead: ClaudeCodeSyncService.shared.isUnavailableAsTarget(for:)
         ) {
         case .stay:
             return
@@ -1625,7 +1639,8 @@ class MenuBarManager: NSObject, ObservableObject {
             activeId: profileManager.activeProfile?.id,
             usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable() || ModelFallback().isActive,
             proactive: SharedDataStore.shared.loadAutoSwitchProactiveEnabled(),
-            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:),
+            isHeldBack: { ClaudeCodeSyncService.shared.isHeldByHandoff($0) }
         )
         let contents = status.stateFileContents { AutoSwitchStatus.americanTime($0) }
         let url = Constants.ClaudePaths.claudeDirectory.appendingPathComponent(".autoswitch-state")
@@ -1655,7 +1670,7 @@ class MenuBarManager: NSObject, ObservableObject {
         let target = AutoSwitchPolicy.switchTarget(
             in: profiles, after: currentProfile,
             usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(), blockedBeyondFable: true,
-            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+            isLoginDead: ClaudeCodeSyncService.shared.isUnavailableAsTarget(for:)
         )
         let nextProfile: Profile
         switch target {
@@ -1711,7 +1726,7 @@ class MenuBarManager: NSObject, ObservableObject {
         let active = profileManager.activeProfile
         let action = AutoSwitchPolicy.fableRestoreAction(
             profiles: profileManager.profiles, activeId: active?.id,
-            isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
+            isLoginDead: ClaudeCodeSyncService.shared.isUnavailableAsTarget(for:)
         )
         if action != .switchFirst { switchFirstLogged = false }
         if case .wait = action {} else { lastLoggedRestoreWait = nil }
@@ -1763,7 +1778,7 @@ class MenuBarManager: NSObject, ObservableObject {
         let toName = nextProfile.name
         let notificationSettings = currentProfile.notificationSettings
         Task {
-            await profileManager.activateProfile(nextProfile.id, selectedBy: "auto")
+            await profileManager.activateProfile(nextProfile.id, selectedBy: "auto", handoff: handoff)
 
             await MainActor.run {
                 self.autoSwitchInFlight = false

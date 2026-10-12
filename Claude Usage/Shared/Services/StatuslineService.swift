@@ -8,6 +8,62 @@ class StatuslineService {
 
     private init() {}
 
+    /// Tests point this at a temporary directory; nothing else sets it.
+    var claudeDirectoryOverride: URL?
+    var claudeDirectory: URL { claudeDirectoryOverride ?? Constants.ClaudePaths.claudeDirectory }
+
+    /// The active account changed: the status line's account name and its
+    /// usage figures must change together.
+    ///
+    /// The status line reads the name and the figures from ONE file
+    /// (`.statusline-usage-cache`), replaced atomically: the new account's
+    /// proven reading, or `READING=1` ("reading…") when it has none yet. Never
+    /// the previous account's figures under the new name.
+    func activeAccountChanged(to profile: Profile, now: Date = Date()) {
+        publishActiveAccount(name: profile.name, reading: ActiveAccountReading.forNewlyActive(profile, now: now), now: now)
+    }
+
+    /// Writes the account name and its reading in one atomic file replace,
+    /// then mirrors the name into the config (used only when the cache has
+    /// aged out and the script fetches on its own).
+    func publishActiveAccount(name: String?, reading: ActiveAccountReading, now: Date = Date()) {
+        guard !AppEnvironment.isRunningTests || claudeDirectoryOverride != nil else { return }
+        let cachePath = claudeDirectory.appendingPathComponent(".statusline-usage-cache")
+        try? Self.usageCacheContents(name: name, reading: reading, now: now).write(to: cachePath, atomically: true, encoding: .utf8)
+        if let name {
+            do {
+                try updateProfileNameInConfig(name)
+            } catch {
+                LoggingService.shared.logError("Failed to update statusline profile name (non-fatal)", error: error)
+            }
+        }
+    }
+
+    /// The usage cache file: `KEY=value` lines the status-line script reads.
+    static func usageCacheContents(name: String?, reading: ActiveAccountReading, now: Date) -> String {
+        var lines: [String] = []
+        let formatter = ISO8601DateFormatter()
+        switch reading {
+        case .notMeasured:
+            lines.append("READING=1")
+            lines.append("TIMESTAMP=\(Int(now.timeIntervalSince1970))")
+            if let name { lines.append("PROFILE_NAME=\(name)") }
+        case .proven(let usage):
+            lines.append("UTILIZATION=\(Int(usage.effectiveSessionPercentage(now: now)))")
+            lines.append("RESETS_AT=\(formatter.string(from: usage.sessionResetTime))")
+            lines.append("TIMESTAMP=\(Int(now.timeIntervalSince1970))")
+            if let name { lines.append("PROFILE_NAME=\(name)") }
+            lines.append("WEEKLY_UTILIZATION=\(Int(usage.weeklyPercentage))")
+            lines.append("WEEKLY_RESETS_AT=\(formatter.string(from: usage.weeklyResetTime))")
+            if let costUsed = usage.costUsed, let costLimit = usage.costLimit, let costCurrency = usage.costCurrency, costLimit > 0 {
+                lines.append("COST_USED=" + String(format: "%.2f", costUsed / 100.0))
+                lines.append("COST_LIMIT=" + String(format: "%.2f", costLimit / 100.0))
+                lines.append("COST_CURRENCY=\(costCurrency)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Embedded Scripts
 
     /// Swift script that fetches Claude usage data from the API.
@@ -114,7 +170,7 @@ exit(1)
     /// Bash script that builds the statusline display.
     /// Installed to ~/.claude/statusline-command.sh and configured in Claude Code settings.json.
     /// Reads user preferences from ~/.claude/statusline-config.txt and displays selected components.
-    private let bashScript = """
+    let bashScript = """
 #!/bin/bash
 config_file="$HOME/.claude/statusline-config.txt"
 if [ -f "$config_file" ]; then
@@ -188,6 +244,23 @@ else
   element_color_pace=""
   element_color_weekly=""
   element_color_extra=""
+fi
+
+# The account name and its usage figures come from ONE file the app replaces
+# atomically (.statusline-usage-cache), so they always belong to the same
+# account. READING=1: the account was just switched to and has no proven
+# reading yet; its figures show "reading…", never the previous account's.
+usage_cache="$HOME/.claude/.statusline-usage-cache"
+usage_reading=0
+if [ -f "$usage_cache" ]; then
+  cache_profile=$(sed -n 's/^PROFILE_NAME=//p' "$usage_cache")
+  cache_stamp=$(sed -n 's/^TIMESTAMP=//p' "$usage_cache")
+  if [ "$(sed -n 's/^READING=//p' "$usage_cache")" = "1" ]; then
+    usage_reading=1
+    [ -n "$cache_profile" ] && profile_name="$cache_profile"
+  elif [ -n "$cache_profile" ] && [ -n "$cache_stamp" ] && [ $(( $(date +%s) - cache_stamp )) -lt 300 ]; then
+    profile_name="$cache_profile"
+  fi
 fi
 
 input=$(cat)
@@ -421,7 +494,13 @@ if [ "$show_context" = "1" ]; then
 fi
 
 usage_text=""
-if [ "$show_usage" = "1" ]; then
+if [ "$show_usage" = "1" ] && [ "$usage_reading" = "1" ]; then
+  if [ "$show_usage_label" = "1" ]; then
+    usage_text="${GRAY}Usage: reading…${RESET}"
+  else
+    usage_text="${GRAY}reading…${RESET}"
+  fi
+elif [ "$show_usage" = "1" ]; then
   # Try reading from cache first (written by Claude Usage app on each refresh)
   cache_file="$HOME/.claude/.statusline-usage-cache"
   swift_result=""
@@ -594,7 +673,7 @@ if [ "$show_usage" = "1" ]; then
 fi
 
 weekly_text=""
-if [ "$show_weekly" = "1" ] && [ "$show_usage" = "1" ]; then
+if [ "$show_weekly" = "1" ] && [ "$show_usage" = "1" ] && [ "$usage_reading" != "1" ]; then
   cache_file="$HOME/.claude/.statusline-usage-cache"
   weekly_util=""
   weekly_reset=""
@@ -732,7 +811,7 @@ if [ "$show_weekly" = "1" ] && [ "$show_usage" = "1" ]; then
 fi
 
 extra_usage_text=""
-if [ "$show_extra_usage" = "1" ] && [ "$show_usage" = "1" ]; then
+if [ "$show_extra_usage" = "1" ] && [ "$show_usage" = "1" ] && [ "$usage_reading" != "1" ]; then
   cache_file="$HOME/.claude/.statusline-usage-cache"
   cost_used=""
   cost_limit=""
@@ -848,6 +927,18 @@ if [ -n "$signin_text" ]; then
   output="${output}${signin_text}"
 fi
 
+# Where auto-switch goes next, and when (the app's NEXT line), in every state,
+# including while the active account is at its limit.
+next_text=""
+if [ -f "$switch_state" ] && [ $(( $(date +%s) - $(stat -f %m "$switch_state" 2>/dev/null || echo 0) )) -lt 600 ]; then
+  next_line=$(sed -n 's/^NEXT=//p' "$switch_state")
+  [ -n "$next_line" ] && next_text="${GRAY}${next_line}${RESET}"
+fi
+if [ -n "$next_text" ]; then
+  [ -n "$output" ] && output="${output}${separator}"
+  output="${output}${next_text}"
+fi
+
 printf "%s\\n" "$output"
 """
 
@@ -867,7 +958,7 @@ printf "%s\\n" "$output"
             throw StatuslineError.providerNotSupported
         }
 
-        let claudeDir = Constants.ClaudePaths.claudeDirectory
+        let claudeDir = claudeDirectory
 
         if !FileManager.default.fileExists(atPath: claudeDir.path) {
             try FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
@@ -926,7 +1017,7 @@ printf "%s\\n" "$output"
 
     /// Removes the session key from the statusline Swift script
     func removeSessionKeyFromScript() throws {
-        let swiftDestination = Constants.ClaudePaths.claudeDirectory
+        let swiftDestination = claudeDirectory
             .appendingPathComponent("fetch-claude-usage.swift")
 
         // Replace with placeholder script that returns error
@@ -969,7 +1060,7 @@ printf "%s\\n" "$output"
         showWeeklyLabel: Bool = true,
         showExtraUsage: Bool = false
     ) throws {
-        let configPath = Constants.ClaudePaths.claudeDirectory
+        let configPath = claudeDirectory
             .appendingPathComponent("statusline-config.txt")
 
         let colorModeString: String
@@ -1034,7 +1125,7 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
     /// Called during profile switches, and on every usage-cache write so a
     /// switch the tracker merely followed (a /login in Claude Code) is shown too.
     func updateProfileNameInConfig(_ profileName: String) throws {
-        let configPath = Constants.ClaudePaths.claudeDirectory
+        let configPath = claudeDirectory
             .appendingPathComponent("statusline-config.txt")
 
         guard FileManager.default.fileExists(atPath: configPath.path) else { return }
@@ -1061,7 +1152,7 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
     /// When enabling, also injects the session key into the Swift script
     /// When disabling, removes the session key from the Swift script
     func updateClaudeCodeSettings(enabled: Bool) throws {
-        let settingsPath = Constants.ClaudePaths.claudeDirectory
+        let settingsPath = claudeDirectory
             .appendingPathComponent("settings.json")
 
         let homeDir = Constants.ClaudePaths.homeDirectory.path
@@ -1108,48 +1199,20 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
     // MARK: - Status
 
     var isInstalled: Bool {
-        let swiftScript = Constants.ClaudePaths.claudeDirectory
+        let swiftScript = claudeDirectory
             .appendingPathComponent("fetch-claude-usage.swift")
 
-        let bashScript = Constants.ClaudePaths.claudeDirectory
+        let bashScript = claudeDirectory
             .appendingPathComponent("statusline-command.sh")
 
         return FileManager.default.fileExists(atPath: swiftScript.path) &&
                FileManager.default.fileExists(atPath: bashScript.path)
     }
 
-    /// Writes usage data to cache file for fast bash script access
+    /// Writes a proven reading of the account `profileName` (the account the
+    /// fetch was made for) to the cache the status line reads.
     func writeUsageCache(usage: ClaudeUsage, profileName: String? = nil) {
-        let cachePath = Constants.ClaudePaths.claudeDirectory
-            .appendingPathComponent(".statusline-usage-cache")
-
-        let formatter = ISO8601DateFormatter()
-        var cacheContent = """
-        UTILIZATION=\(Int(usage.effectiveSessionPercentage))
-        RESETS_AT=\(formatter.string(from: usage.sessionResetTime))
-        TIMESTAMP=\(Int(Date().timeIntervalSince1970))
-        """
-
-        if let name = profileName {
-            cacheContent += "\nPROFILE_NAME=\(name)"
-            // The status line takes the name from its config file and the
-            // numbers from this cache; keep them on the same account.
-            try? updateProfileNameInConfig(name)
-        }
-
-        let weeklyPct = Int(usage.weeklyPercentage)
-        cacheContent += "\nWEEKLY_UTILIZATION=\(weeklyPct)"
-        cacheContent += "\nWEEKLY_RESETS_AT=\(formatter.string(from: usage.weeklyResetTime))"
-
-        if let costUsed = usage.costUsed, let costLimit = usage.costLimit, let costCurrency = usage.costCurrency, costLimit > 0 {
-            let usedStr = String(format: "%.2f", costUsed / 100.0)
-            let limitStr = String(format: "%.2f", costLimit / 100.0)
-            cacheContent += "\nCOST_USED=\(usedStr)"
-            cacheContent += "\nCOST_LIMIT=\(limitStr)"
-            cacheContent += "\nCOST_CURRENCY=\(costCurrency)"
-        }
-
-        try? cacheContent.write(to: cachePath, atomically: true, encoding: .utf8)
+        publishActiveAccount(name: profileName, reading: .proven(usage))
     }
 
     /// Updates scripts only if already installed (installation is optional)

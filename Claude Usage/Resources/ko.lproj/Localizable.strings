@@ -1108,6 +1108,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "%@ 전에 mission control이 읽음 (이 계정은 활성 상태가 아님).";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@: 로그인 필요. 터미널에서 claude-usage-login을 실행하고 %@(으)로 로그인하세요. 그때까지 자동 전환은 이 계정을 건너뜁니다.";
 "popover.reading.stale_idle" = "%@ 전 측정값입니다. 비활성 계정에서는 정상입니다. 다음에 사용할 때 다시 읽으며, 자동 전환도 여전히 가능합니다. 조치할 필요 없음.";
 "popover.reading.stale_idle_mc" = "%@ 전 측정값입니다 (마지막은 mission control). 비활성 계정에서는 정상이며 자동 전환도 여전히 가능합니다. 조치할 필요 없음.";

@@ -1097,6 +1097,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "mission control đã đọc %@ trước (tài khoản này không hoạt động).";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@: cần đăng nhập. Chạy claude-usage-login trong Terminal và đăng nhập bằng %@. Tự động chuyển sẽ bỏ qua tài khoản này cho đến lúc đó.";
 "popover.reading.stale_idle" = "Số liệu từ %@ trước. Bình thường với tài khoản không hoạt động: sẽ được đọc lại khi dùng lần tới, và tự động chuyển vẫn có thể chuyển sang. Không cần làm gì.";
 "popover.reading.stale_idle_mc" = "Số liệu từ %@ trước (lần cuối từ mission control). Bình thường với tài khoản không hoạt động: tự động chuyển vẫn có thể chuyển sang. Không cần làm gì.";

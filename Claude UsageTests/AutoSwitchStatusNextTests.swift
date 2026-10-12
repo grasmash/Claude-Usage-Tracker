@@ -54,14 +54,16 @@ final class AutoSwitchStatusNextTests: XCTestCase {
         XCTAssertTrue(status.stuck)
     }
 
-    func testNoFreshCandidateShowsNoneAndTheEarliestPresumedReset() {
+    func testNoFreshCandidateStillNamesTheEarliestReset() {
         let active = profile("madmatter", session: 100, weekly: 40)
-        // Stale readings at 100% weekly with future resets: unknown, not candidates (the midday state).
+        // Stale readings at 100% weekly with future resets (the midday state): not
+        // targets now, but their reset times are recorded facts and the switcher
+        // goes to the first one that passes.
         let staleA = profile("littlewing", session: 0, weekly: 100, weeklyResetIn: 3 * 86400, age: 7 * 3600)
         let staleB = profile("goose", session: 0, weekly: 100, weeklyResetIn: 86400, age: 20 * 3600)
         let status = AutoSwitchStatus.build(profiles: [active, staleA, staleB], activeId: active.id, now: now)
         let expected = AutoSwitchStatus.americanTime(staleB.claudeUsage!.weeklyResetTime, now: now, timeZone: et)
-        XCTAssertEqual(line(status), "next: none · earliest goose? \(expected)")
+        XCTAssertEqual(line(status), "next: goose · \(expected)")
     }
 
     func testNoOtherAccountAtAll() {

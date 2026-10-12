@@ -1099,6 +1099,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "%@前に mission control が取得（このアカウントは非アクティブです）。";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@: サインインが必要です。ターミナルで claude-usage-login を実行し、%@ としてサインインしてください。それまで自動切り替えはこのアカウントをスキップします。";
 "popover.reading.stale_idle" = "%@前の値です。非アクティブなアカウントでは正常です。次に使うときに再取得され、自動切り替えの対象にもなります。操作は不要です。";
 "popover.reading.stale_idle_mc" = "%@前の値です（最後は mission control から）。非アクティブなアカウントでは正常です。自動切り替えの対象にもなります。操作は不要です。";

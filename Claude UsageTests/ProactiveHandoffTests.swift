@@ -143,26 +143,43 @@ final class ProactiveHandoffTests: XCTestCase {
     }
 
     /// After a hand-off under working holders the replaced login's lineage may
-    /// still sit in a session's memory. It is RELEASED by a holder once that
-    /// process has exited or has made a request after the hand-off signal (its
-    /// transcript was written after the touch — Claude Code re-reads the
-    /// credentials file's mtime before each request and drops its cached
-    /// login when it changed). Until every holder has released it, the tracker
-    /// must not refresh that stored login: a refresh then would be a second use
-    /// of a single-use refresh token lineage.
+    /// still sit in a session's memory. A holder RELEASES it once that process
+    /// has exited (or its pid now names another process), or once it made a
+    /// NEW request after the hand-off signal that was answered (Claude Code
+    /// re-reads the credentials file's mtime before each request and drops its
+    /// cached login when it changed). Until every holder has released it, the
+    /// tracker must not refresh that stored login: a refresh then would be a
+    /// second use of a single-use refresh token lineage.
     func testHandedOffLineageIsRefreshableOnlyOnceEveryHolderReleasedIt() {
         let t0 = now
         let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11, 22], at: t0)
+        let both: (Int32) -> MainLoginSwapPolicy.HolderProcess = { _ in .running(startedAt: nil) }
+        let only22: (Int32) -> MainLoginSwapPolicy.HolderProcess = { $0 == 22 ? .running(startedAt: nil) : .gone }
         // Nobody released: refuse.
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, alive: { _ in true }, lastRequestAt: { _ in nil }))
-        // 11 exited, 22 made a request after the touch: released.
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, now: t0, process: both, requestedAfter: { _, _ in false }))
+        // 11 exited, 22 made an answered request after the touch: released.
+        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, now: t0, process: only22, requestedAfter: { pid, _ in pid == 22 }))
+        // 22 has not: still holding.
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, now: t0, process: only22, requestedAfter: { _, _ in false }))
+        // Past the TTL nothing is held back any more.
         XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(
-            record, alive: { $0 == 22 }, lastRequestAt: { $0 == 22 ? t0.addingTimeInterval(5) : nil }))
-        // 22's last request predates the touch: still holding.
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(
-            record, alive: { $0 == 22 }, lastRequestAt: { $0 == 22 ? t0.addingTimeInterval(-5) : nil }))
-        // A holder whose transcript cannot be found is assumed to still hold.
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, alive: { $0 == 22 }, lastRequestAt: { _ in nil }))
+            record, now: t0.addingTimeInterval(MainLoginSwapPolicy.handoffRecordTTL + 1), process: both, requestedAfter: { _, _ in false }))
+    }
+
+    /// The release proof reads the transcript: a new user entry after the
+    /// signal, then an assistant entry. A reply streamed after the signal to a
+    /// request sent before it is not one.
+    func testTranscriptReleaseProof() {
+        let at = now
+        func line(_ type: String, _ offset: TimeInterval) -> String {
+            let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return #"{"type":"\#(type)","timestamp":"\#(f.string(from: at.addingTimeInterval(offset)))"}"#
+        }
+        XCTAssertFalse(MainLoginSwapPolicy.transcriptShowsAnsweredRequest(after: at, transcript: [line("user", -5), line("assistant", 3)].joined(separator: "\n")))
+        XCTAssertFalse(MainLoginSwapPolicy.transcriptShowsAnsweredRequest(after: at, transcript: [line("assistant", -1), line("user", 2)].joined(separator: "\n")))
+        XCTAssertTrue(MainLoginSwapPolicy.transcriptShowsAnsweredRequest(after: at, transcript: [line("user", 2), line("assistant", 4)].joined(separator: "\n")))
+        // A tail that starts mid-line is fine.
+        XCTAssertTrue(MainLoginSwapPolicy.transcriptShowsAnsweredRequest(after: at, transcript: "tial\":1}\n" + [line("user", 2), line("assistant", 4)].joined(separator: "\n")))
     }
 
     // MARK: - Fixtures

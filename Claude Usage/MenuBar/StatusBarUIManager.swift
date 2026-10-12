@@ -582,7 +582,8 @@ final class StatusBarUIManager {
     /// Updates all status bar buttons based on current usage data
     func updateAllButtons(
         usage: ClaudeUsage,
-        apiUsage: APIUsage?
+        apiUsage: APIUsage?,
+        readingPending: Bool = false
     ) {
         // Get config from active profile
         let profile = ProfileManager.shared.activeProfile
@@ -592,7 +593,8 @@ final class StatusBarUIManager {
         // fallback logic so users authenticated only via `claude login` don't
         // periodically repaint to the default logo after successful refreshes.
         let hasAnyCredentials = hasAnyAvailableCredentials(for: profile)
-        if !hasAnyCredentials || config.enabledMetrics.isEmpty {
+        // `readingPending`: just switched, nothing proven for this account yet.
+        if !hasAnyCredentials || config.enabledMetrics.isEmpty || readingPending {
             // Show default app logo
             if let statusItem = statusItems[.session],  // We use .session as placeholder key
                let button = statusItem.button {

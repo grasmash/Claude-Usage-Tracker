@@ -9,32 +9,44 @@ struct ClaudeUsage: Codable, Equatable {
     var sessionResetTime: Date
 
     /// Returns 0% if the 5-hour session window has expired, otherwise the raw percentage.
-    var effectiveSessionPercentage: Double {
-        sessionResetTime < Date() ? 0.0 : sessionPercentage
-    }
+    var effectiveSessionPercentage: Double { effectiveSessionPercentage(now: Date()) }
 
     /// Returns 0% if the weekly window has expired, otherwise the raw percentage.
-    var effectiveWeeklyPercentage: Double {
-        weeklyResetTime < Date() ? 0.0 : weeklyPercentage
-    }
+    var effectiveWeeklyPercentage: Double { effectiveWeeklyPercentage(now: Date()) }
 
     /// True when either the 5-hour session or the weekly quota is exhausted.
     /// Claude Code refuses requests in both cases, so auto-switch treats them alike.
-    var isLimitReached: Bool {
-        effectiveSessionPercentage >= 100.0 || effectiveWeeklyPercentage >= 100.0
-    }
+    var isLimitReached: Bool { isLimitReached(now: Date()) }
 
     /// Returns 0% if the Fable weekly window has expired, otherwise the raw percentage.
-    var effectiveFableWeeklyPercentage: Double {
-        if let reset = fableWeeklyResetTime, reset < Date() { return 0.0 }
-        return fableWeeklyPercentage
-    }
+    var effectiveFableWeeklyPercentage: Double { effectiveFableWeeklyPercentage(now: Date()) }
 
     /// Like `isLimitReached`, but when Claude Code is set to Fable the Fable
     /// weekly quota counts too: Claude Code refuses Fable requests once it is
     /// exhausted even though the session and weekly quotas still have room.
-    func isLimitReached(usingFable: Bool) -> Bool {
-        isLimitReached || (usingFable && effectiveFableWeeklyPercentage >= 100.0)
+    func isLimitReached(usingFable: Bool) -> Bool { isLimitReached(usingFable: usingFable, now: Date()) }
+
+    // The same, judged at `now`: the switch policy decides at ITS `now`, so a
+    // window that has passed by then counts as reset there too.
+    func effectiveSessionPercentage(now: Date) -> Double {
+        sessionResetTime < now ? 0.0 : sessionPercentage
+    }
+
+    func effectiveWeeklyPercentage(now: Date) -> Double {
+        weeklyResetTime < now ? 0.0 : weeklyPercentage
+    }
+
+    func effectiveFableWeeklyPercentage(now: Date) -> Double {
+        if let reset = fableWeeklyResetTime, reset < now { return 0.0 }
+        return fableWeeklyPercentage
+    }
+
+    func isLimitReached(now: Date) -> Bool {
+        effectiveSessionPercentage(now: now) >= 100.0 || effectiveWeeklyPercentage(now: now) >= 100.0
+    }
+
+    func isLimitReached(usingFable: Bool, now: Date) -> Bool {
+        isLimitReached(now: now) || (usingFable && effectiveFableWeeklyPercentage(now: now) >= 100.0)
     }
 
     /// True when this snapshot has not been refreshed within

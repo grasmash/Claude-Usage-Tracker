@@ -29,12 +29,17 @@ enum MainLoginSwapPolicy {
         /// `CLAUDE_CONFIG_DIR` as set in the process's environment; nil when
         /// unset, empty, or the environment could not be read.
         let configDir: String?
+        /// False when only the executable path is known (the spawn-free
+        /// libproc listing): `command` is then argv0 alone, without the script
+        /// a `node` runs.
+        let argvKnown: Bool
 
-        init(pid: Int32, ppid: Int32 = 1, command: String, configDir: String? = nil) {
+        init(pid: Int32, ppid: Int32 = 1, command: String, configDir: String? = nil, argvKnown: Bool = true) {
             self.pid = pid
             self.ppid = ppid
             self.command = command
             self.configDir = (configDir?.isEmpty ?? true) ? nil : configDir
+            self.argvKnown = argvKnown
         }
     }
 
@@ -98,10 +103,16 @@ enum MainLoginSwapPolicy {
     /// path), the updater's versioned binary, or the older
     /// `node …/@anthropic-ai/claude-code/cli.js` form (the script path is the
     /// token right after `node`, so only argv0/argv1 are consulted).
+    ///
+    /// Without its arguments (the libproc fallback, `argvKnown == false`) a
+    /// `node` process may be `node …/cli.js`, and nothing can tell it apart:
+    /// it counts as Claude Code, refusal-leaning like the rest of the fallback.
     static func isClaudeCode(_ process: RunningProcess) -> Bool {
-        let argv = process.command.split(separator: " ").map(String.init)
+        let argv = process.argvKnown ? process.command.split(separator: " ").map(String.init) : [process.command]
         guard let argv0 = argv.first else { return false }
-        if URL(fileURLWithPath: argv0).lastPathComponent == "claude" { return true }
+        let base = URL(fileURLWithPath: argv0).lastPathComponent
+        if base == "claude" { return true }
+        if !process.argvKnown, base.hasPrefix("node") { return true }
         if versionedBinary.firstMatch(in: argv0, range: NSRange(argv0.startIndex..., in: argv0)) != nil { return true }
         return argv.prefix(2).contains { $0.hasSuffix("@anthropic-ai/claude-code/cli.js") }
     }
@@ -283,23 +294,79 @@ enum MainLoginSwapPolicy {
         let fingerprint: String
         let holderPids: [Int32]
         let at: Date
+        /// Each holder's process start time (key: pid), so a recycled pid is
+        /// told from the holder. Absent in records written by older builds.
+        var holderStartTimes: [String: Date]? = nil
     }
 
-    /// True once every holder has released the replaced lineage: the process
-    /// exited, or it made a request after the signal (`lastRequestAt` — the
-    /// mtime of its transcript; Claude Code re-reads the credentials file's
-    /// mtime before each request and drops its cached login when it changed).
-    /// A holder with no observable request is assumed to still hold it. Until
-    /// this is true the tracker must not refresh that stored login: the
-    /// session may still carry the same single-use refresh token.
+    /// How long a hand-off record may hold a lineage back.
+    static let handoffRecordTTL: TimeInterval = 8 * 3600
+
+    /// A recorded holder as seen now.
+    enum HolderProcess: Equatable {
+        /// No such process: the holder exited.
+        case gone
+        /// A process with this pid is running; `startedAt` is nil when it
+        /// cannot be read.
+        case running(startedAt: Date?)
+    }
+
+    /// True once every holder has released the replaced lineage. Until then
+    /// the tracker must not refresh that stored login: the session may still
+    /// carry the same single-use refresh token.
+    ///
+    /// A holder has released it when:
+    /// - it exited, or its pid now belongs to a different process (the start
+    ///   time differs from the one recorded: pids are reused);
+    /// - or it made a NEW request after the signal and got an answer
+    ///   (`requestedAfter`): Claude Code re-reads the credentials file's mtime
+    ///   before each request and drops its cached login when it changed. A
+    ///   transcript merely modified after the signal proves nothing: a reply
+    ///   streamed to a request sent BEFORE the swap writes to it too.
+    /// A record older than `handoffRecordTTL` no longer holds anything back,
+    /// so an idle holder can never pin a lineage for ever.
     static func lineageReleased(
-        _ record: HandoffRecord, alive: (Int32) -> Bool, lastRequestAt: (Int32) -> Date?
+        _ record: HandoffRecord, now: Date,
+        process: (Int32) -> HolderProcess, requestedAfter: (Int32, Date) -> Bool
     ) -> Bool {
-        record.holderPids.allSatisfy { pid in
-            guard alive(pid) else { return true }
-            guard let last = lastRequestAt(pid) else { return false }
-            return last > record.at
+        if now.timeIntervalSince(record.at) > handoffRecordTTL { return true }
+        return record.holderPids.allSatisfy { pid in
+            guard case .running(let startedAt) = process(pid) else { return true }
+            if let recorded = record.holderStartTimes?[String(pid)], let startedAt,
+               abs(recorded.timeIntervalSince(startedAt)) > 1 {
+                return true   // the pid was reused: the holder itself exited
+            }
+            return requestedAfter(pid, record.at)
         }
+    }
+
+    /// True when a transcript (JSONL, possibly starting mid-line) shows a
+    /// request made after `at` that was answered: a `user` entry timestamped
+    /// after `at`, followed later in the file by an `assistant` entry.
+    static func transcriptShowsAnsweredRequest(after at: Date, transcript: String) -> Bool {
+        var requestAfter = false
+        for line in transcript.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = entry["type"] as? String else { continue }
+            if type == "user", let ts = entry["timestamp"] as? String, let when = parseTimestamp(ts), when > at {
+                requestAfter = true
+            } else if type == "assistant", requestAfter {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static let fractionalTimestamp: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let plainTimestamp = ISO8601DateFormatter()
+
+    private static func parseTimestamp(_ text: String) -> Date? {
+        fractionalTimestamp.date(from: text) ?? plainTimestamp.date(from: text)
     }
 
     /// The stored main logins whose Fable weekly quota is at 100% and has not

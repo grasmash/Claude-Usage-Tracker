@@ -133,7 +133,11 @@ struct PopoverContentView: View {
             // key is the most common reason a profile silently goes stale.
             // A dead login (sign in) and an old reading on an inactive account
             // (no action) are deliberately different banners.
-            if let viewed = manager.clickedProfileId.flatMap({ id in
+            if manager.clickedProfileId == nil, manager.activeReadingPending, let active = profileManager.activeProfile {
+                // Just switched: nothing measured for this account yet. Say so
+                // instead of showing numbers that are not its own.
+                StatusBannerView(icon: "hourglass", message: "popover.reading.pending".localized(with: AutoSwitchStatus.shortName(active.name)), color: .secondary)
+            } else if let viewed = manager.clickedProfileId.flatMap({ id in
                    profileManager.profiles.first(where: { $0.id == id })
                }) ?? profileManager.activeProfile,
                case let state = manager.readingState(for: viewed),

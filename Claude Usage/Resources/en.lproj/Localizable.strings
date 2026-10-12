@@ -1124,6 +1124,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "Read by mission control %@ ago (this account is not active).";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@: sign-in needed. Run claude-usage-login in Terminal and sign in as %@. Auto-switch skips this account until then.";
 "popover.reading.stale_idle" = "Reading %@ old. Normal for an account that is not active: it is read again when it is next used, and auto-switch can still switch to it. No action needed.";
 "popover.reading.stale_idle_mc" = "Reading %@ old (last from mission control). Normal for an account that is not active: auto-switch can still switch to it. No action needed.";

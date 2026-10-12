@@ -1077,6 +1077,7 @@
 
 /* Mission control usage for inactive profiles; dead login vs old reading */
 "popover.reading.from_mc" = "Lu par mission control il y a %@ (ce compte n'est pas actif).";
+"popover.reading.pending" = "Reading %@'s usage… (just switched; nothing measured yet)";
 "popover.reading.sign_in_needed" = "%@ : connexion requise. Lancez claude-usage-login dans le Terminal et connectez-vous en tant que %@. Le changement automatique ignore ce compte d'ici là.";
 "popover.reading.stale_idle" = "Relevé vieux de %@. Normal pour un compte inactif : il sera relu à sa prochaine utilisation, et le changement automatique peut toujours y basculer. Aucune action requise.";
 "popover.reading.stale_idle_mc" = "Relevé vieux de %@ (dernier de mission control). Normal pour un compte inactif : le changement automatique peut toujours y basculer. Aucune action requise.";
