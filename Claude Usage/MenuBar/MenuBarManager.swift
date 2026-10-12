@@ -1614,18 +1614,17 @@ class MenuBarManager: NSObject, ObservableObject {
     /// status line script; KEY=value lines, see `AutoSwitchStatus`).
     private func writeAutoSwitchStatus() {
         guard !AppEnvironment.isRunningTests else { return }
+        // The SAME inputs the switch decision uses (`checkAutoSwitchIfNeeded`):
+        // Fable counts while Claude Code runs it or the Opus fallback is active,
+        // and the proactive setting is the same kill switch.
         let status = AutoSwitchStatus.build(
             profiles: profileManager.profiles,
             activeId: profileManager.activeProfile?.id,
-            usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable(),
+            usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable() || ModelFallback().isActive,
+            proactive: SharedDataStore.shared.loadAutoSwitchProactiveEnabled(),
             isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:)
         )
-        let formatter = DateFormatter()
-        let contents = status.stateFileContents { date in
-            // Within a day the time alone is clear; further out, add the weekday.
-            formatter.dateFormat = date.timeIntervalSinceNow < 86400 ? "h:mma" : "EEE h:mma"
-            return formatter.string(from: date)
-        }
+        let contents = status.stateFileContents { AutoSwitchStatus.americanTime($0) }
         let url = Constants.ClaudePaths.claudeDirectory.appendingPathComponent(".autoswitch-state")
         try? contents.write(to: url, atomically: true, encoding: .utf8)
     }

@@ -109,7 +109,7 @@ final class MissionControlUsageTests: XCTestCase {
     func testParsesMcAccountUsage() throws {
         let readings = try XCTUnwrap(McUsage.parseAccountUsage(accountUsageJSON([
             account("littlewing", sampledAt: now.addingTimeInterval(-60), session: 3, weekly: 0, fable: 12),
-            #"{"name":"nousage","usage":null}"#,
+            #"{"name":"nousage","proven":true,"usage":null}"#,
             account("noweekly", sampledAt: now, session: 3, weekly: nil, fable: nil),
         ])))
         XCTAssertEqual(readings.map(\.account), ["littlewing"])   // incomplete readings stay unknown
@@ -480,7 +480,8 @@ final class MissionControlUsageTests: XCTestCase {
 
     private func account(_ name: String, sampledAt: Date, session: Double?, weekly: Double?, fable: Double?) -> String {
         let r = sampledAt.addingTimeInterval(3600)
-        return #"{"name":"\#(name)","usage":{"sampled_at":"\#(iso(sampledAt))","paused":false,"session":\#(window(session, r, 18000)),"weekly":\#(window(weekly, r, 604800)),"fable":\#(window(fable, r, 604800))}}"#
+        // `proven: true` as mc's usage-self lane posts it (identity checked); McUsageProvenTests covers the other cases.
+        return #"{"name":"\#(name)","proven":true,"source":"usage-self","host":"littlewing","usage":{"sampled_at":"\#(iso(sampledAt))","paused":false,"session":\#(window(session, r, 18000)),"weekly":\#(window(weekly, r, 604800)),"fable":\#(window(fable, r, 604800))}}"#
     }
 
     private func accountUsageJSON(_ accounts: [String]) -> Data {

@@ -92,7 +92,8 @@ final class AutoSwitchStatusTests: XCTestCase {
         let status = AutoSwitchStatus(stuck: true, nextFree: (name: "goose", at: at), needsLogin: ["lw", "mad"],
                                       signInNeeded: ["lw"])
         let text = status.stateFileContents(timeFormatter: { _ in "20:09" })
-        XCTAssertEqual(text, "STUCK=1\nNEXT_FREE=goose 20:09\nNEEDS_LOGIN=lw, mad\nSIGNIN_NEEDED=lw\n")
+        XCTAssertEqual(text, "STUCK=1\nNEXT_FREE=goose 20:09\nNEEDS_LOGIN=lw, mad\nSIGNIN_NEEDED=lw\n"
+                       + "NEXT=next: none\nNEXT_KIND=none\nNEXT_NAME=\nNEXT_AT=\nNEXT_PRESUMED=0\nNEXT_FABLE=0\n")
     }
 
     // MARK: - Helpers

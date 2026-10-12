@@ -28,6 +28,8 @@ struct McUsageReading: Equatable {
 /// holds no login and never touches a token of any account.
 ///
 /// Rules (each pinned by MissionControlUsageTests):
+/// - only rows mc marks `proven: true` (identity checked by the reporter
+///   against the account's rotate config) are readings at all;
 /// - an mc account is matched to a profile only when proven: the local
 ///   claude-rotate config names exactly one account with that mc name, its
 ///   email is named by no other rotate account, exactly one Anthropic profile
@@ -65,6 +67,12 @@ enum McUsage {
         for a in accounts {
             guard let name = a["name"] as? String, isAccountName(name) else { continue }
             seen[name, default: 0] += 1
+            // `proven` (a sibling of `usage`) is true only when the reporter asked
+            // /api/oauth/profile with the same token and the email matched the
+            // account's rotate config. Anything else — false, missing (an older
+            // mc), or not a JSON boolean — is a label, not a reading.
+            guard let proven = a["proven"] as? NSNumber, CFGetTypeID(proven) == CFBooleanGetTypeID(),
+                  proven.boolValue else { continue }
             guard let u = a["usage"] as? [String: Any],
                   let sampled = (u["sampled_at"] as? String).flatMap(parseDate),
                   let session = window(u["session"]), let weekly = window(u["weekly"]) else { continue }

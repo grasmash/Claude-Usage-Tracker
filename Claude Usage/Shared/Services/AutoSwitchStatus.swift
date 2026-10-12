@@ -10,6 +10,33 @@ struct AutoSwitchStatus {
     var stuck: Bool
     var nextFree: (name: String, at: Date)?
     var needsLogin: [String]
+    /// Where auto-switch goes next, from the SAME policy the switcher runs
+    /// (`AutoSwitchPolicy.handoffTarget` / `switchTarget`), so the status line
+    /// can never say "free now" while the policy refuses (2026-10-11 23:52).
+    var next: NextSwitch = .none
+    /// Fable is in use: the binding limit includes the Fable weekly window.
+    var fableBinding: Bool = false
+    /// The active profile's short name (for "opus stays on …").
+    var activeName: String = ""
+
+    enum NextSwitch: Equatable {
+        /// A profile the switcher would move to right now. `presumed`: its
+        /// reading is stale (a window that has passed), not observed.
+        case ready(name: String, presumed: Bool)
+        /// Fable in use, no account has Fable headroom, but this one can run
+        /// the sessions on Opus.
+        case readyWithoutFable(name: String, presumed: Bool)
+        /// Fable in use, only Fable is spent everywhere: the sessions stay and
+        /// run on Opus.
+        case noFableHeadroom
+        /// The best candidate is still at a limit; it frees at `at`. Its
+        /// reading is fresh.
+        case limited(name: String, at: Date)
+        /// No candidate with a fresh reading; the earliest PRESUMED reset known.
+        case noneEarliest(name: String, at: Date)
+        /// Nothing known at all.
+        case none
+    }
     /// Accounts whose login is DEAD (refresh rejected with `invalid_grant`,
     /// held in `deadLogins`): only a new sign-in fixes them. A subset of
     /// `needsLogin`, which also lists accounts with no saved login at all.
@@ -20,6 +47,7 @@ struct AutoSwitchStatus {
         profiles: [Profile],
         activeId: UUID?,
         usingFable: Bool = false,
+        proactive: Bool = true,
         now: Date = Date(),
         isLoginDead: (Profile) -> Bool = { _ in false }
     ) -> AutoSwitchStatus {
@@ -36,12 +64,17 @@ struct AutoSwitchStatus {
         let signInNeeded = switchable.filter { isLoginDead($0) }.map { shortName($0.name) }
 
         var stuck = false
+        var next: NextSwitch = .none
+        var activeName = ""
         if let active = switchable.first(where: { $0.id == activeId }) {
+            activeName = shortName(active.name)
             let blocked = isLoginDead(active)
                 || (active.claudeUsage?.isLimitReached(usingFable: usingFable) ?? false)
             stuck = blocked && AutoSwitchPolicy.nextAvailableProfile(
                 in: switchable, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead
             ) == nil
+            next = nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
+                              now: now, isLoginDead: isLoginDead)
         }
 
         let nextFree = switchable
@@ -52,7 +85,87 @@ struct AutoSwitchStatus {
             }
             .min { $0.at < $1.at }
 
-        return AutoSwitchStatus(stuck: stuck, nextFree: nextFree, needsLogin: needsLogin, signInNeeded: signInNeeded)
+        var status = AutoSwitchStatus(stuck: stuck, nextFree: nextFree, needsLogin: needsLogin, signInNeeded: signInNeeded)
+        status.next = next
+        status.fableBinding = usingFable
+        status.activeName = activeName
+        return status
+    }
+
+    /// The switcher's own answer for the current state: the hand-off target
+    /// while the active account is near its limit (and proactive is on), else
+    /// what the 100% path would pick; failing both, the best candidate still
+    /// at a limit (fresh reading) or the earliest presumed reset.
+    static func nextSwitch(
+        active: Profile, in profiles: [Profile], usingFable: Bool, proactive: Bool,
+        now: Date, isLoginDead: (Profile) -> Bool
+    ) -> NextSwitch {
+        let usage = active.claudeUsage
+        if proactive, let usage, !usage.isLimitReached(usingFable: usingFable),
+           AutoSwitchPolicy.isNearLimit(usage, usingFable: usingFable, now: now),
+           let target = AutoSwitchPolicy.handoffTarget(in: profiles, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead) {
+            return .ready(name: shortName(target.name), presumed: false)
+        }
+        // Only when Fable alone is spent does the Opus fallback keep the sessions here.
+        let onlyFableSpent = usingFable && (usage.map { $0.isLimitReached(usingFable: true) && !$0.isLimitReached } ?? false)
+            && !isLoginDead(active)
+        switch AutoSwitchPolicy.switchTarget(in: profiles, after: active, usingFable: usingFable,
+                                             blockedBeyondFable: !onlyFableSpent, now: now, isLoginDead: isLoginDead) {
+        case .profile(let p):
+            return .ready(name: shortName(p.name), presumed: p.claudeUsage?.isStale(now: now) ?? true)
+        case .profileWithoutFable(let p):
+            return .readyWithoutFable(name: shortName(p.name), presumed: p.claudeUsage?.isStale(now: now) ?? true)
+        case .noFableHeadroom:
+            return .noFableHeadroom
+        case .none:
+            break
+        }
+        // Nobody can take over now: who frees first? Fresh readings are
+        // candidates; stale ones are only a presumption of when.
+        let waiting = profiles
+            .filter { $0.id != active.id && !$0.isPaused && !isLoginDead($0) && AutoSwitchPolicy.canBeApplied($0) }
+            .compactMap { p -> (name: String, at: Date, fresh: Bool)? in
+                guard let u = p.claudeUsage else { return nil }
+                let at = freeAt(u, usingFable: usingFable, now: now)
+                guard at > now else { return nil }
+                return (shortName(p.name), at, !u.isStale(now: now))
+            }
+        if let soonestFresh = waiting.filter(\.fresh).min(by: { $0.at < $1.at }) {
+            return .limited(name: soonestFresh.name, at: soonestFresh.at)
+        }
+        if let soonest = waiting.min(by: { $0.at < $1.at }) {
+            return .noneEarliest(name: soonest.name, at: soonest.at)
+        }
+        return .none
+    }
+
+    /// One line for the status line, in every state.
+    func nextLine(timeFormatter: (Date) -> String) -> String {
+        let prefix = fableBinding ? "next (Fable): " : "next: "
+        switch next {
+        case .ready(let name, let presumed):
+            return "\(prefix)\(name)\(presumed ? "?" : "") (ready)"
+        case .readyWithoutFable(let name, let presumed):
+            return "next (Fable): none · opus: \(name)\(presumed ? "?" : "") (ready)"
+        case .noFableHeadroom:
+            return "next (Fable): none · opus stays on \(activeName)"
+        case .limited(let name, let at):
+            return "\(prefix)\(name) · \(timeFormatter(at))"
+        case .noneEarliest(let name, let at):
+            return "\(prefix)none · earliest \(name)? \(timeFormatter(at))"
+        case .none:
+            return "\(prefix)none"
+        }
+    }
+
+    /// American 12-hour time (operator rule): "2:40 PM" within a day, "Sat
+    /// 2:40 PM" further out.
+    static func americanTime(_ date: Date, now: Date = Date(), timeZone: TimeZone = .current) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = timeZone
+        f.dateFormat = date.timeIntervalSince(now) < 86400 ? "h:mm a" : "EEE h:mm a"
+        return f.string(from: date)
     }
 
     /// When an account can be used again: once every limit it has exhausted has reset.
@@ -74,7 +187,16 @@ struct AutoSwitchStatus {
     /// `KEY=value` lines, simple enough for the status line's bash to read.
     func stateFileContents(timeFormatter: (Date) -> String) -> String {
         let free = nextFree.map { "\($0.name) \(timeFormatter($0.at))" } ?? ""
+        let kind: String, name: String, at: String, presumed: Bool
+        switch next {
+        case .ready(let n, let p), .readyWithoutFable(let n, let p): (kind, name, at, presumed) = ("ready", n, "", p)
+        case .limited(let n, let d): (kind, name, at, presumed) = ("limited", n, timeFormatter(d), false)
+        case .noneEarliest(let n, let d): (kind, name, at, presumed) = ("none", n, timeFormatter(d), true)
+        case .noFableHeadroom, .none: (kind, name, at, presumed) = ("none", "", "", false)
+        }
         return "STUCK=\(stuck ? 1 : 0)\nNEXT_FREE=\(free)\nNEEDS_LOGIN=\(needsLogin.joined(separator: ", "))\n"
             + "SIGNIN_NEEDED=\(signInNeeded.joined(separator: ", "))\n"
+            + "NEXT=\(nextLine(timeFormatter: timeFormatter))\n"
+            + "NEXT_KIND=\(kind)\nNEXT_NAME=\(name)\nNEXT_AT=\(at)\nNEXT_PRESUMED=\(presumed ? 1 : 0)\nNEXT_FABLE=\(fableBinding ? 1 : 0)\n"
     }
 }
