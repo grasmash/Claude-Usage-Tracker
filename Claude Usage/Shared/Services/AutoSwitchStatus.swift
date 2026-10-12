@@ -146,8 +146,16 @@ struct AutoSwitchStatus {
         // the moment it passes (2026-10-12: matt -> littlewing at 5:10:18 PM,
         // after two hours in which nothing said so). So the EARLIEST reset is
         // named, fresh reading or not.
+        // The ACTIVE account counts too: when its own window resets first, the
+        // sessions simply carry on there (no switch), and that is what is next
+        // (2026-10-12 ~7:30 PM: littlewing's session reset at 10:10 PM was
+        // skipped for goose's Tuesday weekly reset).
         let soonest = profiles
-            .filter { $0.id != active.id && !$0.isPaused && !isLoginDead($0) && AutoSwitchPolicy.canBeApplied($0) }
+            .filter { p in
+                p.id == active.id
+                    ? !isLoginDead(p)
+                    : !p.isPaused && !isLoginDead(p) && AutoSwitchPolicy.canBeApplied(p)
+            }
             .compactMap { p -> (name: String, at: Date)? in
                 guard let u = p.claudeUsage else { return nil }
                 let at = freeAt(u, usingFable: usingFable, now: now)

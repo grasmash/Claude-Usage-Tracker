@@ -46,7 +46,7 @@ final class AutoSwitchStatusNextTests: XCTestCase {
     }
 
     func testLimitedCandidateShowsItsResetTime() {
-        let active = profile("madmatter", session: 100, weekly: 40)
+        let active = profile("madmatter", session: 40, weekly: 100, weeklyResetIn: 7 * 86400)   // frees last
         let limited = profile("mattgg", session: 100, weekly: 20, sessionResetIn: 2 * 3600)
         let status = AutoSwitchStatus.build(profiles: [active, limited], activeId: active.id, now: now)
         let expected = AutoSwitchStatus.americanTime(limited.claudeUsage!.sessionResetTime, now: now, timeZone: et)
@@ -55,7 +55,7 @@ final class AutoSwitchStatusNextTests: XCTestCase {
     }
 
     func testNoFreshCandidateStillNamesTheEarliestReset() {
-        let active = profile("madmatter", session: 100, weekly: 40)
+        let active = profile("madmatter", session: 40, weekly: 100, weeklyResetIn: 7 * 86400)   // frees last
         // Stale readings at 100% weekly with future resets (the midday state): not
         // targets now, but their reset times are recorded facts and the switcher
         // goes to the first one that passes.
@@ -71,7 +71,10 @@ final class AutoSwitchStatusNextTests: XCTestCase {
         let dead = profile("goose", session: 0, weekly: 0)
         let status = AutoSwitchStatus.build(profiles: [active, dead], activeId: active.id, now: now,
                                             isLoginDead: { $0.id == dead.id })
-        XCTAssertEqual(line(status), "next: none")
+        // Nobody else can take over: the active account's own reset is next, and
+        // the sessions stay on it.
+        let expected = AutoSwitchStatus.americanTime(active.claudeUsage!.sessionResetTime, now: now, timeZone: et)
+        XCTAssertEqual(line(status), "next: madmatter · \(expected)")
     }
 
     func testFableBindingIsNamed() {

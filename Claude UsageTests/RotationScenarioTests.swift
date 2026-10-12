@@ -76,7 +76,7 @@ final class RotationScenarioTests: XCTestCase {
 
     func testB_AllSpentStaysAndNamesWhoFreesFirst() {
         var decider = AutoSwitchDecider()
-        let active = profile("madmatter", session: 100, weekly: 40)
+        let active = profile("madmatter", session: 40, weekly: 100, weeklyResetIn: 7 * 86400)   // frees last
         let b = profile("mattgg", session: 100, weekly: 20, sessionResetIn: 2 * 3600)
         let c = profile("littlewing", session: 0, weekly: 100, weeklyResetIn: 3 * 86400)
         let t = tick(&decider, active: active, profiles: [active, b, c])
@@ -119,7 +119,7 @@ final class RotationScenarioTests: XCTestCase {
 
     func testD_StaleReadingWithItsLimitStillInForceIsNotATarget() {
         var decider = AutoSwitchDecider()
-        let active = profile("madmatter", session: 100, weekly: 40)
+        let active = profile("madmatter", session: 40, weekly: 100, weeklyResetIn: 7 * 86400)   // frees last
         let stale = profile("littlewing", session: 0, weekly: 100, weeklyResetIn: 3 * 86400, age: 7 * 3600)
         let t = tick(&decider, active: active, profiles: [active, stale])
         XCTAssertEqual(t.decision, .noTarget(notify: true))
@@ -158,7 +158,7 @@ final class RotationScenarioTests: XCTestCase {
         let isDead: (Profile) -> Bool = { $0.id == dead.id }
         let t = tick(&decider, active: active, profiles: [active, dead], isLoginDead: isDead)
         XCTAssertEqual(t.decision, .noTarget(notify: true))
-        XCTAssertEqual(t.nextLine, "next: none")
+        XCTAssertEqual(t.nextLine, "next: madmatter · \(fmt(active.claudeUsage!.sessionResetTime))", "never the dead login; the active account frees itself")
         XCTAssertEqual(t.status.signInNeeded, ["goose"])
         // A target whose stored login turns out dead at apply time: the tracker stays put.
         XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.failure(ClaudeCodeError.noProfileCredentials), selectedBy: "auto"))
@@ -272,6 +272,48 @@ final class RotationScenarioTests: XCTestCase {
                        .switchTo(littlewing, withoutFable: false))
         let status = AutoSwitchStatus.build(profiles: [littlewing, matt, goose], activeId: matt.id, now: landed)
         XCTAssertEqual(status.nextLine { _ in "" }, "next: littlewing? (ready)")
+    }
+
+    // MARK: - I. live 2026-10-12 ~7:30 PM — the ACTIVE account frees first
+
+    /// Installed 322df28 showed "next: gooseappai · Tue 11:59 PM" while the
+    /// active littlewing's own session window reset at 10:10 PM (weekly 52%).
+    /// The earliest reset was the active account's, and the search skipped it.
+    /// Policy: when the active account frees first, NEXT names it and the
+    /// switcher stays (no switch, before or after that reset).
+    func testI_ActiveAccountFreesFirstNamesItselfAndStays() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = et
+        func at(_ day: Int, _ hour: Int, _ minute: Int) -> Date {
+            calendar.date(from: DateComponents(year: 2026, month: 10, day: day, hour: hour, minute: minute))!
+        }
+        let tick = at(12, 19, 30)
+        func spent(_ name: String, session: Double, sessionReset: Date, weekly: Double, weeklyReset: Date) -> Profile {
+            var p = profile(name, session: 0, weekly: 0)
+            var u = usage(session: session, weekly: weekly)
+            u.sessionResetTime = sessionReset; u.weeklyResetTime = weeklyReset; u.fableWeeklyResetTime = weeklyReset
+            u.lastUpdated = tick.addingTimeInterval(-60)
+            p.claudeUsage = u
+            return p
+        }
+        let littlewing = spent("littlewing", session: 100, sessionReset: at(12, 22, 10), weekly: 52, weeklyReset: at(17, 15, 0))
+        let goose = spent("gooseappai", session: 0, sessionReset: at(12, 20, 0), weekly: 100, weeklyReset: at(13, 23, 59))
+        let matt = spent("matt", session: 10, sessionReset: at(12, 21, 0), weekly: 100, weeklyReset: at(17, 14, 59))
+        let mad = spent("madmatter", session: 0, sessionReset: at(12, 20, 0), weekly: 100, weeklyReset: at(16, 9, 0))
+        let profiles = [littlewing, goose, matt, mad]
+
+        var decider = AutoSwitchDecider()
+        XCTAssertEqual(decider.decide(current: littlewing, profiles: profiles, usingFable: false, now: tick), .noTarget(notify: true))
+        let status = AutoSwitchStatus.build(profiles: profiles, activeId: littlewing.id, now: tick)
+        let time: (Date) -> String = { AutoSwitchStatus.americanTime($0, now: tick, timeZone: self.et) }
+        XCTAssertEqual(status.nextLine(timeFormatter: time), "next: littlewing · 10:10 PM")
+        XCTAssertTrue(status.stateFileContents(timeFormatter: time).contains("NEXT_NAME=littlewing\nNEXT_AT=10:10 PM\n"))
+
+        // 10:10 PM: littlewing's window has reset; the sessions stay where they are.
+        let after = at(12, 22, 11)
+        var free = littlewing
+        free.claudeUsage!.lastUpdated = after
+        XCTAssertEqual(decider.decide(current: free, profiles: [free, goose, matt, mad], usingFable: false, now: after), .stay)
     }
 
     // MARK: - Fixtures
