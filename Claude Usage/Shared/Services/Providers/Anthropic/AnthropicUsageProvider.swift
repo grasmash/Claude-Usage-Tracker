@@ -86,14 +86,17 @@ final class AnthropicUsageProvider: UsageProviderService {
             }
         }
 
-        // Priority 3: System Keychain CLI OAuth token
-        // Only use system keychain for the active profile — the keychain/credentials file
-        // reflects the currently active `claude` CLI session. Using it for a non-active
-        // profile would silently return the active profile's stats.
+        // Priority 3: the shared keychain login (Claude Code's), for the active
+        // profile ONLY when that login is PROVEN to be this profile's account
+        // (`loginIsProvenToBelong`: same refresh lineage as the stored login, or
+        // a resolved account lookup naming this account). "Active" is not
+        // proof: after a refused swap the tracker's active profile and the
+        // keychain's login disagree, and on 2026-10-12 this fetch then saved
+        // madmatter's usage under littlewing for ten hours. An unproven login
+        // yields the cached reading below, never another account's numbers.
         if isActiveProfile(profile),
            let systemCredentials = readSystemLogin(),
-           !ClaudeCodeSyncService.shared.isTokenExpired(systemCredentials),
-           let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: systemCredentials) {
+           let accessToken = ClaudeCodeSyncService.shared.usageAccessToken(fromSharedLogin: systemCredentials, for: profile) {
             return try await fetchWithOAuth(accessToken)
         }
 

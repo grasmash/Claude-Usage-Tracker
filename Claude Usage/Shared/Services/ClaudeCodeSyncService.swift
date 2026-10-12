@@ -894,9 +894,9 @@ class ClaudeCodeSyncService {
     ///
     /// `knownLogins` are the main logins the tracker has captured (every
     /// profile's `cliCredentialsJSON`), for the compare-and-swap.
-    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], spentLogins: [String] = [], fableSpentLogins: [String] = []) async throws -> MainLoginSwitch {
+    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], spentLogins: [String] = [], fableSpentLogins: [String] = [], nearLimitLogins: [String] = []) async throws -> MainLoginSwitch {
         try await withSwitchMutex {
-            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, spentLogins: spentLogins, fableSpentLogins: fableSpentLogins)
+            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, spentLogins: spentLogins, fableSpentLogins: fableSpentLogins, nearLimitLogins: nearLimitLogins)
         }
     }
 
@@ -912,7 +912,7 @@ class ClaudeCodeSyncService {
         }
     }
 
-    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String], spentLogins: [String], fableSpentLogins: [String]) async throws -> MainLoginSwitch {
+    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String], spentLogins: [String], fableSpentLogins: [String], nearLimitLogins: [String] = []) async throws -> MainLoginSwitch {
         guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
             // A pinned entry's login is never copied into the main keychain:
             // that puts one single-use refresh token in two config dirs.
@@ -971,15 +971,24 @@ class ClaudeCodeSyncService {
         }
         let keychainLoginSpent = listed(spentLogins)
             || (listed(fableSpentLogins) && !holders.isEmpty && MainLoginSwapPolicy.allHoldersOnFable(holders, modelOf: holderModel))
+        // A proactive hand-off: the keychain login's account is near its limit
+        // on a fresh reading. Working holders are moved (and told to reload);
+        // the replaced lineage is then held back from any refresh until they
+        // have released it (`HandoffRecord`).
+        let keychainLoginNearLimit = !keychainLoginSpent && listed(nearLimitLogins)
         if let refusal = MainLoginSwapPolicy.refusal(
             holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known,
-            keychainLoginSpent: keychainLoginSpent
+            keychainLoginSpent: keychainLoginSpent, keychainLoginNearLimit: keychainLoginNearLimit
         ) {
             LoggingService.shared.log("switchMainLogin: not switching Claude Code to '\(profile.name)': \(refusal)")
             return .refused(refusal)
         }
         if !holders.isEmpty {
-            LoggingService.shared.log("switchMainLogin: \(holders.count) Claude Code session(s) are stranded on a spent login; switching them to '\(profile.name)'")
+            if keychainLoginSpent {
+                LoggingService.shared.log("switchMainLogin: \(holders.count) Claude Code session(s) are stranded on a spent login; switching them to '\(profile.name)'")
+            } else {
+                LoggingService.shared.log("switchMainLogin: hand-off: \(holders.count) working Claude Code session(s) are on a login near its limit; moving them to '\(profile.name)' before it interrupts them")
+            }
         }
 
         // Nothing holds the shared login and the keychain is what we last saw.
@@ -1027,6 +1036,12 @@ class ClaudeCodeSyncService {
             LoggingService.shared.logError("⚠️ switchMainLogin: wrote '\(profile.name)' but could not read the entry back; the switch is UNVERIFIED")
         }
         lastSeenSystemLoginFingerprint = systemLoginFingerprint(jsonData)
+
+        // A hand-off under working holders: remember who may still carry the
+        // replaced lineage, so it is not refreshed until they have released it.
+        if keychainLoginNearLimit, !holders.isEmpty, let replaced = keychainFingerprint {
+            recordHandoff(MainLoginSwapPolicy.HandoffRecord(fingerprint: replaced, holderPids: holders.map(\.pid), at: Date()))
+        }
 
         // Stranded sessions (on a spent login) were there before the write and
         // are expected; tell them to reload onto the new login now. The signal
@@ -1091,9 +1106,12 @@ class ClaudeCodeSyncService {
             }
             let pinned = Set(profiles.compactMap(\.customKeychainServiceName)).compactMap { readKeychainCredentials(serviceName: $0) }
             let spent = MainLoginSwapPolicy.spentLogins(in: profiles, isLoginDead: isLoginDead(for:))
+            let usingFable = AutoSwitchPolicy.isClaudeCodeUsingFable() || ModelFallback().isActive
+            let nearLimit = SharedDataStore.shared.loadAutoSwitchProactiveEnabled()
+                ? MainLoginSwapPolicy.nearLimitLogins(in: profiles, usingFable: usingFable) : []
             return try await performMainLoginSwitch(
                 to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned, spentLogins: spent,
-                fableSpentLogins: MainLoginSwapPolicy.fableSpentLogins(in: profiles))
+                fableSpentLogins: MainLoginSwapPolicy.fableSpentLogins(in: profiles), nearLimitLogins: nearLimit)
         }
     }
 
@@ -1569,6 +1587,17 @@ class ClaudeCodeSyncService {
         return uuid == profileIdentity
     }
 
+    /// The access token of the shared keychain login, for reading `profile`'s
+    /// usage: only when the login is unexpired AND proven to be this profile's
+    /// account. Nil otherwise — an unproven login (another account's, or one
+    /// whose lookup has not succeeded) must never produce a reading that is
+    /// stored under this profile. A nil here also starts the account lookup
+    /// (`provenLoginAccountUuid`), so the next cycle can prove it.
+    func usageAccessToken(fromSharedLogin json: String, for profile: Profile) -> String? {
+        guard !isTokenExpired(json), loginIsProvenToBelong(json, to: profile) else { return nil }
+        return extractAccessToken(from: json)
+    }
+
     /// Why `syncToProfile` must not store `json` under `profile`, or nil.
     /// A profile with no account yet takes the user's explicit sync (there is
     /// nothing to contradict); a profile that has one takes only a proven login.
@@ -1671,6 +1700,18 @@ class ClaudeCodeSyncService {
             return nil
         }
         guard !deadLogins.isDead(refreshToken) else { return nil }
+        // A lineage handed off under working holders may still sit in a
+        // session's memory; refreshing it here would be a second use of its
+        // single-use refresh token. Wait until every holder has released it.
+        if let fingerprint = systemLoginFingerprint(mainJSON), let record = handoffRecord(for: fingerprint) {
+            let released = MainLoginSwapPolicy.lineageReleased(
+                record, alive: Self.processIsAlive, lastRequestAt: { self.holderLastRequestAt(pid: $0) })
+            guard released else {
+                LoggingService.shared.log("switchMainLogin: '\(profileName)''s stored login was handed off under \(record.holderPids.count) working session(s) and not every one has released it yet; not refreshing it (retried next tick)")
+                return nil
+            }
+            forgetHandoff(fingerprint)
+        }
         do {
             let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
             guard let updatedJSON = mergeRefreshedCredentials(into: mainJSON, refreshed: refreshed) else { return nil }
@@ -1688,6 +1729,55 @@ class ClaudeCodeSyncService {
             LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)'", error: error)
         }
         return nil
+    }
+
+    // MARK: - Hand-off records (replaced lineages possibly still held)
+
+    static let handoffRecordsKey = "mainLoginHandoffRecords"
+    private var handoffRecordsInMemory: [MainLoginSwapPolicy.HandoffRecord] = []
+
+    private func loadHandoffRecords() -> [MainLoginSwapPolicy.HandoffRecord] {
+        if AppEnvironment.isRunningTests { return handoffRecordsInMemory }
+        guard let data = UserDefaults.standard.data(forKey: Self.handoffRecordsKey),
+              let records = try? JSONDecoder().decode([MainLoginSwapPolicy.HandoffRecord].self, from: data) else { return [] }
+        return records
+    }
+
+    private func saveHandoffRecords(_ records: [MainLoginSwapPolicy.HandoffRecord]) {
+        if AppEnvironment.isRunningTests { handoffRecordsInMemory = records; return }
+        if let data = try? JSONEncoder().encode(records) {
+            UserDefaults.standard.set(data, forKey: Self.handoffRecordsKey)
+        }
+    }
+
+    func recordHandoff(_ record: MainLoginSwapPolicy.HandoffRecord) {
+        var records = loadHandoffRecords().filter { $0.fingerprint != record.fingerprint }
+        records.append(record)
+        saveHandoffRecords(records)
+        LoggingService.shared.log("switchMainLogin: recorded hand-off of the replaced login under \(record.holderPids.count) working session(s); it is not refreshed until they release it")
+    }
+
+    func handoffRecord(for fingerprint: String) -> MainLoginSwapPolicy.HandoffRecord? {
+        loadHandoffRecords().first { $0.fingerprint == fingerprint }
+    }
+
+    func forgetHandoff(_ fingerprint: String) {
+        saveHandoffRecords(loadHandoffRecords().filter { $0.fingerprint != fingerprint })
+    }
+
+    /// `kill(pid, 0)`: 0 or EPERM means the process exists; ESRCH means gone.
+    static func processIsAlive(_ pid: Int32) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// When a holder last made a request: its transcript's modification time
+    /// (`sessions/<pid>.json` -> `projects/<project>/<sessionId>.jsonl`).
+    func holderLastRequestAt(pid: Int32) -> Date? {
+        guard let transcript = MainLoginSwapPolicy.holderTranscriptURL(
+            pid: pid,
+            sessionsDirectory: Constants.ClaudePaths.claudeDirectory.appendingPathComponent("sessions"),
+            projectsDirectory: Constants.ClaudePaths.projectsDirectory) else { return nil }
+        return try? transcript.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
 
     /// True when the login Claude Code's main sessions use (or would use after

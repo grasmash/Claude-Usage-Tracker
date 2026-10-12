@@ -632,6 +632,20 @@ class SharedDataStore {
         return defaults.bool(forKey: Keys.autoSwitchProfileEnabled)
     }
 
+    /// Proactive hand-off (switch before the limit): ON unless the operator
+    /// turned it off. `defaults write HamedElfayome.Claude-Usage
+    /// autoSwitchProactiveEnabled -bool NO` is the kill switch.
+    static let autoSwitchProactiveEnabledKey = "autoSwitchProactiveEnabled"
+
+    func saveAutoSwitchProactiveEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: Self.autoSwitchProactiveEnabledKey)
+    }
+
+    func loadAutoSwitchProactiveEnabled() -> Bool {
+        defaults.object(forKey: Self.autoSwitchProactiveEnabledKey) == nil
+            ? true : defaults.bool(forKey: Self.autoSwitchProactiveEnabledKey)
+    }
+
     // MARK: - Mission Control (inactive profiles' usage)
 
     /// Default base URL: mission control on littlewing, over the tailnet.

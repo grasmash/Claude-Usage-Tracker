@@ -106,14 +106,16 @@ class ClaudeAPIService: APIServiceProtocol {
             if let systemCredentials = try ClaudeCodeSyncService.shared.readSystemCredentials() {
                 LoggingService.shared.log("ClaudeAPIService: Found CLI credentials in system Keychain")
 
-                // Validate token is not expired
+                // Unexpired AND proven to be the active profile's account; an
+                // unproven shared login never serves a reading that is stored
+                // under this profile (see AnthropicUsageProvider, Priority 3).
                 if ClaudeCodeSyncService.shared.isTokenExpired(systemCredentials) {
                     LoggingService.shared.log("ClaudeAPIService: System Keychain CLI token is expired")
-                } else if let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: systemCredentials) {
+                } else if let accessToken = ClaudeCodeSyncService.shared.usageAccessToken(fromSharedLogin: systemCredentials, for: activeProfile) {
                     LoggingService.shared.log("ClaudeAPIService: Using CLI credentials from system Keychain")
                     return .cliOAuth(accessToken)
                 } else {
-                    LoggingService.shared.log("ClaudeAPIService: Could not extract access token from system Keychain credentials")
+                    LoggingService.shared.log("ClaudeAPIService: System Keychain CLI login is not proven to be '\(activeProfile.name)''s; not using it")
                 }
             } else {
                 LoggingService.shared.log("ClaudeAPIService: No CLI credentials found in system Keychain")

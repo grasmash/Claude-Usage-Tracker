@@ -120,6 +120,54 @@ enum AutoSwitchPolicy {
         return presumedFree
     }
 
+    // MARK: - Proactive hand-off (switch BEFORE the limit)
+
+    /// The active account's binding window at or above this (on a FRESH
+    /// reading) hands the shared login to another account before the limit
+    /// interrupts work. Operator, 2026-10-12: every limit hit that day killed
+    /// in-flight subagents with 429s before the 100% switch could land.
+    static let proactiveThreshold: Double = 90
+
+    /// A hand-off target has EVERY binding window at or below this. The gap to
+    /// `proactiveThreshold` is the hysteresis: an account handed off at 90%
+    /// cannot be handed back to until its window resets, so two accounts never
+    /// ping-pong, and the target has real room, not a sliver.
+    static let handoffTargetCeiling: Double = 75
+
+    /// The highest window in force that could stop Claude Code: session,
+    /// weekly, and the Fable weekly only while Fable is in use.
+    static func bindingPercentage(_ usage: ClaudeUsage, usingFable: Bool, now: Date = Date()) -> Double {
+        var binding = max(usage.effectiveSessionPercentage, usage.effectiveWeeklyPercentage)
+        if usingFable { binding = max(binding, usage.effectiveFableWeeklyPercentage) }
+        return binding
+    }
+
+    /// True when `usage` is a fresh reading at or above the hand-off threshold.
+    /// A stale reading never triggers a hand-off: it may be hours old.
+    static func isNearLimit(_ usage: ClaudeUsage, usingFable: Bool, now: Date = Date()) -> Bool {
+        !usage.isStale(now: now) && bindingPercentage(usage, usingFable: usingFable, now: now) >= proactiveThreshold
+    }
+
+    /// The first profile (wrapping around) fit to take the shared login
+    /// proactively: applicable, not paused, not dead, with a FRESH reading whose
+    /// every binding window is at or below `handoffTargetCeiling`. A presumed
+    /// account (stale reading) is never a hand-off target — proactivity is a
+    /// convenience, and it must not move working sessions onto a guess.
+    static func handoffTarget(
+        in profiles: [Profile], after current: Profile, usingFable: Bool,
+        now: Date = Date(), isLoginDead: (Profile) -> Bool = { _ in false }
+    ) -> Profile? {
+        guard let currentIndex = profiles.firstIndex(where: { $0.id == current.id }), profiles.count > 1 else { return nil }
+        for offset in 1..<profiles.count {
+            let candidate = profiles[(currentIndex + offset) % profiles.count]
+            guard !candidate.isPaused, canBeApplied(candidate), !isLoginDead(candidate),
+                  let usage = candidate.claudeUsage, !usage.isStale(now: now),
+                  bindingPercentage(usage, usingFable: usingFable, now: now) <= handoffTargetCeiling else { continue }
+            return candidate
+        }
+        return nil
+    }
+
     /// Whether an auto-switch may make `target` the tracker's active profile
     /// given what `switchMainLogin` did with the shared login.
     ///
@@ -350,6 +398,10 @@ struct AutoSwitchDecider {
     enum Decision: Equatable {
         case stay
         case switchTo(Profile, withoutFable: Bool)
+        /// Proactive: the active account is near its limit and this account has
+        /// fresh, proven room. Nothing is blocked yet; nobody is notified of a
+        /// problem.
+        case handOff(Profile)
         case noTarget(notify: Bool)
         case noFableHeadroom(notify: Bool)
     }
@@ -358,6 +410,15 @@ struct AutoSwitchDecider {
     private(set) var switched: Set<UUID> = []
     /// Profiles already reported as stuck in this episode.
     private(set) var notifiedStuck: Set<UUID> = []
+    /// Profiles handed off in the current window, keyed by the window's reset
+    /// time, so one window fires one hand-off (a new window is a new episode).
+    private(set) var handedOff: [UUID: Date] = [:]
+    /// Proactive hand-off on/off (the operator's kill switch).
+    var proactive: Bool
+
+    init(proactive: Bool = true) {
+        self.proactive = proactive
+    }
 
     mutating func decide(
         current: Profile, profiles: [Profile], usingFable: Bool, now: Date = Date(),
@@ -365,7 +426,7 @@ struct AutoSwitchDecider {
     ) -> Decision {
         guard let usage = current.claudeUsage, usage.isLimitReached(usingFable: usingFable) else {
             reset(current.id)   // a window reset ends the episode
-            return .stay
+            return decideHandoff(current: current, profiles: profiles, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
         }
         guard !switched.contains(current.id) else { return .stay }
 
@@ -384,6 +445,43 @@ struct AutoSwitchDecider {
         case .none:
             return .noTarget(notify: notifiedStuck.insert(current.id).inserted)
         }
+    }
+
+    /// The proactive branch: the active account is not at a limit. Hands off
+    /// once per window when its fresh reading is near the limit and a fit
+    /// target exists; otherwise stays, silently.
+    private mutating func decideHandoff(
+        current: Profile, profiles: [Profile], usingFable: Bool, now: Date, isLoginDead: (Profile) -> Bool
+    ) -> Decision {
+        guard proactive, let usage = current.claudeUsage,
+              AutoSwitchPolicy.isNearLimit(usage, usingFable: usingFable, now: now) else {
+            handedOff.removeValue(forKey: current.id)   // below the threshold: the window reset or never fired
+            return .stay
+        }
+        let window = Self.bindingWindowReset(usage, usingFable: usingFable, now: now)
+        if let latched = handedOff[current.id], latched == window { return .stay }
+        guard let target = AutoSwitchPolicy.handoffTarget(
+            in: profiles, after: current, usingFable: usingFable, now: now, isLoginDead: isLoginDead
+        ) else { return .stay }
+        handedOff[current.id] = window
+        return .handOff(target)
+    }
+
+    /// The reset time of the window that binds (minute precision: the API's
+    /// reset time jitters by seconds between reads).
+    static func bindingWindowReset(_ usage: ClaudeUsage, usingFable: Bool, now: Date) -> Date {
+        let binding = AutoSwitchPolicy.bindingPercentage(usage, usingFable: usingFable, now: now)
+        var reset = usage.sessionResetTime
+        if usage.effectiveWeeklyPercentage == binding { reset = usage.weeklyResetTime }
+        if usingFable, usage.effectiveFableWeeklyPercentage == binding, let f = usage.fableWeeklyResetTime { reset = f }
+        if usage.effectiveSessionPercentage == binding { reset = usage.sessionResetTime }
+        return Date(timeIntervalSince1970: (reset.timeIntervalSince1970 / 60).rounded(.down) * 60)
+    }
+
+    /// The hand-off did not change the active profile (refused, raced): retry
+    /// next tick.
+    mutating func handoffDidNotLand(_ id: UUID) {
+        handedOff.removeValue(forKey: id)
     }
 
     /// Forgets a profile's episode (its limits cleared, or a re-arm).

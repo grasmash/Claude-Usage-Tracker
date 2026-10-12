@@ -1304,19 +1304,26 @@ class MenuBarManager: NSObject, ObservableObject {
                         UsageHistoryService.shared.recordWeeklyPeriodic(for: profileId, usage: newUsage, provider: profile.provider)
                     }
 
-                    self.usage = newUsage
-
-                    // Save to active profile instead of global DataStore
-                    if let profileId = self.profileManager.activeProfile?.id {
-                        self.profileManager.saveClaudeUsage(newUsage, for: profileId)
+                    // The reading belongs to the profile the fetch was made FOR.
+                    // If the active profile changed while the request was in
+                    // flight, storing it under the new active profile would file
+                    // one account's usage under another (the completion-time
+                    // race behind UsageAttribution).
+                    guard let saveTo = UsageAttribution.saveTarget(
+                        fetchedFor: currentProfileId, activeNow: self.profileManager.activeProfile?.id
+                    ) else {
+                        LoggingService.shared.log("MenuBarManager: active profile changed during the refresh of '\(profile.name)'; reading discarded")
+                        return
                     }
+                    self.usage = newUsage
+                    self.profileManager.saveClaudeUsage(newUsage, for: saveTo)
 
                     // Write statusline cache for instant CLI rendering (Claude Code only)
                     if profile.provider.descriptor.capabilities.cliAccountSync,
                        StatuslineService.shared.isInstalled {
                         StatuslineService.shared.writeUsageCache(
                             usage: newUsage,
-                            profileName: self.profileManager.activeProfile?.name
+                            profileName: profile.name
                         )
                     }
 
@@ -1558,6 +1565,7 @@ class MenuBarManager: NSObject, ObservableObject {
 
         // Re-runs the target search every tick while stuck, so another account
         // freeing up is picked up on the next tick; notifies once per episode.
+        autoSwitchDecider.proactive = SharedDataStore.shared.loadAutoSwitchProactiveEnabled()
         let nextProfile: Profile
         switch autoSwitchDecider.decide(
             current: current, profiles: profiles, usingFable: usingFable,
@@ -1571,6 +1579,11 @@ class MenuBarManager: NSObject, ObservableObject {
                 fallBackToOpusIfHoldersOnFable(currentProfile: currentProfile, movedTo: p.name)
             }
             nextProfile = p
+        case .handOff(let p):
+            let binding = Int(AutoSwitchPolicy.bindingPercentage(usage, usingFable: usingFable))
+            LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' is at \(binding)% (near its limit); handing the shared login to '\(p.name)' before the limit interrupts work")
+            performAutoSwitch(from: currentProfile, to: p, handoff: true)
+            return
         case .noFableHeadroom(let notify):
             guard notify else { return }
             LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit its Fable limit and no account has Fable headroom; staying (retrying each refresh)")
@@ -1741,7 +1754,7 @@ class MenuBarManager: NSObject, ObservableObject {
         }
     }
 
-    private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile) {
+    private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile, handoff: Bool = false) {
         guard !autoSwitchInFlight, !profileManager.isSwitchingProfile, currentProfile.id != nextProfile.id else { return }
         autoSwitchInFlight = true
         let fromName = currentProfile.name
@@ -1759,6 +1772,7 @@ class MenuBarManager: NSObject, ObservableObject {
                 ) else {
                     LoggingService.shared.log("AutoSwitch: switch to '\(toName)' did not change the active profile; not announced, retried next tick")
                     self.autoSwitchDecider.reset(currentProfile.id)
+                    if handoff { self.autoSwitchDecider.handoffDidNotLand(currentProfile.id) }
                     self.deadLoginLatch.didNotLand(currentProfile.id)
                     return
                 }

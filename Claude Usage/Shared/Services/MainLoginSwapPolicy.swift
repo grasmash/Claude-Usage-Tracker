@@ -229,13 +229,21 @@ enum MainLoginSwapPolicy {
     ///
     /// Returns nil when the rewrite may proceed. An empty keychain may always
     /// be written: there is nothing to clobber.
+    /// - `keychainLoginNearLimit`: the keychain login's account is near its
+    ///   limit on a fresh reading (`AutoSwitchPolicy.isNearLimit`) and a
+    ///   proactive hand-off is wanted. Working sessions then do not block
+    ///   either: they are told to reload (the credentials file is touched) and
+    ///   pick the new login up before their next request, while the replaced
+    ///   login's lineage is held back from any refresh until every holder has
+    ///   released it (`lineageReleased`). The compare-and-swap still holds.
     static func refusal(
         holders: Int,
         keychainFingerprint: String?,
         knownFingerprints: Set<String>,
-        keychainLoginSpent: Bool = false
+        keychainLoginSpent: Bool = false,
+        keychainLoginNearLimit: Bool = false
     ) -> Refusal? {
-        if holders > 0 && !keychainLoginSpent { return .sessionsRunning(count: holders) }
+        if holders > 0 && !keychainLoginSpent && !keychainLoginNearLimit { return .sessionsRunning(count: holders) }
         if let current = keychainFingerprint, !knownFingerprints.contains(current) {
             return .unknownKeychainLogin
         }
@@ -254,6 +262,43 @@ enum MainLoginSwapPolicy {
             guard let json = profile.cliCredentialsJSON else { return nil }
             let atLimit = profile.claudeUsage?.isLimitReached ?? false
             return atLimit || isLoginDead(profile) ? json : nil
+        }
+    }
+
+    /// The stored main logins of every account whose FRESH reading is at or
+    /// above the hand-off threshold (`AutoSwitchPolicy.isNearLimit`). A stale
+    /// reading is not here: a hand-off moves working sessions, and that is
+    /// done on evidence only.
+    static func nearLimitLogins(in profiles: [Profile], usingFable: Bool, now: Date = Date()) -> [String] {
+        profiles.compactMap { profile in
+            guard let json = profile.cliCredentialsJSON, let usage = profile.claudeUsage,
+                  AutoSwitchPolicy.isNearLimit(usage, usingFable: usingFable, now: now) else { return nil }
+            return json
+        }
+    }
+
+    /// A shared login replaced under WORKING holders (a proactive hand-off):
+    /// which processes held it, and when the reload signal was sent.
+    struct HandoffRecord: Equatable, Codable {
+        let fingerprint: String
+        let holderPids: [Int32]
+        let at: Date
+    }
+
+    /// True once every holder has released the replaced lineage: the process
+    /// exited, or it made a request after the signal (`lastRequestAt` — the
+    /// mtime of its transcript; Claude Code re-reads the credentials file's
+    /// mtime before each request and drops its cached login when it changed).
+    /// A holder with no observable request is assumed to still hold it. Until
+    /// this is true the tracker must not refresh that stored login: the
+    /// session may still carry the same single-use refresh token.
+    static func lineageReleased(
+        _ record: HandoffRecord, alive: (Int32) -> Bool, lastRequestAt: (Int32) -> Date?
+    ) -> Bool {
+        record.holderPids.allSatisfy { pid in
+            guard alive(pid) else { return true }
+            guard let last = lastRequestAt(pid) else { return false }
+            return last > record.at
         }
     }
 
@@ -287,6 +332,13 @@ enum MainLoginSwapPolicy {
     }
 
     static func holderModel(pid: Int32, sessionsDirectory: URL, projectsDirectory: URL) -> String? {
+        guard let transcript = holderTranscriptURL(pid: pid, sessionsDirectory: sessionsDirectory, projectsDirectory: projectsDirectory) else { return nil }
+        return AutoSwitchPolicy.latestAssistantModel(in: transcript)
+    }
+
+    /// The transcript file of a holder's live session, or nil when the session
+    /// record or the transcript is missing.
+    static func holderTranscriptURL(pid: Int32, sessionsDirectory: URL, projectsDirectory: URL) -> URL? {
         let record = sessionsDirectory.appendingPathComponent("\(pid).json")
         guard let data = try? Data(contentsOf: record),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -295,9 +347,7 @@ enum MainLoginSwapPolicy {
             at: projectsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
         for dir in projects {
             let transcript = dir.appendingPathComponent("\(sessionId).jsonl")
-            if FileManager.default.fileExists(atPath: transcript.path) {
-                return AutoSwitchPolicy.latestAssistantModel(in: transcript)
-            }
+            if FileManager.default.fileExists(atPath: transcript.path) { return transcript }
         }
         return nil
     }
