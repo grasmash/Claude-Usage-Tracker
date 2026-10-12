@@ -1439,12 +1439,50 @@ class ClaudeCodeSyncService {
     private enum LoginAccount {
         case resolving
         case resolved(String)
-        case unresolvable
+        /// The lookup failed (offline, an expired access token the server
+        /// rejects). Not final: retried after `loginAccountRetryInterval`, or
+        /// at once when the login turns up with a renewed access token
+        /// (`accessToken` is a fingerprint of the one that failed).
+        case unresolvable(at: Date, accessToken: String?)
     }
 
-    /// Keyed by `systemLoginFingerprint`, so a login is looked up once.
+    /// Keyed by `systemLoginFingerprint` (the refresh token), so a login is
+    /// looked up once — one lookup in flight per login, a resolved answer kept.
     private var loginAccounts: [String: LoginAccount] = [:]
     private let loginAccountsLock = NSLock()
+
+    /// How long a failed lookup is left alone before the same login is asked
+    /// about again. Tests set it to 0 (retry at once) or `.infinity` (never).
+    var loginAccountRetryInterval: TimeInterval = 60
+
+    private func accessTokenFingerprint(_ credentials: String) -> String? {
+        extractAccessToken(from: credentials).map { sha256HexPrefix($0, length: 16) }
+    }
+
+    /// Whether `credentials` should be looked up now, given what is known.
+    /// Caller holds `loginAccountsLock`.
+    private func lookupDue(_ known: LoginAccount?, credentials: String, now: Date) -> Bool {
+        switch known {
+        case nil:
+            return true
+        case .resolving, .resolved:
+            return false
+        case .unresolvable(let at, let failedToken):
+            if let failedToken, failedToken != accessTokenFingerprint(credentials) { return true }
+            return now.timeIntervalSince(at) >= loginAccountRetryInterval
+        }
+    }
+
+    /// Starts a lookup for `credentials` if one is due. Fire-and-forget: the
+    /// caller answers "unknown" this cycle and asks again next cycle.
+    private func lookUpIfDue(_ credentials: String, fingerprint: String) {
+        loginAccountsLock.lock()
+        let due = lookupDue(loginAccounts[fingerprint], credentials: credentials, now: Date())
+        loginAccountsLock.unlock()
+        if due {
+            Task { await resolveLoginAccount(credentials: credentials) }
+        }
+    }
 
     /// The account identity (`accountUuid`) of the login in `credentials`.
     ///
@@ -1469,11 +1507,12 @@ class ClaudeCodeSyncService {
         case .resolved(let uuid):
             return uuid
         case .unresolvable:
+            lookUpIfDue(credentials, fingerprint: fingerprint)
             return accountIdentity(fromOAuthAccountJSON: configOAuthAccount)
         case .resolving:
             return nil
         case nil:
-            Task { await resolveLoginAccount(credentials: credentials) }
+            lookUpIfDue(credentials, fingerprint: fingerprint)
             return nil
         }
     }
@@ -1493,9 +1532,9 @@ class ClaudeCodeSyncService {
     /// The account uuid of the login in `credentials`, ONLY when its own
     /// lookup succeeded (`.resolved`). Never `.claude.json`'s `oauthAccount`,
     /// which can name the previous account after a `/login`. A login not yet
-    /// looked up starts a lookup and returns nil (unknown) for now. Anything
-    /// that STORES a login under a profile must use this, not
-    /// `loginAccountIdentity`.
+    /// looked up — or whose last lookup failed and is due a retry — starts a
+    /// lookup and returns nil (unknown) for now. Anything that STORES a login
+    /// under a profile must use this, not `loginAccountIdentity`.
     func provenLoginAccountUuid(_ credentials: String) -> String? {
         guard let fingerprint = systemLoginFingerprint(credentials) else { return nil }
         loginAccountsLock.lock()
@@ -1503,8 +1542,8 @@ class ClaudeCodeSyncService {
         loginAccountsLock.unlock()
         switch known {
         case .resolved(let uuid): return uuid
-        case nil: Task { await resolveLoginAccount(credentials: credentials) }; return nil
-        case .resolving, .unresolvable: return nil
+        case nil, .unresolvable: lookUpIfDue(credentials, fingerprint: fingerprint); return nil
+        case .resolving: return nil
         }
     }
 
@@ -1532,15 +1571,22 @@ class ClaudeCodeSyncService {
     }
 
     /// Looks up which account the login in `credentials` belongs to.
+    ///
+    /// One lookup per login at a time: a call while another is in flight
+    /// returns and leaves the in-flight one to answer. A resolved answer is
+    /// final — a failure can never overwrite it, however late it lands. A
+    /// failure is retried (see `LoginAccount.unresolvable`).
     func resolveLoginAccount(credentials: String) async {
         guard let fingerprint = systemLoginFingerprint(credentials) else { return }
         loginAccountsLock.lock()
-        if case .resolved = loginAccounts[fingerprint] {
+        switch loginAccounts[fingerprint] {
+        case .resolved, .resolving:
             loginAccountsLock.unlock()
             return
+        case nil, .unresolvable:
+            loginAccounts[fingerprint] = .resolving
+            loginAccountsLock.unlock()
         }
-        loginAccounts[fingerprint] = .resolving
-        loginAccountsLock.unlock()
 
         var uuid: String?
         if let accessToken = extractAccessToken(from: credentials) {
@@ -1548,10 +1594,16 @@ class ClaudeCodeSyncService {
         }
 
         loginAccountsLock.lock()
-        loginAccounts[fingerprint] = uuid.map(LoginAccount.resolved) ?? .unresolvable
+        if case .resolved = loginAccounts[fingerprint] {
+            // Answered meanwhile; never downgrade.
+        } else if let uuid {
+            loginAccounts[fingerprint] = .resolved(uuid)
+        } else {
+            loginAccounts[fingerprint] = .unresolvable(at: Date(), accessToken: accessTokenFingerprint(credentials))
+        }
         loginAccountsLock.unlock()
         if uuid == nil {
-            LoggingService.shared.log("resolveLoginAccount: could not look up the keychain login's account; using .claude.json")
+            LoggingService.shared.log("resolveLoginAccount: could not look up the keychain login's account; will retry")
         }
     }
 

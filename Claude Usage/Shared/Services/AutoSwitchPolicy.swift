@@ -4,14 +4,28 @@ import Foundation
 /// it can be unit tested without a `ProfileManager` or `MenuBarManager`.
 enum AutoSwitchPolicy {
 
-    /// Usage data older than this is not trusted for switching decisions.
+    /// Usage data older than this is a presumption, not an observation.
     ///
-    /// A profile the tracker can no longer refresh (expired session key, dead
-    /// token) keeps its last snapshot forever. Once that snapshot's reset
-    /// windows pass, its *effective* percentages read 0% and it looks like the
-    /// freshest account on the machine — while in reality we know nothing about
-    /// it. Switching to such a profile hands Claude Code credentials we cannot
-    /// vouch for. So a candidate must have been observed recently.
+    /// A fresh reading (within this age) is evidence an account has room and
+    /// always wins. An older reading is taken only as a last resort, and only
+    /// when it reports no limit still in force — a limit it reported as
+    /// reached whose window has since passed counts as reset (the effective
+    /// percentages). It used to be a hard gate: a profile the tracker could no
+    /// longer refresh kept a snapshot whose windows had passed, looked free, and
+    /// on 2026-09-17 auto-switch wrote its dead login into the keychain. That
+    /// hazard is handled where it arises now — `isLoginDead` skips a login the
+    /// server has rejected, and the swap's own refresh
+    /// (`refreshStoredMainLoginIfExpired`) marks a login dead on `invalid_grant`
+    /// so the next tick moves on — while the gate had become the thing that
+    /// kept rotation stuck: since the single refresher (0bca20c) the tracker
+    /// never reads a non-active login again once its access token expires, so
+    /// EVERY other account's reading is stale within hours and nothing was ever
+    /// a candidate. 2026-10-11 11:52 PM: madmatter hit its limit, the status
+    /// line said "no account free · next: matt 11:51PM" (free NOW), and
+    /// matt@guitargate.com — last read ~19:30 at 100% with a window that ended
+    /// 19:29:59, weekly 44% — was skipped for four hours. A presumed-free
+    /// account is verified after the switch: active, it is read live, and a
+    /// spent reading re-runs this search.
     static let maxUsageAge: TimeInterval = Constants.usageStaleAfter
 
     /// Finds the next profile (wrapping around) that has credentials, has been
@@ -59,15 +73,17 @@ enum AutoSwitchPolicy {
         return mainRefreshToken != pinnedRefreshToken
     }
 
-    /// Candidates must be applicable (see `canBeApplied`), observed recently,
-    /// and under both limits. When `usingFable` is true they must also be under
-    /// their Fable weekly limit, since switching to an account whose Fable
-    /// quota is spent would not unblock a Claude Code set to Fable.
+    /// Candidates must be applicable (see `canBeApplied`) and under both
+    /// limits. When `usingFable` is true they must also be under their Fable
+    /// weekly limit, since switching to an account whose Fable quota is spent
+    /// would not unblock a Claude Code set to Fable.
     ///
-    /// Profiles with no usage data, or data older than `maxUsageAge`, are
-    /// skipped: the tracker cannot currently see them, so there is no evidence
-    /// they have capacity (see `maxUsageAge`). Profiles `isLoginDead` reports
-    /// as logged out, and paused profiles, are skipped too.
+    /// The first candidate (wrapping around) with a FRESH reading under its
+    /// limits is returned. Failing that, the first whose stale reading reports
+    /// no limit still in force — presumed free, see `maxUsageAge`. Profiles
+    /// with no usage data at all are skipped: nothing was ever observed.
+    /// Profiles `isLoginDead` reports as logged out, and paused profiles, are
+    /// skipped too.
     static func nextAvailableProfile(
         in profiles: [Profile],
         after current: Profile,
@@ -80,6 +96,7 @@ enum AutoSwitchPolicy {
         let count = profiles.count
         guard count > 1 else { return nil }
 
+        var presumedFree: Profile?
         for offset in 1..<count {
             let candidate = profiles[(currentIndex + offset) % count]
 
@@ -89,16 +106,18 @@ enum AutoSwitchPolicy {
             // applying it would hand Claude Code a login that cannot work.
             guard !isLoginDead(candidate) else { continue }
 
-            guard let usage = candidate.claudeUsage else { continue }
+            guard let usage = candidate.claudeUsage,
+                  !usage.isLimitReached(usingFable: usingFable) else { continue }
 
-            guard !usage.isStale(now: now) else { continue }
-
-            if !usage.isLimitReached(usingFable: usingFable) {
+            if !usage.isStale(now: now) {
                 return candidate
+            }
+            if presumedFree == nil {
+                presumedFree = candidate
             }
         }
 
-        return nil
+        return presumedFree
     }
 
     /// Where auto-switch goes (operator, 2026-10-11: "if fable is being used,

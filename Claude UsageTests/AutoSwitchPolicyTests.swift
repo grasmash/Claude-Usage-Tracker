@@ -99,10 +99,11 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(next?.id, healthy.id)
     }
 
-    func testProfileWithStaleUsageIsSkipped() {
-        // Regression: a profile whose refresh has been failing keeps a stale
-        // snapshot whose reset windows have passed, so its effective usage reads
-        // 0% and it looks like the best target. It must be skipped.
+    func testAFreshCandidateIsPreferredOverAStaleOne() {
+        // A profile whose refresh has been failing keeps a stale snapshot whose
+        // reset windows have passed, so its effective usage reads 0%. A fresh
+        // reading is evidence; the stale one is a presumption, so the fresh
+        // candidate wins whenever there is one.
         let now = Date()
         let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
         let stale = makeProfile("b", usage: makeUsage(
@@ -129,12 +130,40 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(next?.id, recent.id)
     }
 
-    func testReturnsNilWhenOnlyOtherProfileIsStale() {
+    func testAStaleReadingWithHeadroomIsALastResortCandidate() {
+        // The single refresher never reads a non-active login again once its
+        // access token expires, so every other account's reading goes stale
+        // within hours. A stale reading that reports no limit still in force is
+        // the best evidence there is; the switch is verified live afterwards.
         let now = Date()
         let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
         let stale = makeProfile("b", usage: makeUsage(session: 0, weekly: 0, updatedAt: now.addingTimeInterval(-3600)))
 
-        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, stale], after: current, now: now))
+        XCTAssertEqual(AutoSwitchPolicy.nextAvailableProfile(in: [current, stale], after: current, now: now)?.id, stale.id)
+    }
+
+    func testAStaleReadingWhoseLimitIsStillInForceIsSkipped() {
+        // Spent when last seen, and the window it reported has not passed yet:
+        // nothing suggests it has freed up.
+        let now = Date()
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
+        let spent = makeProfile("b", usage: makeUsage(
+            session: 0, weekly: 100, weeklyResetIn: 3 * 86400, updatedAt: now.addingTimeInterval(-7 * 3600)
+        ))
+
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [current, spent], after: current, now: now))
+    }
+
+    func testAStaleReadingWithAPassedWindowIsPresumedResetAndTaken() {
+        // Spent when last seen, but the window it reported has since passed:
+        // presumed reset, and chosen when nothing fresh is free.
+        let now = Date()
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
+        let rolledOver = makeProfile("b", usage: makeUsage(
+            session: 100, weekly: 40, sessionResetIn: -30 * 60, updatedAt: now.addingTimeInterval(-4 * 3600)
+        ))
+
+        XCTAssertEqual(AutoSwitchPolicy.nextAvailableProfile(in: [current, rolledOver], after: current, now: now)?.id, rolledOver.id)
     }
 
     func testSkipsProfilesWithoutAnyCredentials() {
@@ -498,6 +527,48 @@ final class AutoSwitchPolicyTests: XCTestCase {
         let other = makeProfile("B", usage: makeUsage(session: 10, weekly: 100, fable: 10))
         XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active, other], activeId: active.id), .wait(.noHeadroom))
         XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active], activeId: nil), .wait(.activeUnverifiable))
+    }
+
+    // MARK: - Replay 2026-10-11 11:52 PM: a freed account with a stale reading
+    //
+    // madmatter23 hit its 5-hour limit at 11:52 PM (window to 12:40 AM). The
+    // status line read "⚠ no account free · next: matt 11:51PM" (matt =
+    // matt@guitargate.com, and 11:51 was the current tick: its freeAt was NOW)
+    // and nothing switched; the operator ran /login by hand. The tracker's
+    // readings at that tick, from profiles-backup.json and the usageHistory
+    // files: madmatter fresh at 100% session; grasmash, littlewing,
+    // matt.grasmick and goose stale since 16:50 / 11:45 with weekly 100% and
+    // resets days away (truly spent); matt@guitargate.com stale since ~19:30 —
+    // 100% session with a window that ended 19:29:59, weekly 44%, Fable 38% —
+    // free for four hours and skipped only because its reading was older than
+    // maxUsageAge (the single refresher never read its expired login again).
+
+    func testReplay20261011_aFreedAccountWithAStaleReadingIsTheSwitchTarget() {
+        let now = Date()
+        let h: TimeInterval = 3600
+        let madmatter = makeProfile("madmatter23@gmail.com", usage: makeUsage(
+            session: 100, weekly: 82, sessionResetIn: 48 * 60, weeklyResetIn: 6 * 24 * h, fable: 80, updatedAt: now))
+        let grasmash = makeProfile("grasmashllc@gmail.com", usage: makeUsage(
+            session: 0, weekly: 100, sessionResetIn: -2 * h, weeklyResetIn: 3 * 24 * h, fable: 59, updatedAt: now - 7 * h))
+        let littlewing = makeProfile("littlewing@guitargate.com", usage: makeUsage(
+            session: 82, weekly: 100, sessionResetIn: -10 * h, weeklyResetIn: 35 * h, fable: 66, updatedAt: now - 12 * h))
+        let mattg = makeProfile("matt.grasmick@gmail.com", usage: makeUsage(
+            session: 0, weekly: 100, sessionResetIn: -2 * h, weeklyResetIn: 3 * 24 * h, fable: 100, updatedAt: now - 7 * h))
+        let goose = makeProfile("gooseappai@gmail.com", usage: makeUsage(
+            session: 0, weekly: 100, sessionResetIn: -2 * h, weeklyResetIn: 2 * 24 * h, fable: 38, updatedAt: now - 7 * h))
+        let mattgg = makeProfile("matt@guitargate.com", usage: makeUsage(
+            session: 100, weekly: 44, sessionResetIn: -(4 * h + 22 * 60), weeklyResetIn: 6 * 24 * h, fable: 38,
+            updatedAt: now - (4 * h + 25 * 60)))
+        let profiles = [grasmash, littlewing, madmatter, mattg, goose, mattgg]
+
+        var decider = AutoSwitchDecider()
+        for usingFable in [false, true] {
+            XCTAssertEqual(
+                decider.decide(current: madmatter, profiles: profiles, usingFable: usingFable, now: now),
+                .switchTo(mattgg, withoutFable: false), "usingFable=\(usingFable)")
+            decider.reset(madmatter.id)
+        }
+        XCTAssertFalse(AutoSwitchStatus.build(profiles: profiles, activeId: madmatter.id, now: now).stuck)
     }
 
     // MARK: - Stuck with no free account: retry every tick (2026-10-11 6:05 PM)
