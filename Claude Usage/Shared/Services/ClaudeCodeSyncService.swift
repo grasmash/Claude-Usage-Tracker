@@ -1440,10 +1440,12 @@ class ClaudeCodeSyncService {
         case resolving
         case resolved(String)
         /// The lookup failed (offline, an expired access token the server
-        /// rejects). Not final: retried after `loginAccountRetryInterval`, or
-        /// at once when the login turns up with a renewed access token
-        /// (`accessToken` is a fingerprint of the one that failed).
-        case unresolvable(at: Date, accessToken: String?)
+        /// rejects). Not final: retried after `loginAccountRetryInterval`,
+        /// doubling per consecutive failure up to `loginAccountMaxRetryInterval`
+        /// (an expired token is not re-sent every minute for hours), or at once
+        /// when the login turns up with a renewed access token (`accessToken`
+        /// is a fingerprint of the one that failed).
+        case unresolvable(at: Date, accessToken: String?, failures: Int)
     }
 
     /// Keyed by `systemLoginFingerprint` (the refresh token), so a login is
@@ -1454,9 +1456,17 @@ class ClaudeCodeSyncService {
     /// How long a failed lookup is left alone before the same login is asked
     /// about again. Tests set it to 0 (retry at once) or `.infinity` (never).
     var loginAccountRetryInterval: TimeInterval = 60
+    /// Ceiling for the doubling retry interval.
+    var loginAccountMaxRetryInterval: TimeInterval = 3600
 
     private func accessTokenFingerprint(_ credentials: String) -> String? {
         extractAccessToken(from: credentials).map { sha256HexPrefix($0, length: 16) }
+    }
+
+    /// The wait after `failures` consecutive failures: base, 2x, 4x … capped.
+    func loginAccountRetryDelay(afterFailures failures: Int) -> TimeInterval {
+        let doublings = max(0, min(failures - 1, 16))
+        return min(loginAccountRetryInterval * pow(2, Double(doublings)), loginAccountMaxRetryInterval)
     }
 
     /// Whether `credentials` should be looked up now, given what is known.
@@ -1467,9 +1477,9 @@ class ClaudeCodeSyncService {
             return true
         case .resolving, .resolved:
             return false
-        case .unresolvable(let at, let failedToken):
+        case .unresolvable(let at, let failedToken, let failures):
             if let failedToken, failedToken != accessTokenFingerprint(credentials) { return true }
-            return now.timeIntervalSince(at) >= loginAccountRetryInterval
+            return now.timeIntervalSince(at) >= loginAccountRetryDelay(afterFailures: failures)
         }
     }
 
@@ -1579,14 +1589,18 @@ class ClaudeCodeSyncService {
     func resolveLoginAccount(credentials: String) async {
         guard let fingerprint = systemLoginFingerprint(credentials) else { return }
         loginAccountsLock.lock()
+        let priorFailures: Int
         switch loginAccounts[fingerprint] {
         case .resolved, .resolving:
             loginAccountsLock.unlock()
             return
-        case nil, .unresolvable:
-            loginAccounts[fingerprint] = .resolving
-            loginAccountsLock.unlock()
+        case nil:
+            priorFailures = 0
+        case .unresolvable(_, _, let failures):
+            priorFailures = failures
         }
+        loginAccounts[fingerprint] = .resolving
+        loginAccountsLock.unlock()
 
         var uuid: String?
         if let accessToken = extractAccessToken(from: credentials) {
@@ -1599,7 +1613,8 @@ class ClaudeCodeSyncService {
         } else if let uuid {
             loginAccounts[fingerprint] = .resolved(uuid)
         } else {
-            loginAccounts[fingerprint] = .unresolvable(at: Date(), accessToken: accessTokenFingerprint(credentials))
+            loginAccounts[fingerprint] = .unresolvable(
+                at: Date(), accessToken: accessTokenFingerprint(credentials), failures: priorFailures + 1)
         }
         loginAccountsLock.unlock()
         if uuid == nil {
@@ -1679,14 +1694,21 @@ class ClaudeCodeSyncService {
     /// a switch) for this profile has been rejected by the OAuth server, i.e.
     /// the account needs a fresh `/login`.
     ///
-    /// For the active profile that is the system keychain login; for any other
-    /// profile it is the stored login a switch would apply.
+    /// For the active profile that is the system keychain login when it is
+    /// proven to be this profile's (Claude Code may have rotated it); when it
+    /// is not — another account's login, or one not yet looked up — the
+    /// profile is judged by its stored login, the one a switch would apply,
+    /// like any other profile. Judging nothing in that case read "alive" for a
+    /// dead login whenever the tracker's active profile and the keychain
+    /// disagreed (probe D, gate on 2070d8b). For any other profile it is the
+    /// stored login.
     func isLoginDead(for profile: Profile) -> Bool {
         guard !deadLogins.isEmpty else { return false }
 
         let mainJSON: String?
         if ProfileStore.shared.loadActiveProfileId() == profile.id {
             mainJSON = (try? readSystemCredentials()).flatMap { systemCredentials($0, belongTo: profile) ? $0 : nil }
+                ?? profile.cliCredentialsJSON
         } else {
             mainJSON = profile.cliCredentialsJSON
         }

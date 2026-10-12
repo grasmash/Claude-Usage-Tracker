@@ -112,12 +112,43 @@ enum AutoSwitchPolicy {
             if !usage.isStale(now: now) {
                 return candidate
             }
-            if presumedFree == nil {
-                presumedFree = candidate
-            }
+            // Among presumptions, the most recently observed is the best one.
+            if let held = presumedFree?.claudeUsage?.lastUpdated, held >= usage.lastUpdated { continue }
+            presumedFree = candidate
         }
 
         return presumedFree
+    }
+
+    /// Whether an auto-switch may make `target` the tracker's active profile
+    /// given what `switchMainLogin` did with the shared login.
+    ///
+    /// A switch the user clicked always activates: they chose the account, and
+    /// the notification tells them what Claude Code's login is doing. An
+    /// AUTOMATIC switch activates only when the shared login was written, or
+    /// its refusal will be retried (sessions running, an unknown or unreadable
+    /// keychain, no process list). When the stored login could not be applied
+    /// at all — the switch threw (its refresh was rejected: the login is dead,
+    /// and `refreshStoredMainLoginIfExpired` has marked it so), or the refusal
+    /// is final (`untrustedStoredLogin`, `notTheSharedLoginEntry`) — the
+    /// tracker must NOT move: with tracker-active = target and keychain = the
+    /// spent account, `isLoginDead(target)` would judge by the keychain's
+    /// login, the target's stale "free" reading would read `.stay`, adoption
+    /// never fires, and rotation stalls behind a false "switched" notice.
+    /// Staying put makes `switchLanded` false, so the decider re-arms and the
+    /// next tick skips the now-dead target (probe D, gate on 2070d8b).
+    static func activateAfterMainLoginSwitch(
+        _ outcome: Result<ClaudeCodeSyncService.MainLoginSwitch, Error>, selectedBy: String
+    ) -> Bool {
+        guard selectedBy == "auto" else { return true }
+        switch outcome {
+        case .failure:
+            return false
+        case .success(.refused(.untrustedStoredLogin)), .success(.refused(.notTheSharedLoginEntry)):
+            return false
+        case .success:
+            return true
+        }
     }
 
     /// Where auto-switch goes (operator, 2026-10-11: "if fable is being used,

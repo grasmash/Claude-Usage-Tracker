@@ -529,6 +529,45 @@ final class AutoSwitchPolicyTests: XCTestCase {
         XCTAssertEqual(AutoSwitchPolicy.fableRestoreAction(profiles: [active], activeId: nil), .wait(.activeUnverifiable))
     }
 
+    func testTheMostRecentlyObservedStaleCandidateIsPreferred() {
+        let now = Date()
+        let current = makeProfile("a", usage: makeUsage(session: 100, weekly: 10, updatedAt: now))
+        let older = makeProfile("b", usage: makeUsage(session: 0, weekly: 0, updatedAt: now.addingTimeInterval(-6 * 3600)))
+        let newer = makeProfile("c", usage: makeUsage(session: 0, weekly: 0, updatedAt: now.addingTimeInterval(-1 * 3600)))
+
+        XCTAssertEqual(AutoSwitchPolicy.nextAvailableProfile(in: [current, older, newer], after: current, now: now)?.id, newer.id)
+    }
+
+    // MARK: - Probe D (gate on 2070d8b): an automatic switch INTO a login that cannot be applied
+    //
+    // With tracker-active = B and the keychain still = spent A, isLoginDead(B)
+    // judged by A's unproven keychain login (false), B's stale "free" reading
+    // read .stay, adoption never fired, and switchLanded announced a switch
+    // that had not happened. The tracker must stay on A so the decider re-arms.
+
+    func testAnAutomaticSwitchWhoseLoginWasRejectedDoesNotActivate() {
+        struct RefreshRejected: Error {}
+        XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.failure(RefreshRejected()), selectedBy: "auto"))
+        XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.untrustedStoredLogin(.unknownProvenance))), selectedBy: "auto"))
+        XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.notTheSharedLoginEntry(service: "Claude Code-credentials-x"))), selectedBy: "auto"))
+    }
+
+    func testAnAutomaticSwitchActivatesWhenTheLoginWasWrittenOrTheRefusalIsRetried() {
+        for outcome: ClaudeCodeSyncService.MainLoginSwitch in [
+            .applied(racedHolders: 0), .alreadyApplied,
+            .refused(.sessionsRunning(count: 3)), .refused(.unknownKeychainLogin),
+            .refused(.processListUnavailable), .refused(.keychainUnreadable),
+        ] {
+            XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(outcome), selectedBy: "auto"), "\(outcome)")
+        }
+    }
+
+    func testAUserSwitchAlwaysActivates() {
+        struct RefreshRejected: Error {}
+        XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.failure(RefreshRejected()), selectedBy: "user"))
+        XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.untrustedStoredLogin(.copyOfPinnedEntry))), selectedBy: "user"))
+    }
+
     // MARK: - Replay 2026-10-11 11:52 PM: a freed account with a stale reading
     //
     // madmatter23 hit its 5-hour limit at 11:52 PM (window to 12:40 AM). The

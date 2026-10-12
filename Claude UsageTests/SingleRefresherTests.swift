@@ -770,4 +770,65 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertFalse(ClaudeCodeSyncService.isMutatingSecurityVerb("find-generic-password"))
         XCTAssertFalse(ClaudeCodeSyncService.isMutatingSecurityVerb("dump-keychain"))
     }
+
+    // MARK: - Probe D (gate on 2070d8b): switching INTO a dead login
+    //
+    // A presumed-free target's reading is stale because its token expired, so
+    // every such switch refreshes the stored login; a rejected refresh must
+    // leave the tracker on the spent account, mark the target dead, and make
+    // the next tick skip it. `ProfileManager.activateProfile` itself is not
+    // driven here: the singleton writes the real statusline config and posts
+    // notifications under the test host. Its decision is
+    // `AutoSwitchPolicy.activateAfterMainLoginSwitch` (AutoSwitchPolicyTests).
+
+    private func staleFreeUsage() -> ClaudeUsage {
+        var u = ClaudeUsage.empty
+        u.sessionPercentage = 100
+        u.sessionResetTime = Date().addingTimeInterval(-4 * 3600)   // window long passed
+        u.lastUpdated = Date().addingTimeInterval(-5 * 3600)
+        return u
+    }
+
+    func testProbeD_aRejectedStoredLoginRefreshThrowsMarksItDeadAndTheNextTickSkipsIt() async {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        var spentA = imported("A", a)
+        spentA.claudeUsage = ClaudeUsage.empty
+        spentA.claudeUsage?.sessionPercentage = 100
+        var b = imported("B", login("B-dead-\(UUID().uuidString.prefix(6))", expiresIn: -600))
+        b.claudeUsage = staleFreeUsage()
+        sync.tokenRefresher = { [unowned self] _ in
+            self.refreshCalls += 1
+            throw ClaudeCodeError.refreshFailed(status: 400, body: #"{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}"#)
+        }
+        XCTAssertEqual(AutoSwitchPolicy.nextAvailableProfile(in: [spentA, b], after: spentA, isLoginDead: sync.isLoginDead(for:))?.id, b.id,
+                       "precondition: B is the presumed-free target")
+
+        var thrown: Error?
+        do { _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!]) } catch { thrown = error }
+
+        XCTAssertNotNil(thrown, "the switch throws: the stored login could not be applied")
+        XCTAssertEqual(refreshCalls, 1)
+        XCTAssertEqual(keychain[mainService], a, "A's login is untouched")
+        XCTAssertTrue(sync.isLoginDead(for: b), "B is marked dead")
+        XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.failure(thrown!), selectedBy: "auto"),
+                       "the tracker stays on A …")
+        XCTAssertFalse(AutoSwitchPolicy.switchLanded(fromId: spentA.id, targetId: b.id, activeIdAfter: spentA.id),
+                       "… so the auto-switch did not land and the decider re-arms")
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: [spentA, b], after: spentA, isLoginDead: sync.isLoginDead(for:)),
+                     "the next tick skips B")
+    }
+
+    func testProbeD_theActiveProfileIsJudgedByItsStoredLoginWhenTheKeychainLoginIsNotProvenItsOwn() {
+        // The pre-fix end state: tracker-active = B, keychain still = A.
+        keychain[mainService] = login("A", expiresIn: 3600)
+        let tag = UUID().uuidString.prefix(6)
+        let b = imported("B", login("B-dead-\(tag)", expiresIn: -600))
+        sync.deadLogins.markDead("refresh-B-dead-\(tag)")
+        let previousActive = ProfileStore.shared.loadActiveProfileId()
+        ProfileStore.shared.saveActiveProfileId(b.id)
+        defer { if let previousActive { ProfileStore.shared.saveActiveProfileId(previousActive) } }
+
+        XCTAssertTrue(sync.isLoginDead(for: b), "A's login in the keychain is not proven to be B's; B is judged by the login a switch would apply")
+    }
 }

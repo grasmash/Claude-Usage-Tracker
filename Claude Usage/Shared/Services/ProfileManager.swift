@@ -293,27 +293,21 @@ class ProfileManager: ObservableObject {
             return
         }
 
-        // Rotation first reaches NEW work: the selection file names the account
-        // `cca` (claude-rotate) starts its next session in. That never touches a
-        // login a running session holds. (Anthropic-only — switching to e.g. a
-        // Codex profile must not rewrite anything of Claude Code's.)
-        if updatedProfile.provider.descriptor.capabilities.cliAccountSync {
-            writeSelection(for: updatedProfile, by: selectedBy)
-        }
-
-        // Then the shared Claude Code login (the main keychain entry), but only
-        // when nothing holds it — see `ClaudeCodeSyncService.switchMainLogin`.
+        // The shared Claude Code login (the main keychain entry), but only when
+        // nothing holds it — see `ClaudeCodeSyncService.switchMainLogin`.
         LoggingService.shared.log("Checking CLI credentials for profile '\(updatedProfile.name)': hasJSON=\(updatedProfile.cliCredentialsJSON != nil)")
 
         if AutoSwitchPolicy.canBeApplied(updatedProfile) {
             let previousName = activeProfile?.name ?? "the previous account"
             pendingMainLoginSwitch = true
             pendingMainLoginPrevious = previousName
+            let result: Result<ClaudeCodeSyncService.MainLoginSwitch, Error>
             do {
                 let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id)
                 // Reload: the switch may have refreshed and stored the login.
                 profiles = profileStore.loadProfiles()
                 handleMainLoginSwitch(outcome, for: updatedProfile, previousName: previousName, announceLater: false)
+                result = .success(outcome)
             } catch {
                 pendingMainLoginSwitch = false
                 LoggingService.shared.logError("Failed to apply CLI credentials (non-fatal)", error: error)
@@ -322,6 +316,15 @@ class ProfileManager: ObservableObject {
                     reason: "notification.switch_not_applied.apply_failed".localized,
                     settings: updatedProfile.notificationSettings
                 )
+                result = .failure(error)
+            }
+            // An automatic switch whose login could not be applied does not move
+            // the tracker: see `AutoSwitchPolicy.activateAfterMainLoginSwitch`.
+            guard AutoSwitchPolicy.activateAfterMainLoginSwitch(result, selectedBy: selectedBy) else {
+                LoggingService.shared.log("AutoSwitch: '\(updatedProfile.name)' could not take the shared login; the active profile stays '\(previousName)'")
+                switchingSemaphore = false
+                isSwitchingProfile = false
+                return
             }
         } else if updatedProfile.provider.descriptor.capabilities.cliAccountSync {
             // The tracker will show this profile as active, but Claude Code is
@@ -340,6 +343,16 @@ class ProfileManager: ObservableObject {
                     : "notification.switch_not_applied.no_cli_creds").localized,
                 settings: updatedProfile.notificationSettings
             )
+        }
+
+        // Rotation reaches NEW work: the selection file names the account `cca`
+        // (claude-rotate) starts its next session in. That never touches a login
+        // a running session holds. Written once the account is actually taken,
+        // so it never names a login that just proved dead. (Anthropic-only —
+        // switching to e.g. a Codex profile must not rewrite anything of Claude
+        // Code's.)
+        if updatedProfile.provider.descriptor.capabilities.cliAccountSync {
+            writeSelection(for: updatedProfile, by: selectedBy)
         }
 
         // Update last used timestamp
