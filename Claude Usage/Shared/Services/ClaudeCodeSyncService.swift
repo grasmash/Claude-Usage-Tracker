@@ -96,11 +96,24 @@ class ClaudeCodeSyncService {
     /// or its output cannot be decoded: an empty list would read as "no
     /// holders" and let a switch proceed blind (C1).
     static func listRunningProcesses() -> [MainLoginSwapPolicy.RunningProcess]? {
-        guard let commands = runPs(["-axww", "-o", "pid=,ppid=,command="]),
-              let withEnvironment = runPs(["-axwwE", "-o", "pid=,ppid=,command="]) else { return nil }
-        let processes = MainLoginSwapPolicy.parsePsOutput(commands: commands, withEnvironment: withEnvironment)
-        // A machine always has processes; an empty parse means ps changed shape.
-        return processes.isEmpty ? nil : processes
+        if let commands = runPs(["-axww", "-o", "pid=,ppid=,command="]),
+           let withEnvironment = runPs(["-axwwE", "-o", "pid=,ppid=,command="]) {
+            let processes = MainLoginSwapPolicy.parsePsOutput(commands: commands, withEnvironment: withEnvironment)
+            // A machine always has processes; an empty parse means ps changed shape.
+            if !processes.isEmpty { return processes }
+            LoggingService.shared.logError("listRunningProcesses: ps output parsed to no processes (\(commands.utf8.count) and \(withEnvironment.utf8.count) bytes); using the in-process listing")
+        }
+        // 2026-10-12 03:14-10:21 EDT: `ps` failed 856 times in a row and every
+        // switch was refused for seven hours ("cannot list processes"). The
+        // in-process listing needs no spawn. It cannot read environments, so
+        // every Claude Code process counts as a shared-login holder — erring
+        // toward refusal, never toward a blind write.
+        let fallback = ProcessListing.listViaLibproc()
+        if fallback.isEmpty {
+            LoggingService.shared.logError("listRunningProcesses: the in-process listing found no processes either; refusing")
+            return nil
+        }
+        return fallback
     }
 
     private static func runPs(_ arguments: [String]) -> String? {
@@ -113,13 +126,13 @@ class ClaudeCodeSyncService {
         do {
             try process.run()
         } catch {
-            LoggingService.shared.logError("listRunningProcesses: could not run ps \(arguments.first ?? "")", error: error)
+            LoggingService.shared.logError("listRunningProcesses: could not run ps \(arguments.first ?? "") (errno \(errno))", error: error)
             return nil
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
-            LoggingService.shared.logError("listRunningProcesses: ps \(arguments.first ?? "") exited \(process.terminationStatus)")
+            LoggingService.shared.logError("listRunningProcesses: ps \(arguments.first ?? "") exited \(process.terminationStatus) (reason \(process.terminationReason.rawValue), \(data.count) bytes)")
             return nil
         }
         // ps output is not guaranteed UTF-8 (arguments can be any bytes).
