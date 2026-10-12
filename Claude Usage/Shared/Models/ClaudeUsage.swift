@@ -88,6 +88,16 @@ struct ClaudeUsage: Codable, Equatable {
     var lastUpdated: Date
     var userTimezone: TimeZone
 
+    /// Where this reading came from: nil = the app's own read of the account;
+    /// `sourceMissionControl` = mission control's read-only reading for an
+    /// inactive profile (`McUsage`). `lastUpdated` is always the time the
+    /// reading was taken, whichever the source.
+    var source: String?
+
+    static let sourceMissionControl = "mc"
+
+    var isFromMissionControl: Bool { source == Self.sourceMissionControl }
+
     /// Remaining percentage (100 - used percentage)
     var remainingPercentage: Double {
         max(0, 100 - effectiveSessionPercentage)
@@ -175,6 +185,7 @@ extension ClaudeUsage {
         case overageBalance, overageBalanceCurrency
         case planType, creditsBalance, creditsUnlimited
         case lastUpdated, userTimezone
+        case source
     }
 
     init(from decoder: Decoder) throws {
@@ -208,7 +219,8 @@ extension ClaudeUsage {
             creditsBalance: try c.decodeIfPresent(Double.self, forKey: .creditsBalance),
             creditsUnlimited: try c.decodeIfPresent(Bool.self, forKey: .creditsUnlimited),
             lastUpdated: try c.decodeIfPresent(Date.self, forKey: .lastUpdated) ?? Date(),
-            userTimezone: try c.decodeIfPresent(TimeZone.self, forKey: .userTimezone) ?? .current
+            userTimezone: try c.decodeIfPresent(TimeZone.self, forKey: .userTimezone) ?? .current,
+            source: (try? c.decodeIfPresent(String.self, forKey: .source)) ?? nil
         )
     }
 }

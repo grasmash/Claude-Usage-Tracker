@@ -1096,3 +1096,17 @@
 "support.popup_signature" = "das Ein-Personen-Team hinter Claude Usage";
 "support.popup_body" = "Kostenlos, Open Source, von einer Person gebaut — ohne Werbung, ohne Tracking. Hat es dich je vor einem verbrannten Session-Limit bewahrt, hält ein Kaffee es am Leben.";
 "support.popup_days" = "Behält deine Limits seit %d Tagen im Blick — für immer kostenlos";
+
+/* Mission control usage for inactive profiles; dead login vs old reading */
+"popover.reading.from_mc" = "Von Mission Control vor %@ gelesen (dieses Konto ist nicht aktiv).";
+"popover.reading.sign_in_needed" = "%@: Anmeldung nötig. Führe claude-usage-login im Terminal aus und melde dich als %@ an. Der automatische Wechsel überspringt dieses Konto bis dahin.";
+"popover.reading.stale_idle" = "Messwert %@ alt. Normal für ein inaktives Konto: Es wird bei der nächsten Nutzung neu gelesen, und der automatische Wechsel kann weiterhin dorthin wechseln. Nichts zu tun.";
+"popover.reading.stale_idle_mc" = "Messwert %@ alt (zuletzt von Mission Control). Normal für ein inaktives Konto: Der automatische Wechsel kann weiterhin dorthin wechseln. Nichts zu tun.";
+"mc_usage.title" = "Nutzung aus Mission Control";
+"mc_usage.subtitle" = "Aktuelle Nutzung inaktiver Konten aus der schreibgeschützten Nutzungsabfrage von Mission Control. Token leer lassen, um dies auszuschalten.";
+"mc_usage.url" = "Mission-Control-URL";
+"mc_usage.token" = "Token";
+"mc_usage.token_saved" = "Token gespeichert";
+"mc_usage.save" = "Speichern";
+"mc_usage.clear" = "Löschen";
+"mc_usage.status" = "Letzter Abruf: %@";

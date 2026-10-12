@@ -1082,3 +1082,17 @@
 "support.popup_signature" = "Claude Usage 背后的一人团队";
 "support.popup_body" = "免费、开源、一人开发——没有广告，没有跟踪。如果它曾帮你避免烧掉会话额度，一杯咖啡就能让它继续前进。";
 "support.popup_days" = "已守护你的额度 %d 天 — 永久免费";
+
+/* Mission control usage for inactive profiles; dead login vs old reading */
+"popover.reading.from_mc" = "mission control 于 %@ 前读取（此账户未激活）。";
+"popover.reading.sign_in_needed" = "%@：需要登录。在终端运行 claude-usage-login，并以 %@ 登录。在此之前自动切换会跳过此账户。";
+"popover.reading.stale_idle" = "读数来自 %@ 前。未激活的账户这是正常的：下次使用时会重新读取，自动切换仍可切换到它。无需操作。";
+"popover.reading.stale_idle_mc" = "读数来自 %@ 前（最后一次来自 mission control）。未激活的账户这是正常的：自动切换仍可切换到它。无需操作。";
+"mc_usage.title" = "mission control 用量";
+"mc_usage.subtitle" = "从 mission control 的只读用量读取获取未激活账户的最新用量。令牌留空即关闭。";
+"mc_usage.url" = "mission control 网址";
+"mc_usage.token" = "令牌";
+"mc_usage.token_saved" = "令牌已保存";
+"mc_usage.save" = "保存";
+"mc_usage.clear" = "清除";
+"mc_usage.status" = "上次获取：%@";

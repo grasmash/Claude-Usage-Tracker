@@ -1122,6 +1122,11 @@ class MenuBarManager: NSObject, ObservableObject {
                 }
             }
 
+            // Inactive profiles' fresh readings from mission control, after the
+            // loop above so its cached fallback cannot write an older snapshot
+            // over them, and before the auto-switch checks below read them.
+            await self.applyMissionControlUsage()
+
             // Update all icons once after all profiles are refreshed
             await MainActor.run {
                 let config = self.profileManager.multiProfileConfig
@@ -1147,6 +1152,30 @@ class MenuBarManager: NSObject, ObservableObject {
                 self.checkAutoSwitchForDeadLogin()
                 self.restoreModelIfFableIsBack()
                 self.writeAutoSwitchStatus()
+            }
+        }
+    }
+
+    /// Stores mission control's fresh readings for INACTIVE profiles (see
+    /// `McUsage`). One read-only GET, throttled; no config or any failure
+    /// changes nothing, so the app behaves exactly as before. The active
+    /// profile is never touched: it is read live.
+    private func applyMissionControlUsage() async {
+        let readings = await McUsageClient.shared.fetchReadings(config: SharedDataStore.shared.missionControlConfig())
+        guard !readings.isEmpty else { return }
+        guard let rotate = McUsage.loadRotateConfig() else {
+            LoggingService.shared.log("McUsage: claude-rotate config unreadable; no profile can be matched to mission control")
+            return
+        }
+        await MainActor.run {
+            let updates = McUsage.overlay(
+                profiles: self.profileManager.profiles,
+                activeProfileId: self.profileManager.activeProfile?.id,
+                readings: readings, rotate: rotate, now: Date())
+            for update in updates {
+                self.profileManager.saveClaudeUsage(update.usage, for: update.profileId)
+                let name = self.profileManager.profiles.first { $0.id == update.profileId }?.name ?? "?"
+                LoggingService.shared.log("McUsage: '\(name)' took mission control's reading from \(update.usage.lastUpdated) (weekly \(update.usage.weeklyPercentage)%)")
             }
         }
     }
@@ -1233,6 +1262,11 @@ class MenuBarManager: NSObject, ObservableObject {
             await MainActor.run {
                 self.isRefreshing = true
             }
+
+            // Inactive profiles' fresh readings from mission control, before
+            // the auto-switch check below reads them. Single-profile mode never
+            // reads an inactive profile itself, so nothing here can overwrite them.
+            await self.applyMissionControlUsage()
 
             // Capture previous usage BEFORE fetching new data (for reset detection)
             let previousUsage = await MainActor.run { self.usage }
@@ -1413,32 +1447,64 @@ class MenuBarManager: NSObject, ObservableObject {
 
     // MARK: - Stale Profile Detection
 
-    /// Why a profile's usage is not updating, in user-facing terms, or nil if fresh.
-    ///
-    /// Two distinct causes, two distinct remedies:
-    /// - the last refresh failed (typically an expired claude.ai session key) →
-    ///   re-sign in;
-    /// - the profile has no session key and is not the active one, so its CLI
-    ///   OAuth token is never refreshed (rotating it could break a live Claude
-    ///   Code session) → add a session key so it is tracked independently.
-    func staleReason(for profile: Profile, now: Date = Date()) -> String? {
-        guard let usage = profile.claudeUsage else {
-            return "popover.stale.never_updated".localized
-        }
-        // A single failed refresh on otherwise-fresh data is noise (transient
-        // 429s, blips). Only call it out once the data has actually gone stale.
-        guard usage.isStale(now: now) else { return nil }
-        if let error = profileRefreshErrors[profile.id] {
-            return "popover.stale.refresh_failed".localized(with: error)
-        }
-        if profile.claudeSessionKey == nil,
-           profile.id != profileManager.activeProfile?.id {
-            return "popover.stale.no_session_key".localized(with: Self.ageDescription(since: usage.lastUpdated, now: now))
-        }
-        return "popover.stale.generic".localized(with: Self.ageDescription(since: usage.lastUpdated, now: now))
+    /// What can honestly be said about a profile's reading. Uses only what
+    /// the app already knows (the dead-login set and the last refresh result);
+    /// it never probes a refresh to find out, because that is a token write.
+    func readingState(for profile: Profile, now: Date = Date()) -> ProfileReadingState {
+        ProfileReadingState.classify(
+            profile: profile,
+            isActive: profile.id == profileManager.activeProfile?.id,
+            isLoginDead: deadLoginProfileIds(now: now).contains(profile.id),
+            refreshError: profileRefreshErrors[profile.id],
+            now: now
+        )
     }
 
-    /// True if the profile's data is stale or its last refresh failed.
+    /// Profiles whose login `deadLogins` holds. Cached briefly: the popover
+    /// asks on every render, and judging the active profile reads its keychain
+    /// login (a read, never a write).
+    private var deadLoginCache: (at: Date, ids: Set<UUID>)?
+
+    private func deadLoginProfileIds(now: Date) -> Set<UUID> {
+        if let cache = deadLoginCache, abs(now.timeIntervalSince(cache.at)) < 15 { return cache.ids }
+        let ids = Set(profileManager.profiles
+            .filter { $0.provider.descriptor.capabilities.cliAccountSync && ClaudeCodeSyncService.shared.isLoginDead(for: $0) }
+            .map(\.id))
+        deadLoginCache = (now, ids)
+        return ids
+    }
+
+    /// The banner text for a profile's reading, or nil when there is nothing
+    /// to say. A dead login says exactly what to run; an old reading on an
+    /// inactive account says no action is needed.
+    static func readingMessage(_ state: ProfileReadingState, profile: Profile, now: Date = Date()) -> String? {
+        switch state {
+        case .fresh(let fromMC):
+            guard fromMC, let usage = profile.claudeUsage else { return nil }
+            return "popover.reading.from_mc".localized(with: ageDescription(since: usage.lastUpdated, now: now))
+        case .neverUpdated:
+            return "popover.stale.never_updated".localized
+        case .signInNeeded:
+            return "popover.reading.sign_in_needed".localized(with: AutoSwitchStatus.shortName(profile.name), profile.name)
+        case .refreshFailed(let error):
+            return "popover.stale.refresh_failed".localized(with: error)
+        case .staleIdle(let age, let fromMC):
+            let ageText = ageDescription(since: now.addingTimeInterval(-age), now: now)
+            return (fromMC ? "popover.reading.stale_idle_mc" : "popover.reading.stale_idle").localized(with: ageText)
+        case .staleActive(let age):
+            return "popover.stale.generic".localized(with: ageDescription(since: now.addingTimeInterval(-age), now: now))
+        }
+    }
+
+    /// Why a profile's usage needs attention, in user-facing terms, or nil
+    /// when it does not (fresh, or an old reading that needs no action).
+    func staleReason(for profile: Profile, now: Date = Date()) -> String? {
+        let state = readingState(for: profile, now: now)
+        guard state.needsAction else { return nil }
+        return Self.readingMessage(state, profile: profile, now: now)
+    }
+
+    /// True if the profile's data needs attention (see `staleReason`).
     func isProfileStale(_ profile: Profile, now: Date = Date()) -> Bool {
         staleReason(for: profile, now: now) != nil
     }

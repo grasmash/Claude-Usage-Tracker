@@ -830,6 +830,24 @@ if [ -n "$extra_usage_text" ]; then
   output="${output}${extra_usage_text}"
 fi
 
+# Accounts whose login is dead and need a new sign-in (the app lists them in
+# .autoswitch-state). An account whose reading is merely old is never listed.
+signin_text=""
+switch_state="$HOME/.claude/.autoswitch-state"
+if [ -f "$switch_state" ] && [ $(( $(date +%s) - $(stat -f %m "$switch_state" 2>/dev/null || echo 0) )) -lt 600 ]; then
+  signin_needed=$(sed -n 's/^SIGNIN_NEEDED=//p' "$switch_state")
+  if [ -n "$signin_needed" ]; then
+    case "$signin_needed" in
+      *,*) signin_text=$'\\033[0;33m'"⚠ ${signin_needed} need sign-in"$'\\033[0m' ;;
+      *) signin_text=$'\\033[0;33m'"⚠ ${signin_needed} needs sign-in"$'\\033[0m' ;;
+    esac
+  fi
+fi
+if [ -n "$signin_text" ]; then
+  [ -n "$output" ] && output="${output}${separator}"
+  output="${output}${signin_text}"
+fi
+
 printf "%s\\n" "$output"
 """
 

@@ -1096,3 +1096,17 @@
 "support.popup_signature" = "Claude Usage を一人で作っています";
 "support.popup_body" = "無料・オープンソース・個人開発。広告もトラッキングもありません。セッション上限の浪費を防いだことがあるなら、一杯のコーヒーが開発を支えます。";
 "support.popup_days" = "あなたの上限を見守って %d 日 — ずっと無料";
+
+/* Mission control usage for inactive profiles; dead login vs old reading */
+"popover.reading.from_mc" = "%@前に mission control が取得（このアカウントは非アクティブです）。";
+"popover.reading.sign_in_needed" = "%@: サインインが必要です。ターミナルで claude-usage-login を実行し、%@ としてサインインしてください。それまで自動切り替えはこのアカウントをスキップします。";
+"popover.reading.stale_idle" = "%@前の値です。非アクティブなアカウントでは正常です。次に使うときに再取得され、自動切り替えの対象にもなります。操作は不要です。";
+"popover.reading.stale_idle_mc" = "%@前の値です（最後は mission control から）。非アクティブなアカウントでは正常です。自動切り替えの対象にもなります。操作は不要です。";
+"mc_usage.title" = "mission control の使用量";
+"mc_usage.subtitle" = "mission control の読み取り専用の取得から、非アクティブなアカウントの最新の使用量を表示します。トークンを空にするとオフになります。";
+"mc_usage.url" = "mission control の URL";
+"mc_usage.token" = "トークン";
+"mc_usage.token_saved" = "トークン保存済み";
+"mc_usage.save" = "保存";
+"mc_usage.clear" = "消去";
+"mc_usage.status" = "最終取得: %@";

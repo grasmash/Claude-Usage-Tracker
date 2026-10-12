@@ -285,6 +285,9 @@ struct ManageProfilesView: View {
                     )
                 }
 
+                // Inactive profiles' usage from mission control
+                MissionControlUsageSettingsView()
+
                 // Info Card
                 SettingsContentCard {
                     VStack(alignment: .leading, spacing: DesignTokens.Spacing.medium) {

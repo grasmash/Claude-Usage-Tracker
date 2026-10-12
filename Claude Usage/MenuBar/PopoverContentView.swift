@@ -131,16 +131,24 @@ struct PopoverContentView: View {
             // Says WHY the numbers stopped moving and what to do; tapping opens
             // Settings. Shown before the generic banners because a dead session
             // key is the most common reason a profile silently goes stale.
+            // A dead login (sign in) and an old reading on an inactive account
+            // (no action) are deliberately different banners.
             if let viewed = manager.clickedProfileId.flatMap({ id in
                    profileManager.profiles.first(where: { $0.id == id })
                }) ?? profileManager.activeProfile,
-               let reason = manager.staleReason(for: viewed) {
-                StatusBannerView(
-                    icon: "exclamationmark.triangle.fill",
-                    message: reason,
-                    color: .orange
-                ) {
-                    onPreferences()
+               case let state = manager.readingState(for: viewed),
+               let reason = MenuBarManager.readingMessage(state, profile: viewed) {
+                switch state {
+                case .signInNeeded:
+                    StatusBannerView(icon: "person.crop.circle.badge.exclamationmark", message: reason, color: .red) {
+                        onPreferences()
+                    }
+                case .fresh, .staleIdle:
+                    StatusBannerView(icon: "clock", message: reason, color: .secondary)
+                default:
+                    StatusBannerView(icon: "exclamationmark.triangle.fill", message: reason, color: .orange) {
+                        onPreferences()
+                    }
                 }
             } else if manager.hasCredentialError {
                 StatusBannerView(

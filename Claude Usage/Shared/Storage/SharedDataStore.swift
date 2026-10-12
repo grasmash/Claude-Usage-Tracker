@@ -74,6 +74,10 @@ class SharedDataStore {
         // Auto-Switch Profile
         static let autoSwitchProfileEnabled = "autoSwitchProfileEnabled"
 
+        // Mission control (inactive profiles' usage)
+        static let missionControlURL = "missionControlURL"
+        static let missionControlToken = "missionControlToken"
+
         // Popover Settings
         static let popoverShowRemainingTime = "popoverShowRemainingTime" // legacy bool key
         static let popoverTimeDisplay = "popoverTimeDisplay"
@@ -622,6 +626,40 @@ class SharedDataStore {
 
     func loadAutoSwitchProfileEnabled() -> Bool {
         return defaults.bool(forKey: Keys.autoSwitchProfileEnabled)
+    }
+
+    // MARK: - Mission Control (inactive profiles' usage)
+
+    /// Default base URL: mission control on littlewing, over the tailnet.
+    static let defaultMissionControlURL = "https://littlewing.taile99318.ts.net:8443"
+
+    func saveMissionControlURL(_ url: String) {
+        defaults.set(url.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Keys.missionControlURL)
+    }
+
+    func loadMissionControlURL() -> String {
+        defaults.string(forKey: Keys.missionControlURL) ?? Self.defaultMissionControlURL
+    }
+
+    /// The mc token pasted in Settings. Stored with the app's other settings;
+    /// never logged. Empty or absent = the feature is off.
+    func saveMissionControlToken(_ token: String) {
+        let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty {
+            defaults.removeObject(forKey: Keys.missionControlToken)
+        } else {
+            defaults.set(t, forKey: Keys.missionControlToken)
+        }
+    }
+
+    func loadMissionControlToken() -> String {
+        defaults.string(forKey: Keys.missionControlToken) ?? ""
+    }
+
+    /// The mc fetch config, or nil (feature off) when no token is set or the
+    /// URL is not https.
+    func missionControlConfig() -> McUsageClient.Config? {
+        McUsageClient.Config(baseURL: loadMissionControlURL(), token: loadMissionControlToken())
     }
 
     // MARK: - Popover Settings

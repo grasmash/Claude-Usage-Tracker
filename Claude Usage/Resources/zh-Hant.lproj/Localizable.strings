@@ -1082,3 +1082,17 @@
 "support.popup_signature" = "Claude Usage 背後的一人團隊";
 "support.popup_body" = "免費、開源、一人開發——沒有廣告，沒有追蹤。如果它曾幫你避免燒掉工作階段額度，一杯咖啡就能讓它繼續前進。";
 "support.popup_days" = "已守護你的額度 %d 天 — 永遠免費";
+
+/* Mission control usage for inactive profiles; dead login vs old reading */
+"popover.reading.from_mc" = "mission control 於 %@ 前讀取（此帳號未啟用）。";
+"popover.reading.sign_in_needed" = "%@：需要登入。在終端機執行 claude-usage-login，並以 %@ 登入。在此之前自動切換會略過此帳號。";
+"popover.reading.stale_idle" = "讀數來自 %@ 前。未啟用的帳號這是正常的：下次使用時會重新讀取，自動切換仍可切換到它。無需操作。";
+"popover.reading.stale_idle_mc" = "讀數來自 %@ 前（最後一次來自 mission control）。未啟用的帳號這是正常的：自動切換仍可切換到它。無需操作。";
+"mc_usage.title" = "mission control 用量";
+"mc_usage.subtitle" = "從 mission control 的唯讀用量讀取取得未啟用帳號的最新用量。權杖留空即關閉。";
+"mc_usage.url" = "mission control 網址";
+"mc_usage.token" = "權杖";
+"mc_usage.token_saved" = "權杖已儲存";
+"mc_usage.save" = "儲存";
+"mc_usage.clear" = "清除";
+"mc_usage.status" = "上次取得：%@";

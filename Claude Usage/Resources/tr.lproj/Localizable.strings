@@ -1088,3 +1088,17 @@
 "support.popup_signature" = "Claude Usage'ın arkasındaki tek kişilik ekip";
 "support.popup_body" = "Ücretsiz, açık kaynak, tek kişi tarafından yapıldı — reklam yok, izleme yok. Sizi bir oturum limitini yakmaktan kurtardıysa, bir kahve onu ayakta tutar.";
 "support.popup_days" = "%d gündür limitlerinizi izliyor — her zaman ücretsiz";
+
+/* Mission control usage for inactive profiles; dead login vs old reading */
+"popover.reading.from_mc" = "%@ önce mission control tarafından okundu (bu hesap etkin değil).";
+"popover.reading.sign_in_needed" = "%@: oturum açılması gerekiyor. Terminal'de claude-usage-login çalıştırın ve %@ olarak oturum açın. O zamana kadar otomatik geçiş bu hesabı atlar.";
+"popover.reading.stale_idle" = "Okuma %@ önce. Etkin olmayan bir hesap için normal: bir sonraki kullanımda yeniden okunur ve otomatik geçiş yine bu hesaba geçebilir. İşlem gerekmez.";
+"popover.reading.stale_idle_mc" = "Okuma %@ önce (sonuncusu mission control'den). Etkin olmayan bir hesap için normal: otomatik geçiş yine bu hesaba geçebilir. İşlem gerekmez.";
+"mc_usage.title" = "mission control kullanımı";
+"mc_usage.subtitle" = "Etkin olmayan hesapların güncel kullanımı, mission control'ün salt okunur okumasından. Kapatmak için belirteci boş bırakın.";
+"mc_usage.url" = "mission control URL'si";
+"mc_usage.token" = "Belirteç";
+"mc_usage.token_saved" = "Belirteç kaydedildi";
+"mc_usage.save" = "Kaydet";
+"mc_usage.clear" = "Temizle";
+"mc_usage.status" = "Son alma: %@";

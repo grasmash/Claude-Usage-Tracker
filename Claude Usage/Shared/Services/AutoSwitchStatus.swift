@@ -10,6 +10,11 @@ struct AutoSwitchStatus {
     var stuck: Bool
     var nextFree: (name: String, at: Date)?
     var needsLogin: [String]
+    /// Accounts whose login is DEAD (refresh rejected with `invalid_grant`,
+    /// held in `deadLogins`): only a new sign-in fixes them. A subset of
+    /// `needsLogin`, which also lists accounts with no saved login at all.
+    /// An account whose reading is merely old is never listed: that is normal.
+    var signInNeeded: [String] = []
 
     static func build(
         profiles: [Profile],
@@ -28,6 +33,8 @@ struct AutoSwitchStatus {
             .filter { isLoginDead($0) || !AutoSwitchPolicy.canBeApplied($0) }
             .map { shortName($0.name) }
 
+        let signInNeeded = switchable.filter { isLoginDead($0) }.map { shortName($0.name) }
+
         var stuck = false
         if let active = switchable.first(where: { $0.id == activeId }) {
             let blocked = isLoginDead(active)
@@ -45,7 +52,7 @@ struct AutoSwitchStatus {
             }
             .min { $0.at < $1.at }
 
-        return AutoSwitchStatus(stuck: stuck, nextFree: nextFree, needsLogin: needsLogin)
+        return AutoSwitchStatus(stuck: stuck, nextFree: nextFree, needsLogin: needsLogin, signInNeeded: signInNeeded)
     }
 
     /// When an account can be used again: once every limit it has exhausted has reset.
@@ -68,5 +75,6 @@ struct AutoSwitchStatus {
     func stateFileContents(timeFormatter: (Date) -> String) -> String {
         let free = nextFree.map { "\($0.name) \(timeFormatter($0.at))" } ?? ""
         return "STUCK=\(stuck ? 1 : 0)\nNEXT_FREE=\(free)\nNEEDS_LOGIN=\(needsLogin.joined(separator: ", "))\n"
+            + "SIGNIN_NEEDED=\(signInNeeded.joined(separator: ", "))\n"
     }
 }

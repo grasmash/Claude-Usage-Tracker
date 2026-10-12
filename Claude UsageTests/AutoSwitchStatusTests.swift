@@ -89,9 +89,10 @@ final class AutoSwitchStatusTests: XCTestCase {
 
     func testStateFileLines() {
         let at = Date(timeIntervalSince1970: 0)
-        let status = AutoSwitchStatus(stuck: true, nextFree: (name: "goose", at: at), needsLogin: ["lw", "mad"])
+        let status = AutoSwitchStatus(stuck: true, nextFree: (name: "goose", at: at), needsLogin: ["lw", "mad"],
+                                      signInNeeded: ["lw"])
         let text = status.stateFileContents(timeFormatter: { _ in "20:09" })
-        XCTAssertEqual(text, "STUCK=1\nNEXT_FREE=goose 20:09\nNEEDS_LOGIN=lw, mad\n")
+        XCTAssertEqual(text, "STUCK=1\nNEXT_FREE=goose 20:09\nNEEDS_LOGIN=lw, mad\nSIGNIN_NEEDED=lw\n")
     }
 
     // MARK: - Helpers

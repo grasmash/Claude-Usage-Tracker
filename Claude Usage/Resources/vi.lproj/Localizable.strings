@@ -1094,3 +1094,17 @@
 "support.popup_body" = "Miễn phí, mã nguồn mở, do một người xây dựng — không quảng cáo, không theo dõi. Nếu nó từng giúp bạn khỏi lãng phí giới hạn phiên, một ly cà phê sẽ giúp nó tiếp tục.";
 "support.popup_days" = "Đồng hành cùng giới hạn của bạn %d ngày — luôn miễn phí";
 "support.popup_later" = "Để sau";
+
+/* Mission control usage for inactive profiles; dead login vs old reading */
+"popover.reading.from_mc" = "mission control đã đọc %@ trước (tài khoản này không hoạt động).";
+"popover.reading.sign_in_needed" = "%@: cần đăng nhập. Chạy claude-usage-login trong Terminal và đăng nhập bằng %@. Tự động chuyển sẽ bỏ qua tài khoản này cho đến lúc đó.";
+"popover.reading.stale_idle" = "Số liệu từ %@ trước. Bình thường với tài khoản không hoạt động: sẽ được đọc lại khi dùng lần tới, và tự động chuyển vẫn có thể chuyển sang. Không cần làm gì.";
+"popover.reading.stale_idle_mc" = "Số liệu từ %@ trước (lần cuối từ mission control). Bình thường với tài khoản không hoạt động: tự động chuyển vẫn có thể chuyển sang. Không cần làm gì.";
+"mc_usage.title" = "Mức dùng từ mission control";
+"mc_usage.subtitle" = "Mức dùng mới nhất của các tài khoản không hoạt động từ lượt đọc chỉ-đọc của mission control. Để trống mã để tắt.";
+"mc_usage.url" = "URL mission control";
+"mc_usage.token" = "Mã";
+"mc_usage.token_saved" = "Đã lưu mã";
+"mc_usage.save" = "Lưu";
+"mc_usage.clear" = "Xóa";
+"mc_usage.status" = "Lần lấy gần nhất: %@";
