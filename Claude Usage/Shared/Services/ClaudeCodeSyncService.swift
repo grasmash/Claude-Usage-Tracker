@@ -71,6 +71,26 @@ class ClaudeCodeSyncService {
             projectsDirectory: Constants.ClaudePaths.projectsDirectory)
     }
 
+    /// Every keychain item a Claude Code process reads a login from (the
+    /// shared `Claude Code-credentials` and each config dir's hashed entry);
+    /// nil when the keychain could not be queried. `storedLoginForUsage`
+    /// treats nil or an empty list as "unknown" and refreshes nothing. Tests
+    /// supply a list.
+    var claudeCodeServiceLister: () -> [String]? = {
+        ClaudeCodeSyncService.queryClaudeCodeKeychainServices()
+    }
+
+    /// The stored profile as saved now (read inside the switch mutex, so a
+    /// login another caller just refreshed is seen). Tests supply profiles.
+    var storedProfileLoader: (UUID) -> Profile? = { id in
+        ProfileStore.shared.loadProfiles().first(where: { $0.id == id })
+    }
+
+    /// Saves a refreshed stored login into the profile. Tests record it.
+    var storedLoginPersister: (UUID, String) -> Void = { id, json in
+        ClaudeCodeSyncService.shared.persistProfileCredentialsJSON(profileId: id, json: json)
+    }
+
     /// True when Claude Code sessions hold the shared login and every one of
     /// them is on Fable (per holder, from its own transcript).
     func sharedLoginHoldersAllOnFable() -> Bool {
@@ -598,6 +618,12 @@ class ClaudeCodeSyncService {
     /// presented. The Security API is fast, doesn't spawn a subprocess, and only
     /// returns attributes for items the app is already entitled to read.
     func listClaudeCodeKeychainServices() -> [String] {
+        Self.queryClaudeCodeKeychainServices() ?? []
+    }
+
+    /// `listClaudeCodeKeychainServices` that tells a failed query (nil) from
+    /// an empty result, for callers that must fail closed.
+    static func queryClaudeCodeKeychainServices() -> [String]? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecMatchLimit as String: kSecMatchLimitAll,
@@ -606,12 +632,11 @@ class ClaudeCodeSyncService {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess else {
-            if status != errSecItemNotFound {
-                LoggingService.shared.log("listClaudeCodeKeychainServices: SecItemCopyMatching failed (status=\(status))")
-            }
-            return []
+            if status == errSecItemNotFound { return [] }
+            LoggingService.shared.log("listClaudeCodeKeychainServices: SecItemCopyMatching failed (status=\(status))")
+            return nil
         }
-        guard let items = result as? [[String: Any]] else { return [] }
+        guard let items = result as? [[String: Any]] else { return nil }
 
         let prefix = "Claude Code-credentials"
         var found: Set<String> = []
@@ -1267,8 +1292,10 @@ class ClaudeCodeSyncService {
     ///   the same entry raced theirs, and the loser was logged out.
     /// - The shared login (the main keychain entry) belongs to the `claude`
     ///   sessions started without `CLAUDE_CONFIG_DIR`.
-    /// - A stored snapshot of an inactive account's main login is refreshed in
-    ///   exactly one place: `switchMainLogin(to:)`, once it is safe to write.
+    /// - A stored snapshot of an inactive account's main login is refreshed
+    ///   only under the switch mutex, and only when no Claude Code storage holds
+    ///   it: by `switchMainLogin(to:)` before writing it, and by
+    ///   `storedLoginForUsage` to read an inactive account's usage.
     ///
     /// So when the token here has expired, the answer is stale and the caller
     /// shows last-known usage; it is not refreshed. Returns nil when the profile
@@ -1566,6 +1593,90 @@ class ClaudeCodeSyncService {
         return nil
     }
 
+    // MARK: - Usage for inactive profiles (their stored own login)
+
+    /// The stored own main login of an INACTIVE profile, to read its usage
+    /// when its pinned entry's access token has expired (pinned entries belong
+    /// to the claude-rotate sessions on that dir and are never refreshed here).
+    ///
+    /// A valid access token is returned as is: reading usage with it touches no
+    /// refresh token. An expired one is refreshed only when this app is
+    /// provably its only holder:
+    /// - the profile is not active, the login is its own (`canBeApplied`) and
+    ///   of known origin (`import` or `keychain`), and not known dead;
+    /// - its refresh token is in NO Claude Code keychain item (every
+    ///   `Claude Code-credentials*` entry is listed and read) and not in the
+    ///   plaintext credentials file. Claude Code posts only the refresh token
+    ///   it finds in its storage at that moment (it re-reads under its refresh
+    ///   lock and adopts whatever is there), so a token in none of them has no
+    ///   other holder. A list that cannot be made, or an item that cannot be
+    ///   read, refreshes nothing.
+    /// It runs under the switch mutex, the same lock as
+    /// `refreshStoredMainLoginIfExpired`, so the two never post one token
+    /// twice; the stored copy is re-read inside it. Returns nil when no usable
+    /// login results (the caller shows last-known usage).
+    func storedLoginForUsage(_ profile: Profile, isActive: Bool) async -> String? {
+        guard !isActive, AutoSwitchPolicy.canBeApplied(profile),
+              let stored = profile.cliCredentialsJSON, extractRefreshToken(from: stored) != nil else { return nil }
+        if !storedLoginNeedsRefresh(stored) { return stored }
+        return try? await withSwitchMutex { () async -> String? in
+            let current = self.storedProfileLoader(profile.id) ?? profile
+            guard let json = current.cliCredentialsJSON, let refreshToken = self.extractRefreshToken(from: json) else { return nil }
+            if !self.storedLoginNeedsRefresh(json) { return json }   // another caller refreshed it meanwhile
+            guard current.mainLoginProvenance == "import" || current.mainLoginProvenance == "keychain" else {
+                LoggingService.shared.log("storedLoginForUsage: '\(current.name)' stored login has no known origin; not refreshing")
+                return nil
+            }
+            guard !self.deadLogins.isDead(refreshToken) else { return nil }
+            if let holder = self.claudeCodeHolder(ofRefreshToken: refreshToken) {
+                LoggingService.shared.log("storedLoginForUsage: not refreshing '\(current.name)': \(holder)")
+                return nil
+            }
+            do {
+                let refreshed = try await self.performTokenRefresh(refreshToken: refreshToken)
+                guard let updated = self.mergeRefreshedCredentials(into: json, refreshed: refreshed) else { return nil }
+                self.storedLoginPersister(current.id, updated)
+                LoggingService.shared.log("storedLoginForUsage: refreshed '\(current.name)' stored login (no Claude Code storage holds it)")
+                return updated
+            } catch let ClaudeCodeError.refreshFailed(status, body) {
+                LoggingService.shared.logError("storedLoginForUsage: refresh failed for '\(current.name)' (HTTP \(status)) body=\(body)")
+                if DeadLoginTracker.isInvalidGrant(status: status, body: body) {
+                    self.deadLogins.markDead(refreshToken)
+                }
+            } catch {
+                LoggingService.shared.logError("storedLoginForUsage: refresh failed for '\(current.name)'", error: error)
+            }
+            return nil
+        }
+    }
+
+    private func storedLoginNeedsRefresh(_ json: String) -> Bool {
+        guard let expiry = extractTokenExpiry(from: json) else { return true }   // unknown expiry: never assume valid
+        return expiry.timeIntervalSinceNow <= Self.refreshLeewaySeconds
+    }
+
+    /// Why `refreshToken` may have another holder, or nil when no Claude Code
+    /// storage holds it. Unknown (no list, an unreadable item) is a reason.
+    private func claudeCodeHolder(ofRefreshToken refreshToken: String) -> String? {
+        guard let services = claudeCodeServiceLister(), !services.isEmpty else {
+            return "the Claude Code keychain items could not be listed"
+        }
+        for service in services {
+            guard let result = runSecurityCommand(arguments: ["find-generic-password", "-s", service, "-a", NSUserName(), "-w"]) else {
+                return "keychain item '\(service)' could not be read"
+            }
+            if result.timedOut { return "reading keychain item '\(service)' timed out" }
+            if result.exitCode == 44 { continue }   // gone since the list: holds nothing
+            guard result.exitCode == 0 else { return "keychain item '\(service)' could not be read (exit \(result.exitCode))" }
+            let json = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            if extractRefreshToken(from: json) == refreshToken { return "keychain item '\(service)' holds it" }
+        }
+        if let file = readCredentialsFile(), extractRefreshToken(from: file) == refreshToken {
+            return "the credentials file holds it"
+        }
+        return nil
+    }
+
     /// True when the login Claude Code's main sessions use (or would use after
     /// a switch) for this profile has been rejected by the OAuth server, i.e.
     /// the account needs a fresh `/login`.
@@ -1590,7 +1701,7 @@ class ClaudeCodeSyncService {
     /// of clobbering concurrent edits to other profile fields.
     /// `ownMainLogin`, when given, also records whether `json` is the profile's
     /// own main login (see `Profile.hasOwnMainLogin`).
-    private func persistProfileCredentialsJSON(profileId: UUID, json: String, ownMainLogin: Bool? = nil, provenance: String? = nil) {
+    fileprivate func persistProfileCredentialsJSON(profileId: UUID, json: String, ownMainLogin: Bool? = nil, provenance: String? = nil) {
         var reloaded = ProfileStore.shared.loadProfiles()
         guard let idx = reloaded.firstIndex(where: { $0.id == profileId }) else { return }
         let own = ownMainLogin ?? reloaded[idx].hasOwnMainLogin

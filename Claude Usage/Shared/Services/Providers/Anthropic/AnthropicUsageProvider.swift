@@ -69,6 +69,19 @@ final class AnthropicUsageProvider: UsageProviderService {
                let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: usableJSON) {
                 return try await apiService.fetchUsageData(oauthAccessToken: accessToken)
             }
+
+            // Priority 2b: an INACTIVE profile whose pinned entry (or unpinned
+            // snapshot) has expired: read with its stored own main login. That
+            // copy is this app's alone; `storedLoginForUsage` refreshes it only
+            // when no Claude Code storage holds its refresh token, and never
+            // touches a pinned entry or the shared login.
+            let isActive = profile.id == ProfileManager.shared.activeProfile?.id
+            if !isActive,
+               let storedJSON = await ClaudeCodeSyncService.shared.storedLoginForUsage(profile, isActive: false),
+               !ClaudeCodeSyncService.shared.isTokenExpired(storedJSON),
+               let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: storedJSON) {
+                return try await apiService.fetchUsageData(oauthAccessToken: accessToken)
+            }
         }
 
         // Priority 3: System Keychain CLI OAuth token
