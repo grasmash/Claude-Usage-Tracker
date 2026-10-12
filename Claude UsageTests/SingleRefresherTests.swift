@@ -853,6 +853,8 @@ final class SingleRefresherTests: XCTestCase {
         processes = [bareClaude(500), bareClaude(501)]
         let b = imported("B", login("B", expiresIn: 3600))
         FileManager.default.createFile(atPath: sync.credentialsFileURL.path, contents: Data())
+        try FileManager.default.createDirectory(at: sync.sessionsDirectory, withIntermediateDirectories: true)
+        try #"{"sessionId":"s"}"#.write(to: sync.sessionsDirectory.appendingPathComponent("501.json"), atomically: true, encoding: .utf8)
 
         let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!], nearLimitLogins: [a])
 
@@ -860,6 +862,7 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON, "the hand-off wrote B")
         let record = sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))
         XCTAssertEqual(record?.holderPids.sorted(), [500, 501], "A's lineage is held back until 500 and 501 release it")
+        XCTAssertEqual(record?.holdersWithSession, [501], "which holders were Claude Code sessions is written down")
         XCTAssertEqual(refreshCalls, 0)
     }
 
@@ -970,11 +973,101 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertFalse(sync.lineageIsReleased(record))
     }
 
-    /// A record never pins a lineage for ever.
-    func testAHandoffRecordExpires() {
-        let record = MainLoginSwapPolicy.HandoffRecord(
-            fingerprint: "f", holderPids: [getpid()], at: Date().addingTimeInterval(-MainLoginSwapPolicy.handoffRecordTTL - 60))
-        XCTAssertTrue(sync.lineageIsReleased(record))
+    /// The TTL never releases a lineage a live holder may still carry: an idle
+    /// session pinning it is the SAFE state (releasing it lets the tracker
+    /// refresh a single-use token the session still holds: a logout).
+    func testALiveHolderPastTheTTLStillHoldsTheLineage() throws {
+        let started = try XCTUnwrap(ProcessListing.startTime(pid: getpid()))
+        let old = Date().addingTimeInterval(-MainLoginSwapPolicy.handoffRecordTTL - 60)
+        XCTAssertFalse(sync.lineageIsReleased(MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: "f", holderPids: [getpid()], at: old, holderStartTimes: ["\(getpid())": started])))
+        XCTAssertFalse(sync.lineageIsReleased(MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: old)),
+                       "start time unknown: still the safe answer")
+    }
+
+    /// The TTL only prunes records nobody can be holding any more.
+    func testOnlyRecordsWhoseHoldersAreAllGoneArePrunedAfterTheTTL() throws {
+        let started = try XCTUnwrap(ProcessListing.startTime(pid: getpid()))
+        let old = Date().addingTimeInterval(-MainLoginSwapPolicy.handoffRecordTTL - 60)
+        let gonePid = Int32.max - 7
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(fingerprint: "live", holderPids: [getpid()], at: old,
+                                                             holderStartTimes: ["\(getpid())": started]))
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(fingerprint: "gone", holderPids: [gonePid], at: old))
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(fingerprint: "new", holderPids: [getpid()], at: Date()))
+        XCTAssertNotNil(sync.handoffRecord(for: "live"), "a live holder's record is never pruned")
+        XCTAssertNil(sync.handoffRecord(for: "gone"))
+        XCTAssertNotNil(sync.handoffRecord(for: "new"))
+    }
+
+    /// End to end: a live process that never had a session record is released;
+    /// the same process WITH one (a real session) is not.
+    func testALiveNonSessionHolderIsReleasedButASessionIsNot() throws {
+        let at = Date().addingTimeInterval(-60)
+        let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: at, holdersWithSession: [])
+        XCTAssertTrue(sync.lineageIsReleased(record), "no session record then or now: not a Claude Code session")
+        try writeTranscript(pid: getpid(), entries: [("user", at.addingTimeInterval(-30))])
+        XCTAssertFalse(sync.lineageIsReleased(record), "it has a session record now")
+    }
+
+    // MARK: - Regate fix 2: a target whose swap keeps being refused
+
+    func testANonRetryableRefusalMakesTheTargetUnavailableAndIsToldOnce() throws {
+        sync.resetSwitchRefusalsForTesting()
+        defer { sync.resetSwitchRefusalsForTesting() }
+        let b = imported("B", login("B", expiresIn: 3600))
+        let c = imported("C", login("C", expiresIn: 3600))
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: b))
+
+        XCTAssertTrue(sync.noteSwitchOutcome(.refused(.untrustedStoredLogin(.unknownProvenance)), for: b), "told at once")
+        XCTAssertTrue(sync.isUnavailableAsTarget(for: b), "not picked again every tick")
+        XCTAssertTrue(sync.isRefusingSwitch(b))
+        XCTAssertFalse(sync.noteSwitchOutcome(.refused(.untrustedStoredLogin(.unknownProvenance)), for: b), "once per episode")
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: c))
+
+        // The switcher goes past it; the status line does not call it ready.
+        var active = Profile(name: "A", cliCredentialsJSON: login("A", expiresIn: 3600))
+        active.claudeUsage = Self.usage(session: 100)
+        var bp = b; bp.claudeUsage = Self.usage(session: 0)
+        XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [active, bp], after: active, usingFable: false, blockedBeyondFable: true,
+                                                     isLoginDead: sync.isUnavailableAsTarget(for:)), AutoSwitchPolicy.SwitchTarget.none)
+        let status = AutoSwitchStatus.build(profiles: [active, bp], activeId: active.id, isRefusing: { self.sync.isRefusingSwitch($0) })
+        XCTAssertEqual(status.next, .refused(name: "B"))
+        XCTAssertTrue(status.stuck)
+        let state = status.stateFileContents { _ in "" }
+        XCTAssertTrue(state.contains("NEXT=next: none · B refused the switch\n") && state.contains("NEXT_KIND=refused\nNEXT_NAME=B\n"), state)
+        XCTAssertEqual(AutoSwitchStatus.build(profiles: [active, bp], activeId: active.id).next, .ready(name: "B", presumed: false),
+                       "without the refusal it would read ready")
+
+        // A re-import (a different stored login) ends the episode.
+        var reimported = b
+        reimported.cliCredentialsJSON = login("B2", expiresIn: 3600)
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: reimported))
+        // So does a swap that lands.
+        XCTAssertFalse(sync.noteSwitchOutcome(.applied(racedHolders: 0), for: b))
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: b))
+    }
+
+    func testARetryableRefusalIsToldAfterItRepeatsAndStaysATarget() {
+        var tracker = SwitchRefusalTracker()
+        let id = UUID()
+        let t0 = Date()
+        for tick in 1..<SwitchRefusalTracker.repeatsBeforeNotice {
+            XCTAssertFalse(tracker.record(.refused(.unknownKeychainLogin), target: id, loginFingerprint: "f", now: t0.addingTimeInterval(Double(tick))))
+            XCTAssertFalse(tracker.isRefusing(id, loginFingerprint: "f", now: t0.addingTimeInterval(Double(tick))))
+        }
+        XCTAssertTrue(tracker.record(.refused(.unknownKeychainLogin), target: id, loginFingerprint: "f", now: t0.addingTimeInterval(10)), "told once it has repeated")
+        XCTAssertFalse(tracker.record(.refused(.unknownKeychainLogin), target: id, loginFingerprint: "f", now: t0.addingTimeInterval(11)))
+        XCTAssertTrue(tracker.isRefusing(id, loginFingerprint: "f", now: t0.addingTimeInterval(11)), "the status line stops saying ready")
+        XCTAssertFalse(tracker.isUnavailable(id, loginFingerprint: "f", now: t0.addingTimeInterval(11)), "still retried: it can clear by itself")
+        // A non-retryable target is tried again after the hold, quietly.
+        XCTAssertTrue(tracker.record(.refused(.notTheSharedLoginEntry(service: "x")), target: UUID(), loginFingerprint: nil, now: t0))
+        var other = SwitchRefusalTracker()
+        let o = UUID()
+        _ = other.record(.refused(.untrustedStoredLogin(.unknownProvenance)), target: o, loginFingerprint: "f", now: t0)
+        XCTAssertTrue(other.isUnavailable(o, loginFingerprint: "f", now: t0.addingTimeInterval(SwitchRefusalTracker.hold - 1)))
+        XCTAssertFalse(other.isUnavailable(o, loginFingerprint: "f", now: t0.addingTimeInterval(SwitchRefusalTracker.hold + 1)))
+        XCTAssertFalse(other.record(.refused(.untrustedStoredLogin(.unknownProvenance)), target: o, loginFingerprint: "f", now: t0.addingTimeInterval(SwitchRefusalTracker.hold + 2)),
+                       "the retry after the hold does not notify again")
     }
 
     private func writeTranscript(pid: Int32, entries: [(String, Date)]) throws {

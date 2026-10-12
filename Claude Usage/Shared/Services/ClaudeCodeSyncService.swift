@@ -1058,7 +1058,8 @@ class ClaudeCodeSyncService {
                 if case .running(let at?) = holderProcess(holder.pid) { started[String(holder.pid)] = at }
             }
             recordHandoff(MainLoginSwapPolicy.HandoffRecord(
-                fingerprint: replaced, holderPids: holders.map(\.pid), at: Date(), holderStartTimes: started))
+                fingerprint: replaced, holderPids: holders.map(\.pid), at: Date(), holderStartTimes: started,
+                holdersWithSession: holders.map(\.pid).filter(holderHasSession)))
         }
 
         // Stranded sessions (on a spent login) were there before the write and
@@ -1780,9 +1781,10 @@ class ClaudeCodeSyncService {
     }
 
     func recordHandoff(_ record: MainLoginSwapPolicy.HandoffRecord) {
-        // Expired records hold nothing back any more (`handoffRecordTTL`); drop them.
+        // Old records are dropped only when nobody can be holding them any more.
         var records = loadHandoffRecords().filter {
-            $0.fingerprint != record.fingerprint && record.at.timeIntervalSince($0.at) <= MainLoginSwapPolicy.handoffRecordTTL
+            $0.fingerprint != record.fingerprint
+                && !MainLoginSwapPolicy.isPrunable($0, now: record.at, process: holderProcess)
         }
         records.append(record)
         saveHandoffRecords(records)
@@ -1831,10 +1833,36 @@ class ClaudeCodeSyncService {
         return MainLoginSwapPolicy.transcriptShowsAnsweredRequest(after: at, transcript: text)
     }
 
+    /// Whether Claude Code has a live-session record for `pid`.
+    func holderHasSession(_ pid: Int32) -> Bool {
+        FileManager.default.fileExists(atPath: sessionsDirectory.appendingPathComponent("\(pid).json").path)
+    }
+
     /// Whether every holder of a handed-off lineage has released it.
-    func lineageIsReleased(_ record: MainLoginSwapPolicy.HandoffRecord, now: Date = Date()) -> Bool {
+    func lineageIsReleased(_ record: MainLoginSwapPolicy.HandoffRecord) -> Bool {
         MainLoginSwapPolicy.lineageReleased(
-            record, now: now, process: holderProcess, requestedAfter: { self.holderRequestedAfter(pid: $0, at: $1) })
+            record, process: holderProcess, hasSession: holderHasSession,
+            requestedAfter: { self.holderRequestedAfter(pid: $0, at: $1) })
+    }
+
+    // MARK: - Targets that keep refusing the swap
+
+    private var switchRefusals = SwitchRefusalTracker()
+
+    /// Notes what a switch to `profile` did with the shared login. True when
+    /// the user should be told about a refusal now (once per episode).
+    func noteSwitchOutcome(_ outcome: MainLoginSwitch, for profile: Profile, now: Date = Date()) -> Bool {
+        switchRefusals.record(outcome, target: profile.id,
+                              loginFingerprint: profile.cliCredentialsJSON.flatMap(systemLoginFingerprint), now: now)
+    }
+
+    /// The switch to `profile` keeps being refused: not "ready".
+    func isRefusingSwitch(_ profile: Profile, now: Date = Date()) -> Bool {
+        switchRefusals.isRefusing(profile.id, loginFingerprint: profile.cliCredentialsJSON.flatMap(systemLoginFingerprint), now: now)
+    }
+
+    func resetSwitchRefusalsForTesting() {
+        switchRefusals = SwitchRefusalTracker()
     }
 
     /// True while `profile`'s stored login was handed off under working
@@ -1847,13 +1875,15 @@ class ClaudeCodeSyncService {
         if let expiry = extractTokenExpiry(from: json), expiry.timeIntervalSince(now) > Self.refreshLeewaySeconds {
             return false   // usable as stored: the switch writes it without a refresh
         }
-        return !lineageIsReleased(record, now: now)
+        return !lineageIsReleased(record)
     }
 
-    /// Not a switch target now: a dead login, or a stored login held back by
-    /// an unreleased hand-off that would need a refresh.
+    /// Not a switch target now: a dead login, a stored login held back by an
+    /// unreleased hand-off that would need a refresh, or one whose swap is
+    /// refused for a reason that will not clear by itself.
     func isUnavailableAsTarget(for profile: Profile) -> Bool {
         isLoginDead(for: profile) || isHeldByHandoff(profile)
+            || switchRefusals.isUnavailable(profile.id, loginFingerprint: profile.cliCredentialsJSON.flatMap(systemLoginFingerprint))
     }
 
     func resetHandoffRecordsForTesting() {

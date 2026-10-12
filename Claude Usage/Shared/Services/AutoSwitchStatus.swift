@@ -31,6 +31,10 @@ struct AutoSwitchStatus {
         case noFableHeadroom
         /// Every candidate is still at a limit; this one frees first, at `at`.
         case limited(name: String, at: Date)
+        /// This account has room, but the swap to it keeps being refused
+        /// (an untrusted stored login, a hand-off refused tick after tick):
+        /// it is not "ready" until that is fixed.
+        case refused(name: String)
         /// Nothing known at all.
         case none
     }
@@ -47,11 +51,13 @@ struct AutoSwitchStatus {
         proactive: Bool = true,
         now: Date = Date(),
         isLoginDead: (Profile) -> Bool = { _ in false },
-        isHeldBack: (Profile) -> Bool = { _ in false }
+        isHeldBack: (Profile) -> Bool = { _ in false },
+        isRefusing: (Profile) -> Bool = { _ in false }
     ) -> AutoSwitchStatus {
         // Not a switch target: dead, or held back by an unreleased hand-off
         // (the same predicate the switcher uses). Only DEAD logins need a sign-in.
-        func unavailable(_ profile: Profile) -> Bool { isLoginDead(profile) || isHeldBack(profile) }
+        func unavailable(_ profile: Profile) -> Bool { isLoginDead(profile) || isHeldBack(profile) || isRefusing(profile) }
+        func unavailableButForRefusal(_ profile: Profile) -> Bool { isLoginDead(profile) || isHeldBack(profile) }
         // Paused accounts are set aside on purpose; they are neither
         // candidates nor something to nag about. The active one still counts.
         let switchable = profiles.filter {
@@ -76,6 +82,19 @@ struct AutoSwitchStatus {
             ) == nil
             next = nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
                               now: now, isLoginDead: unavailable)
+            // Nobody is ready, but one WOULD be if its swap were not refused: say that.
+            switch next {
+            case .ready, .readyWithoutFable:
+                break
+            default:
+                switch nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
+                                  now: now, isLoginDead: unavailableButForRefusal) {
+                case .ready(let name, _), .readyWithoutFable(let name, _):
+                    next = .refused(name: name)
+                default:
+                    break
+                }
+            }
         }
 
         let nextFree = switchable
@@ -149,6 +168,8 @@ struct AutoSwitchStatus {
             return "next (Fable): none · opus: \(name)\(presumed ? "?" : "") (ready)"
         case .noFableHeadroom:
             return "next (Fable): none · opus stays on \(activeName)"
+        case .refused(let name):
+            return "\(prefix)none · \(name) refused the switch"
         case .limited(let name, let at):
             return "\(prefix)\(name) · \(timeFormatter(at))"
         case .none:
@@ -189,6 +210,7 @@ struct AutoSwitchStatus {
         switch next {
         case .ready(let n, let p), .readyWithoutFable(let n, let p): (kind, name, at, presumed) = ("ready", n, "", p)
         case .limited(let n, let d): (kind, name, at, presumed) = ("limited", n, timeFormatter(d), false)
+        case .refused(let n): (kind, name, at, presumed) = ("refused", n, "", false)
         case .noFableHeadroom, .none: (kind, name, at, presumed) = ("none", "", "", false)
         }
         return "STUCK=\(stuck ? 1 : 0)\nNEXT_FREE=\(free)\nNEEDS_LOGIN=\(needsLogin.joined(separator: ", "))\n"

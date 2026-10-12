@@ -221,6 +221,15 @@ enum MainLoginSwapPolicy {
         case untrustedStoredLogin(StoredLoginDistrust)
     }
 
+    /// A refusal that will not clear by itself: retrying every tick only
+    /// repeats it (and its notification).
+    static func isRetryable(_ refusal: Refusal) -> Bool {
+        switch refusal {
+        case .untrustedStoredLogin, .notTheSharedLoginEntry: return false
+        case .sessionsRunning, .unknownKeychainLogin, .processListUnavailable, .keychainUnreadable: return true
+        }
+    }
+
     /// Decides a compare-and-swap of the shared login.
     ///
     /// - `holders`: Claude Code processes on the shared login right now.
@@ -297,9 +306,14 @@ enum MainLoginSwapPolicy {
         /// Each holder's process start time (key: pid), so a recycled pid is
         /// told from the holder. Absent in records written by older builds.
         var holderStartTimes: [String: Date]? = nil
+        /// The holders that had a `sessions/<pid>.json` when the hand-off was
+        /// recorded, i.e. were Claude Code sessions. Absent in older records.
+        var holdersWithSession: [Int32]? = nil
     }
 
-    /// How long a hand-off record may hold a lineage back.
+    /// After this long a hand-off record is PRUNED, but only when every
+    /// holder is gone (exited, or its pid reused). It never releases a lineage
+    /// a live holder may still carry: see `lineageReleased`.
     static let handoffRecordTTL: TimeInterval = 8 * 3600
 
     /// A recorded holder as seen now.
@@ -318,26 +332,43 @@ enum MainLoginSwapPolicy {
     /// A holder has released it when:
     /// - it exited, or its pid now belongs to a different process (the start
     ///   time differs from the one recorded: pids are reused);
+    /// - or it was never a Claude Code session: it had no `sessions/<pid>.json`
+    ///   when the hand-off was recorded and has none now. Without `ps` every
+    ///   `node` process is counted as a holder (mc daemons, vite); those never
+    ///   make a Claude request and would otherwise pin the lineage until exit;
     /// - or it made a NEW request after the signal and got an answer
     ///   (`requestedAfter`): Claude Code re-reads the credentials file's mtime
     ///   before each request and drops its cached login when it changed. A
     ///   transcript merely modified after the signal proves nothing: a reply
     ///   streamed to a request sent BEFORE the swap writes to it too.
-    /// A record older than `handoffRecordTTL` no longer holds anything back,
-    /// so an idle holder can never pin a lineage for ever.
+    ///
+    /// Time alone never releases it. An idle session that still holds the
+    /// lineage pins it, and that is the SAFE state: releasing it would let the
+    /// tracker refresh a token the session still carries, which logs it out.
     static func lineageReleased(
-        _ record: HandoffRecord, now: Date,
-        process: (Int32) -> HolderProcess, requestedAfter: (Int32, Date) -> Bool
+        _ record: HandoffRecord,
+        process: (Int32) -> HolderProcess, hasSession: (Int32) -> Bool, requestedAfter: (Int32, Date) -> Bool
     ) -> Bool {
-        if now.timeIntervalSince(record.at) > handoffRecordTTL { return true }
-        return record.holderPids.allSatisfy { pid in
-            guard case .running(let startedAt) = process(pid) else { return true }
-            if let recorded = record.holderStartTimes?[String(pid)], let startedAt,
-               abs(recorded.timeIntervalSince(startedAt)) > 1 {
-                return true   // the pid was reused: the holder itself exited
-            }
+        record.holderPids.allSatisfy { pid in
+            if holderIsGone(record, pid: pid, process: process) { return true }
+            if let withSession = record.holdersWithSession, !withSession.contains(pid), !hasSession(pid) { return true }
             return requestedAfter(pid, record.at)
         }
+    }
+
+    /// The recorded holder no longer exists: no such process, or the pid now
+    /// names a process that started at another time.
+    static func holderIsGone(_ record: HandoffRecord, pid: Int32, process: (Int32) -> HolderProcess) -> Bool {
+        guard case .running(let startedAt) = process(pid) else { return true }
+        if let recorded = record.holderStartTimes?[String(pid)], let startedAt,
+           abs(recorded.timeIntervalSince(startedAt)) > 1 { return true }
+        return false
+    }
+
+    /// A record old enough to drop: past the TTL AND every holder gone.
+    static func isPrunable(_ record: HandoffRecord, now: Date, process: (Int32) -> HolderProcess) -> Bool {
+        now.timeIntervalSince(record.at) > handoffRecordTTL
+            && record.holderPids.allSatisfy { holderIsGone(record, pid: $0, process: process) }
     }
 
     /// True when a transcript (JSONL, possibly starting mid-line) shows a

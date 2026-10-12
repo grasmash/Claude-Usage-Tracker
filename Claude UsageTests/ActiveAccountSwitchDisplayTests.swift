@@ -135,6 +135,86 @@ final class ActiveAccountSwitchDisplayTests: XCTestCase {
         XCTAssertTrue(try render().contains("next: goose · 5:10 PM"))
     }
 
+    // MARK: - The bash script is installed even when the fetch script cannot be
+
+    /// 2026-10-12: the operator's statusline-command.sh was dated Oct 3. The
+    /// update threw `sessionKeyNotFound` (the active profile has no claude.ai
+    /// session key) before it reached the bash script, so no fix to the status
+    /// line ever arrived.
+    func testTheBashScriptIsUpdatedEvenWhenTheFetchScriptCannotBeInjected() throws {
+        let bash = claudeDir.appendingPathComponent("statusline-command.sh")
+        try "#!/bin/bash\necho old\n".write(to: bash, atomically: true, encoding: .utf8)
+        try "// old fetch script\n".write(to: claudeDir.appendingPathComponent("fetch-claude-usage.swift"), atomically: true, encoding: .utf8)
+        XCTAssertTrue(statusline.isInstalled)
+
+        var keyless = Profile(name: "matt@guitargate.com")
+        keyless.claudeSessionKey = nil
+        XCTAssertThrowsError(try statusline.updateScriptsIfInstalled(activeProfile: keyless), "no session key: the fetch script cannot be injected")
+
+        XCTAssertEqual(try String(contentsOf: bash, encoding: .utf8), statusline.bashScript, "the bash script is current all the same")
+        XCTAssertEqual(try String(contentsOf: claudeDir.appendingPathComponent("fetch-claude-usage.swift"), encoding: .utf8),
+                       "// old fetch script\n", "the fetch script is left as it was")
+    }
+
+    // MARK: - Hardening: both files are data, never code
+
+    /// statusline-config.txt is `source`d: a profile name must not run.
+    func testAProfileNameIsNeverExecutedByTheStatusLine() throws {
+        let evil = #"x"; touch "$HOME/pwned"; echo "$(touch $HOME/pwned2)`touch $HOME/pwned3`"#
+        statusline.writeUsageCache(usage: usage(session: 5, weekly: 6), profileName: evil)
+        let line = try render()
+        for file in ["pwned", "pwned2", "pwned3"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(file).path), "\(file): the name ran as shell")
+        }
+        XCTAssertTrue(line.contains("5%"), line)
+        // The config still round-trips the literal name for the script's fallback.
+        let sourced = try shell(#"source "$HOME/.claude/statusline-config.txt"; printf '%s' "$PROFILE_NAME""#)
+        XCTAssertEqual(sourced, evil)
+        // ... and the name is replaced, not appended, on the next switch.
+        try statusline.updateProfileNameInConfig("plain@x.com")
+        XCTAssertEqual(try shell(#"source "$HOME/.claude/statusline-config.txt"; printf '%s' "$PROFILE_NAME""#), "plain@x.com")
+        XCTAssertEqual(try String(contentsOf: claudeDir.appendingPathComponent("statusline-config.txt"), encoding: .utf8)
+            .components(separatedBy: "PROFILE_NAME=").count, 2)
+    }
+
+    /// Bash arithmetic evaluates `a[$(cmd)]`: a TIMESTAMP that is not a number
+    /// must never reach it.
+    func testANonNumericCacheTimestampIsNeverEvaluated() throws {
+        let cache = "UTILIZATION=55\nRESETS_AT=2026-10-12T19:19:59Z\nTIMESTAMP=x[$(touch $HOME/pwned)]\nPROFILE_NAME=littlewing@x.com\nWEEKLY_UTILIZATION=9\nWEEKLY_RESETS_AT=2026-10-17T18:59:59Z\nCOST_USED=1.00\nCOST_LIMIT=2.00\nCOST_CURRENCY=USD"
+        try cache.write(to: claudeDir.appendingPathComponent(".statusline-usage-cache"), atomically: true, encoding: .utf8)
+        var config = try String(contentsOf: claudeDir.appendingPathComponent("statusline-config.txt"), encoding: .utf8)
+        config = config.replacingOccurrences(of: "SHOW_EXTRA_USAGE=0", with: "SHOW_EXTRA_USAGE=1")
+        try config.write(to: claudeDir.appendingPathComponent("statusline-config.txt"), atomically: true, encoding: .utf8)
+        _ = try render()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent("pwned").path), "the timestamp ran as shell")
+
+        // The same for the figures, with a valid timestamp and the bars on.
+        let figures = "UTILIZATION=x[$(touch $HOME/pwned2)]\nRESETS_AT=2026-10-12T19:19:59Z\nTIMESTAMP=\(Int(Date().timeIntervalSince1970))\nPROFILE_NAME=littlewing@x.com\nWEEKLY_UTILIZATION=x[$(touch $HOME/pwned3)]\nWEEKLY_RESETS_AT=2026-10-17T18:59:59Z"
+        try figures.write(to: claudeDir.appendingPathComponent(".statusline-usage-cache"), atomically: true, encoding: .utf8)
+        config = config.replacingOccurrences(of: "SHOW_PROGRESS_BAR=0", with: "SHOW_PROGRESS_BAR=1")
+            .replacingOccurrences(of: "SHOW_WEEKLY_BAR=0", with: "SHOW_WEEKLY_BAR=1")
+        try config.write(to: claudeDir.appendingPathComponent("statusline-config.txt"), atomically: true, encoding: .utf8)
+        _ = try render()
+        for file in ["pwned2", "pwned3"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(file).path), "\(file): a figure ran as shell")
+        }
+    }
+
+    private func shell(_ script: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", script]
+        process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        process.currentDirectoryURL = home
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // MARK: - Helpers
 
     /// Runs the installed script the way Claude Code does, with ANSI stripped.

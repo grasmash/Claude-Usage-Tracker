@@ -156,14 +156,35 @@ final class ProactiveHandoffTests: XCTestCase {
         let both: (Int32) -> MainLoginSwapPolicy.HolderProcess = { _ in .running(startedAt: nil) }
         let only22: (Int32) -> MainLoginSwapPolicy.HolderProcess = { $0 == 22 ? .running(startedAt: nil) : .gone }
         // Nobody released: refuse.
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, now: t0, process: both, requestedAfter: { _, _ in false }))
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, process: both, hasSession: { _ in true }, requestedAfter: { _, _ in false }))
         // 11 exited, 22 made an answered request after the touch: released.
-        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, now: t0, process: only22, requestedAfter: { pid, _ in pid == 22 }))
+        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, process: only22, hasSession: { _ in true }, requestedAfter: { pid, _ in pid == 22 }))
         // 22 has not: still holding.
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, now: t0, process: only22, requestedAfter: { _, _ in false }))
-        // Past the TTL nothing is held back any more.
-        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(
-            record, now: t0.addingTimeInterval(MainLoginSwapPolicy.handoffRecordTTL + 1), process: both, requestedAfter: { _, _ in false }))
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, process: only22, hasSession: { _ in true }, requestedAfter: { _, _ in false }))
+        // Time alone releases nothing: a live holder pins the lineage (the safe
+        // state). The TTL only prunes records whose holders are all gone.
+        let late = t0.addingTimeInterval(MainLoginSwapPolicy.handoffRecordTTL + 1)
+        XCTAssertFalse(MainLoginSwapPolicy.isPrunable(record, now: late, process: both))
+        XCTAssertFalse(MainLoginSwapPolicy.isPrunable(record, now: late, process: only22))
+        XCTAssertTrue(MainLoginSwapPolicy.isPrunable(record, now: late, process: { _ in .gone }))
+        XCTAssertFalse(MainLoginSwapPolicy.isPrunable(record, now: t0, process: { _ in .gone }), "not before the TTL")
+    }
+
+    /// Without `ps`, every `node` is counted as a holder. One that had no
+    /// Claude Code session record at the hand-off and has none now never held
+    /// the login: it does not pin the lineage. A real session does.
+    func testAHolderThatWasNeverAClaudeSessionDoesNotPinTheLineage() {
+        let running: (Int32) -> MainLoginSwapPolicy.HolderProcess = { _ in .running(startedAt: nil) }
+        let daemon = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11, 22], at: now, holdersWithSession: [22])
+        // 11 (an mc daemon) never had a session; 22 (a session) answered a new request.
+        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(daemon, process: running, hasSession: { $0 == 22 }, requestedAfter: { pid, _ in pid == 22 }))
+        // 22 has made no new request: it still holds.
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(daemon, process: running, hasSession: { $0 == 22 }, requestedAfter: { _, _ in false }))
+        // 11 has a session record NOW: it may be a session that started late; it holds.
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(daemon, process: running, hasSession: { _ in true }, requestedAfter: { pid, _ in pid == 22 }))
+        // A record from a build that did not note sessions: nothing is assumed.
+        let legacy = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11], at: now)
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(legacy, process: running, hasSession: { _ in false }, requestedAfter: { _, _ in false }))
     }
 
     /// The release proof reads the transcript: a new user entry after the

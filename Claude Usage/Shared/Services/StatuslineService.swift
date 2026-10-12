@@ -39,6 +39,23 @@ class StatuslineService {
         }
     }
 
+    /// A value for a `KEY=value` line: one line.
+    static func singleLine(_ text: String) -> String {
+        text.components(separatedBy: .newlines).joined(separator: " ")
+    }
+
+    /// `text` for the inside of a double-quoted string in a file bash
+    /// `source`s (statusline-config.txt): nothing in it may expand or end the
+    /// string.
+    static func doubleQuotedForBash(_ text: String) -> String {
+        var out = ""
+        for character in singleLine(text) {
+            if "\\\"$`".contains(character) { out.append("\\") }
+            out.append(character)
+        }
+        return out
+    }
+
     /// The usage cache file: `KEY=value` lines the status-line script reads.
     static func usageCacheContents(name: String?, reading: ActiveAccountReading, now: Date) -> String {
         var lines: [String] = []
@@ -47,12 +64,12 @@ class StatuslineService {
         case .notMeasured:
             lines.append("READING=1")
             lines.append("TIMESTAMP=\(Int(now.timeIntervalSince1970))")
-            if let name { lines.append("PROFILE_NAME=\(name)") }
+            if let name { lines.append("PROFILE_NAME=\(Self.singleLine(name))") }
         case .proven(let usage):
             lines.append("UTILIZATION=\(Int(usage.effectiveSessionPercentage(now: now)))")
             lines.append("RESETS_AT=\(formatter.string(from: usage.sessionResetTime))")
             lines.append("TIMESTAMP=\(Int(now.timeIntervalSince1970))")
-            if let name { lines.append("PROFILE_NAME=\(name)") }
+            if let name { lines.append("PROFILE_NAME=\(Self.singleLine(name))") }
             lines.append("WEEKLY_UTILIZATION=\(Int(usage.weeklyPercentage))")
             lines.append("WEEKLY_RESETS_AT=\(formatter.string(from: usage.weeklyResetTime))")
             if let costUsed = usage.costUsed, let costLimit = usage.costLimit, let costCurrency = usage.costCurrency, costLimit > 0 {
@@ -250,11 +267,19 @@ fi
 # atomically (.statusline-usage-cache), so they always belong to the same
 # account. READING=1: the account was just switched to and has no proven
 # reading yet; its figures show "reading…", never the previous account's.
+# Values read from the cache reach bash arithmetic, which evaluates more than
+# numbers (a[$(cmd)] runs cmd): anything that is not all digits becomes empty.
+only_digits() {
+  case "$1" in
+    ''|*[!0-9]*) printf '' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 usage_cache="$HOME/.claude/.statusline-usage-cache"
 usage_reading=0
 if [ -f "$usage_cache" ]; then
   cache_profile=$(sed -n 's/^PROFILE_NAME=//p' "$usage_cache")
-  cache_stamp=$(sed -n 's/^TIMESTAMP=//p' "$usage_cache")
+  cache_stamp=$(only_digits "$(sed -n 's/^TIMESTAMP=//p' "$usage_cache")")
   if [ "$(sed -n 's/^READING=//p' "$usage_cache")" = "1" ]; then
     usage_reading=1
     [ -n "$cache_profile" ] && profile_name="$cache_profile"
@@ -505,12 +530,12 @@ elif [ "$show_usage" = "1" ]; then
   cache_file="$HOME/.claude/.statusline-usage-cache"
   swift_result=""
   if [ -f "$cache_file" ]; then
-    cache_ts=$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)
+    cache_ts=$(only_digits "$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)")
     now_ts=$(date +%s)
     if [ -n "$cache_ts" ]; then
       cache_age=$((now_ts - cache_ts))
       if [ "$cache_age" -lt 300 ]; then
-        cache_util=$(grep "^UTILIZATION=" "$cache_file" | cut -d= -f2)
+        cache_util=$(only_digits "$(grep "^UTILIZATION=" "$cache_file" | cut -d= -f2)")
         cache_reset=$(grep "^RESETS_AT=" "$cache_file" | cut -d= -f2)
         if [ -n "$cache_util" ]; then
           swift_result="${cache_util}|${cache_reset}"
@@ -678,12 +703,12 @@ if [ "$show_weekly" = "1" ] && [ "$show_usage" = "1" ] && [ "$usage_reading" != 
   weekly_util=""
   weekly_reset=""
   if [ -f "$cache_file" ]; then
-    cache_ts=$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)
+    cache_ts=$(only_digits "$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)")
     now_ts=$(date +%s)
     if [ -n "$cache_ts" ]; then
       cache_age=$((now_ts - cache_ts))
       if [ "$cache_age" -lt 300 ]; then
-        weekly_util=$(grep "^WEEKLY_UTILIZATION=" "$cache_file" | cut -d= -f2)
+        weekly_util=$(only_digits "$(grep "^WEEKLY_UTILIZATION=" "$cache_file" | cut -d= -f2)")
         weekly_reset=$(grep "^WEEKLY_RESETS_AT=" "$cache_file" | cut -d= -f2)
       fi
     fi
@@ -817,7 +842,7 @@ if [ "$show_extra_usage" = "1" ] && [ "$show_usage" = "1" ] && [ "$usage_reading
   cost_limit=""
   cost_currency=""
   if [ -f "$cache_file" ]; then
-    cache_ts=$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)
+    cache_ts=$(only_digits "$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)")
     now_ts=$(date +%s)
     if [ -n "$cache_ts" ]; then
       cache_age=$((now_ts - cache_ts))
@@ -947,13 +972,17 @@ printf "%s\\n" "$output"
     /// Installs statusline scripts with session key injection from active profile
     /// - Parameter injectSessionKey: If true, injects the session key from active profile into the Swift script
     func installScripts(injectSessionKey: Bool = false) throws {
+        try installScripts(injectSessionKey: injectSessionKey, activeProfile: ProfileManager.shared.activeProfile)
+    }
+
+    func installScripts(injectSessionKey: Bool, activeProfile: Profile?) throws {
         // Statusline is Claude Code infrastructure. When the active profile's
         // provider has no CLI account sync (e.g. Codex), THROW rather than
         // silently return: callers rely on the install-or-throw invariant —
         // updateClaudeCodeSettings(enabled: true) would otherwise proceed to
         // point ~/.claude/settings.json at a script that was never installed.
         if injectSessionKey,
-           let activeProfile = ProfileManager.shared.activeProfile,
+           let activeProfile,
            !activeProfile.provider.descriptor.capabilities.cliAccountSync {
             throw StatuslineError.providerNotSupported
         }
@@ -970,7 +999,7 @@ printf "%s\\n" "$output"
 
         if injectSessionKey {
             // Load session key and org ID from active profile
-            guard let activeProfile = ProfileManager.shared.activeProfile else {
+            guard let activeProfile else {
                 throw StatuslineError.noActiveProfile
             }
 
@@ -1002,16 +1031,17 @@ printf "%s\\n" "$output"
             ofItemAtPath: swiftDestination.path
         )
 
-        // Install bash script
-        let bashDestination = claudeDir.appendingPathComponent("statusline-command.sh")
-        try bashScript.write(to: bashDestination, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            // Owner-only: the script embeds the raw session key (GHSA-mfxh-xpwm-23c7 / #267)
-            // and is only ever executed by Claude Code running as the same user.
-            [.posixPermissions: 0o700],
-            ofItemAtPath: bashDestination.path
-        )
+        try installBashScript()
+    }
 
+    /// Installs the status-line bash script alone. It embeds no secret and
+    /// needs no session key, so it is kept current even when the fetch script
+    /// cannot be (2026-10-12: the update threw `sessionKeyNotFound` first and
+    /// the operator's status line stayed on a script from Oct 3).
+    func installBashScript() throws {
+        let bashDestination = claudeDirectory.appendingPathComponent("statusline-command.sh")
+        try bashScript.write(to: bashDestination, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: bashDestination.path)
         print("[StatuslineService] Bash script installed to: \(bashDestination.path)")
     }
 
@@ -1095,7 +1125,7 @@ SHOW_RESET_LABEL=\(showResetLabel ? "1" : "0")
 COLOR_MODE=\(colorModeString)
 SINGLE_COLOR=\(singleColorHex)
 SHOW_PROFILE=\(showProfile ? "1" : "0")
-PROFILE_NAME="\(profileName)"
+PROFILE_NAME="\(Self.doubleQuotedForBash(profileName))"
 SHOW_WEEKLY=\(showWeekly ? "1" : "0")
 SHOW_WEEKLY_BAR=\(showWeeklyBar ? "1" : "0")
 SHOW_WEEKLY_PACE_MARKER=\(showWeeklyPaceMarker ? "1" : "0")
@@ -1137,9 +1167,9 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
 
     /// `config` with its PROFILE_NAME set to `profileName`, or nil if it already is.
     static func config(_ config: String, withProfileName profileName: String) -> String? {
-        let line = "PROFILE_NAME=\"\(profileName)\""
+        let line = "PROFILE_NAME=\"\(doubleQuotedForBash(profileName))\""
         var content = config
-        if let range = content.range(of: #"PROFILE_NAME="[^"]*""#, options: .regularExpression) {
+        if let range = content.range(of: #"PROFILE_NAME="(?:[^"\\]|\\.)*""#, options: .regularExpression) {
             guard content[range] != line else { return nil }
             content.replaceSubrange(range, with: line)
         } else {
@@ -1217,8 +1247,15 @@ ELEMENT_COLOR_EXTRA=\(elementColors.extraUsageBaseHex ?? "")
 
     /// Updates scripts only if already installed (installation is optional)
     func updateScriptsIfInstalled() throws {
+        try updateScriptsIfInstalled(activeProfile: ProfileManager.shared.activeProfile)
+    }
+
+    func updateScriptsIfInstalled(activeProfile: Profile?) throws {
+        // The bash script first and on its own: what follows can throw.
+        let bash = claudeDirectory.appendingPathComponent("statusline-command.sh")
+        if FileManager.default.fileExists(atPath: bash.path) { try installBashScript() }
         guard isInstalled else { return }
-        try installScripts(injectSessionKey: true)
+        try installScripts(injectSessionKey: true, activeProfile: activeProfile)
     }
 
     /// Checks if active profile has a valid session key

@@ -309,11 +309,14 @@ class ProfileManager: ObservableObject {
                 let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id, handoff: handoff)
                 // Reload: the switch may have refreshed and stored the login.
                 profiles = profileStore.loadProfiles()
-                if handoff, case .refused(let reason) = outcome {
-                    // A refused hand-off changes nothing and is retried next
-                    // tick: no "not applied" notice per attempt, and nothing
-                    // left pending (the tracker stays where the sessions are).
-                    LoggingService.shared.log("AutoSwitch: hand-off to '\(updatedProfile.name)' refused (\(reason)); staying on '\(previousName)', retried next tick")
+                // Once per episode: a refused automatic switch that does not
+                // move the tracker (a hand-off, or a refusal that will not
+                // clear by itself) is attempted again later; telling the user
+                // each time is a notification storm.
+                let tell = cliSyncService.noteSwitchOutcome(outcome, for: updatedProfile)
+                if selectedBy == "auto", case .refused(let reason) = outcome,
+                   handoff || !MainLoginSwapPolicy.isRetryable(reason), !tell {
+                    LoggingService.shared.log("AutoSwitch: switch to '\(updatedProfile.name)' refused (\(reason)); staying on '\(previousName)'")
                 } else {
                     handleMainLoginSwitch(outcome, for: updatedProfile, previousName: previousName, announceLater: false)
                 }
@@ -332,7 +335,7 @@ class ProfileManager: ObservableObject {
             // the tracker: see `AutoSwitchPolicy.activateAfterMainLoginSwitch`.
             guard AutoSwitchPolicy.activateAfterMainLoginSwitch(result, selectedBy: selectedBy, handoff: handoff) else {
                 LoggingService.shared.log("AutoSwitch: '\(updatedProfile.name)' could not take the shared login; the active profile stays '\(previousName)'")
-                if handoff { pendingMainLoginSwitch = false }
+                pendingMainLoginSwitch = false   // the tracker did not move: nothing to apply later
                 switchingSemaphore = false
                 isSwitchingProfile = false
                 return

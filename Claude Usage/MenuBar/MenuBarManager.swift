@@ -1640,7 +1640,8 @@ class MenuBarManager: NSObject, ObservableObject {
             usingFable: AutoSwitchPolicy.isClaudeCodeUsingFable() || ModelFallback().isActive,
             proactive: SharedDataStore.shared.loadAutoSwitchProactiveEnabled(),
             isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:),
-            isHeldBack: { ClaudeCodeSyncService.shared.isHeldByHandoff($0) }
+            isHeldBack: { ClaudeCodeSyncService.shared.isHeldByHandoff($0) },
+            isRefusing: { ClaudeCodeSyncService.shared.isRefusingSwitch($0) }
         )
         let contents = status.stateFileContents { AutoSwitchStatus.americanTime($0) }
         let url = Constants.ClaudePaths.claudeDirectory.appendingPathComponent(".autoswitch-state")

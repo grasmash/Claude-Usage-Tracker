@@ -59,8 +59,8 @@ final class RotationScenarioTests: XCTestCase {
         XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 3, keychainFingerprint: "mad", knownFingerprints: ["mad"], keychainLoginNearLimit: true))
         // ... and the replaced lineage is not refreshable until the holders release it.
         let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "mad", holderPids: [1, 2, 3], at: now)
-        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, now: now, process: { _ in .running(startedAt: nil) }, requestedAfter: { _, _ in false }))
-        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, now: now, process: { _ in .running(startedAt: nil) }, requestedAfter: { _, _ in true }))
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, process: { _ in .running(startedAt: nil) }, hasSession: { _ in true }, requestedAfter: { _, _ in false }))
+        XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(record, process: { _ in .running(startedAt: nil) }, hasSession: { _ in true }, requestedAfter: { _, _ in true }))
 
         // Had the hand-off been refused (proactive off), 100% still switches.
         var strict = AutoSwitchDecider(proactive: false)
