@@ -175,13 +175,23 @@ final class ProactiveHandoffTests: XCTestCase {
     /// the login: it does not pin the lineage. A real session does.
     func testAHolderThatWasNeverAClaudeSessionDoesNotPinTheLineage() {
         let running: (Int32) -> MainLoginSwapPolicy.HolderProcess = { _ in .running(startedAt: nil) }
-        let daemon = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11, 22], at: now, holdersWithSession: [22])
+        let daemon = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11, 22], at: now, holdersWithSession: [22],
+                                                       holdersByNameOnly: [11])
         // 11 (an mc daemon) never had a session; 22 (a session) answered a new request.
         XCTAssertTrue(MainLoginSwapPolicy.lineageReleased(daemon, process: running, hasSession: { $0 == 22 }, requestedAfter: { pid, _ in pid == 22 }))
         // 22 has made no new request: it still holds.
         XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(daemon, process: running, hasSession: { $0 == 22 }, requestedAfter: { _, _ in false }))
         // 11 has a session record NOW: it may be a session that started late; it holds.
         XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(daemon, process: running, hasSession: { _ in true }, requestedAfter: { pid, _ in pid == 22 }))
+        // The same 11 identified by its ARGUMENTS (claude, the versioned binary,
+        // cli.js) IS Claude Code, session record or not: only exit, pid reuse or
+        // an answered new request releases it.
+        let byArgv = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11, 22], at: now, holdersWithSession: [22],
+                                                       holdersByNameOnly: [])
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(byArgv, process: running, hasSession: { $0 == 22 }, requestedAfter: { pid, _ in pid == 22 }))
+        let unknownHow = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11, 22], at: now, holdersWithSession: [22])
+        XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(unknownHow, process: running, hasSession: { $0 == 22 }, requestedAfter: { pid, _ in pid == 22 }),
+                       "how it was counted is not recorded: nothing is assumed")
         // A record from a build that did not note sessions: nothing is assumed.
         let legacy = MainLoginSwapPolicy.HandoffRecord(fingerprint: "old", holderPids: [11], at: now)
         XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(legacy, process: running, hasSession: { _ in false }, requestedAfter: { _, _ in false }))

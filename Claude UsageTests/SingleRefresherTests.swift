@@ -850,7 +850,8 @@ final class SingleRefresherTests: XCTestCase {
     func testHandoffUnderWorkingHoldersWritesAndRecordsTheHandoff() async throws {
         let a = login("A", expiresIn: 3600)
         keychain[mainService] = a
-        processes = [bareClaude(500), bareClaude(501)]
+        processes = [bareClaude(500), bareClaude(501),
+                     .init(pid: 502, command: "/opt/homebrew/bin/node", configDir: nil, argvKnown: false)]
         let b = imported("B", login("B", expiresIn: 3600))
         FileManager.default.createFile(atPath: sync.credentialsFileURL.path, contents: Data())
         try FileManager.default.createDirectory(at: sync.sessionsDirectory, withIntermediateDirectories: true)
@@ -861,8 +862,9 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertEqual(outcome, .applied(racedHolders: 0))
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON, "the hand-off wrote B")
         let record = sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))
-        XCTAssertEqual(record?.holderPids.sorted(), [500, 501], "A's lineage is held back until 500 and 501 release it")
+        XCTAssertEqual(record?.holderPids.sorted(), [500, 501, 502], "A's lineage is held back until its holders release it")
         XCTAssertEqual(record?.holdersWithSession, [501], "which holders were Claude Code sessions is written down")
+        XCTAssertEqual(record?.holdersByNameOnly, [502], "and which were counted only as a node with unknown arguments")
         XCTAssertEqual(refreshCalls, 0)
     }
 
@@ -1003,8 +1005,12 @@ final class SingleRefresherTests: XCTestCase {
     /// the same process WITH one (a real session) is not.
     func testALiveNonSessionHolderIsReleasedButASessionIsNot() throws {
         let at = Date().addingTimeInterval(-60)
-        let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: at, holdersWithSession: [])
-        XCTAssertTrue(sync.lineageIsReleased(record), "no session record then or now: not a Claude Code session")
+        let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "f", holderPids: [getpid()], at: at, holdersWithSession: [],
+                                                       holdersByNameOnly: [getpid()])
+        XCTAssertTrue(sync.lineageIsReleased(record), "a name-only node with no session record then or now: not a Claude Code session")
+        XCTAssertFalse(sync.lineageIsReleased(MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: "f", holderPids: [getpid()], at: at, holdersWithSession: [], holdersByNameOnly: [])),
+            "identified by its arguments: Claude Code, session record or not")
         try writeTranscript(pid: getpid(), entries: [("user", at.addingTimeInterval(-30))])
         XCTAssertFalse(sync.lineageIsReleased(record), "it has a session record now")
     }

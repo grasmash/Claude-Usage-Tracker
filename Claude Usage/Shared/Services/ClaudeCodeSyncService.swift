@@ -1059,7 +1059,8 @@ class ClaudeCodeSyncService {
             }
             recordHandoff(MainLoginSwapPolicy.HandoffRecord(
                 fingerprint: replaced, holderPids: holders.map(\.pid), at: Date(), holderStartTimes: started,
-                holdersWithSession: holders.map(\.pid).filter(holderHasSession)))
+                holdersWithSession: holders.map(\.pid).filter(holderHasSession),
+                holdersByNameOnly: holders.filter(MainLoginSwapPolicy.isNameOnlyNode).map(\.pid)))
         }
 
         // Stranded sessions (on a spent login) were there before the write and

@@ -112,9 +112,15 @@ enum MainLoginSwapPolicy {
         guard let argv0 = argv.first else { return false }
         let base = URL(fileURLWithPath: argv0).lastPathComponent
         if base == "claude" { return true }
-        if !process.argvKnown, base.hasPrefix("node") { return true }
+        if isNameOnlyNode(process) { return true }
         if versionedBinary.firstMatch(in: argv0, range: NSRange(argv0.startIndex..., in: argv0)) != nil { return true }
         return argv.prefix(2).contains { $0.hasSuffix("@anthropic-ai/claude-code/cli.js") }
+    }
+
+    /// A `node` whose arguments could not be read: counted as Claude Code on
+    /// its name alone.
+    static func isNameOnlyNode(_ process: RunningProcess) -> Bool {
+        !process.argvKnown && URL(fileURLWithPath: process.command).lastPathComponent.hasPrefix("node")
     }
 
     /// True for a process known to launch Claude Code as a child: `happy`'s
@@ -309,6 +315,10 @@ enum MainLoginSwapPolicy {
         /// The holders that had a `sessions/<pid>.json` when the hand-off was
         /// recorded, i.e. were Claude Code sessions. Absent in older records.
         var holdersWithSession: [Int32]? = nil
+        /// The holders counted only because they are a `node` whose arguments
+        /// could not be read (`isNameOnlyNode`): possibly not Claude Code at
+        /// all. Absent in older records.
+        var holdersByNameOnly: [Int32]? = nil
     }
 
     /// After this long a hand-off record is PRUNED, but only when every
@@ -332,10 +342,12 @@ enum MainLoginSwapPolicy {
     /// A holder has released it when:
     /// - it exited, or its pid now belongs to a different process (the start
     ///   time differs from the one recorded: pids are reused);
-    /// - or it was never a Claude Code session: it had no `sessions/<pid>.json`
-    ///   when the hand-off was recorded and has none now. Without `ps` every
-    ///   `node` process is counted as a holder (mc daemons, vite); those never
-    ///   make a Claude request and would otherwise pin the lineage until exit;
+    /// - or it was counted ONLY as a `node` with unknown arguments
+    ///   (`holdersByNameOnly`: without `ps` every node is a holder, mc daemons
+    ///   and vite included) and was never a Claude Code session: no
+    ///   `sessions/<pid>.json` when the hand-off was recorded and none now. A
+    ///   holder identified by its arguments (`claude`, the versioned binary,
+    ///   `cli.js`) IS Claude Code and gets no such release;
     /// - or it made a NEW request after the signal and got an answer
     ///   (`requestedAfter`): Claude Code re-reads the credentials file's mtime
     ///   before each request and drops its cached login when it changed. A
@@ -351,7 +363,8 @@ enum MainLoginSwapPolicy {
     ) -> Bool {
         record.holderPids.allSatisfy { pid in
             if holderIsGone(record, pid: pid, process: process) { return true }
-            if let withSession = record.holdersWithSession, !withSession.contains(pid), !hasSession(pid) { return true }
+            if record.holdersByNameOnly?.contains(pid) == true,
+               let withSession = record.holdersWithSession, !withSession.contains(pid), !hasSession(pid) { return true }
             return requestedAfter(pid, record.at)
         }
     }
