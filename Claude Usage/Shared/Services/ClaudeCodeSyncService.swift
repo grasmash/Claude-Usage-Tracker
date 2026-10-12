@@ -71,6 +71,12 @@ class ClaudeCodeSyncService {
             projectsDirectory: Constants.ClaudePaths.projectsDirectory)
     }
 
+    /// Reads `.claude.json`'s `oauthAccount`; every `readOAuthAccount()` call
+    /// goes through it. Tests replace it so they never read the real file.
+    var configOAuthAccountReader: () -> String? = {
+        ClaudeCodeSyncService.shared.readOAuthAccountFromConfigFile()
+    }
+
     /// True when Claude Code sessions hold the shared login and every one of
     /// them is on Fable (per holder, from its own transcript).
     func sharedLoginHoldersAllOnFable() -> Bool {
@@ -710,6 +716,10 @@ class ClaudeCodeSyncService {
     /// preserves unknown/future fields — Claude Code may add new keys over time,
     /// and we want to faithfully round-trip whatever is present.
     func readOAuthAccount() -> String? {
+        configOAuthAccountReader()
+    }
+
+    fileprivate func readOAuthAccountFromConfigFile() -> String? {
         guard let url = locateClaudeConfigFile() else {
             LoggingService.shared.log("readOAuthAccount: no .claude.json config file found")
             return nil
@@ -809,6 +819,10 @@ class ClaudeCodeSyncService {
         var profiles = ProfileStore.shared.loadProfiles()
         guard let index = profiles.firstIndex(where: { $0.id == profileId }) else {
             throw ClaudeCodeError.noProfileCredentials
+        }
+        if let refusal = syncToProfileRefusal(jsonData, profile: profiles[index]) {
+            LoggingService.shared.log("⚠️ syncToProfile: not storing Claude Code's login under '\(profiles[index].name)': \(refusal)")
+            throw ClaudeCodeError.loginNotProven(refusal)
         }
 
         profiles[index].cliCredentialsJSON = jsonData
@@ -1319,11 +1333,11 @@ class ClaudeCodeSyncService {
     }
 
     /// True when the system (Claude Code) credentials are for the same account as `profile`.
-    private func systemCredentials(_ systemJSON: String, belongTo profile: Profile) -> Bool {
-        let systemIdentity = loginAccountIdentity(credentials: systemJSON, configOAuthAccount: readOAuthAccount())
-        let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON)
-        return (systemIdentity != nil && systemIdentity == profileIdentity)
-            || extractRefreshToken(from: systemJSON) == profile.cliCredentialsJSON.flatMap(extractRefreshToken)
+    /// Proven only (`loginIsProvenToBelong`): a capture stores this login under
+    /// the profile, and a switch later refreshes what was stored, so a guess
+    /// from `.claude.json` would put a live lineage under the wrong account.
+    func systemCredentials(_ systemJSON: String, belongTo profile: Profile) -> Bool {
+        loginIsProvenToBelong(systemJSON, to: profile)
     }
 
     /// True when `mainJSON` (a login from the main keychain) is this profile's
@@ -1468,10 +1482,53 @@ class ClaudeCodeSyncService {
     /// otherwise nil — so another account's details are never stored with
     /// this login.
     func loginOAuthAccount(credentials: String, configOAuthAccount: String?) -> String? {
+        // Proven identity only: with an unresolved login, loginAccountIdentity IS the config's
+        // account, so comparing the two would always "match".
         guard let config = configOAuthAccount,
-              let identity = loginAccountIdentity(credentials: credentials, configOAuthAccount: config),
+              let identity = provenLoginAccountUuid(credentials),
               identity == accountIdentity(fromOAuthAccountJSON: config) else { return nil }
         return config
+    }
+
+    /// The account uuid of the login in `credentials`, ONLY when its own
+    /// lookup succeeded (`.resolved`). Never `.claude.json`'s `oauthAccount`,
+    /// which can name the previous account after a `/login`. A login not yet
+    /// looked up starts a lookup and returns nil (unknown) for now. Anything
+    /// that STORES a login under a profile must use this, not
+    /// `loginAccountIdentity`.
+    func provenLoginAccountUuid(_ credentials: String) -> String? {
+        guard let fingerprint = systemLoginFingerprint(credentials) else { return nil }
+        loginAccountsLock.lock()
+        let known = loginAccounts[fingerprint]
+        loginAccountsLock.unlock()
+        switch known {
+        case .resolved(let uuid): return uuid
+        case nil: Task { await resolveLoginAccount(credentials: credentials) }; return nil
+        case .resolving, .unresolvable: return nil
+        }
+    }
+
+    /// Whether `json` (a login from the shared item) is PROVEN to be
+    /// `profile`'s: the same refresh token as its stored login, or a resolved
+    /// account lookup equal to its account. Unknown is not proof.
+    func loginIsProvenToBelong(_ json: String, to profile: Profile) -> Bool {
+        if let token = extractRefreshToken(from: json), token == profile.cliCredentialsJSON.flatMap(extractRefreshToken) {
+            return true
+        }
+        guard let uuid = provenLoginAccountUuid(json),
+              let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) else { return false }
+        return uuid == profileIdentity
+    }
+
+    /// Why `syncToProfile` must not store `json` under `profile`, or nil.
+    /// A profile with no account yet takes the user's explicit sync (there is
+    /// nothing to contradict); a profile that has one takes only a proven login.
+    func syncToProfileRefusal(_ json: String, profile: Profile) -> String? {
+        guard accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) != nil else { return nil }
+        if loginIsProvenToBelong(json, to: profile) { return nil }
+        return provenLoginAccountUuid(json) == nil
+            ? "Claude Code's login could not be proven to be this profile's account (its account lookup has not succeeded); try again in a moment"
+            : "Claude Code is logged into a different account than this profile"
     }
 
     /// Looks up which account the login in `credentials` belongs to.
@@ -1641,6 +1698,19 @@ class ClaudeCodeSyncService {
 
     // MARK: - Auto Re-sync Before Switching
 
+    /// Whether `resyncBeforeSwitching` may store `freshJSON` (the shared
+    /// login) as `profile`'s own login.
+    func resyncAllowed(freshJSON: String, profile: Profile) -> Bool {
+        // Claude Code ROTATES refresh tokens, so for the same account the shared
+        // login's token routinely differs from the stored one; that rotation is
+        // what this captures. Proof is the login's own resolved account lookup,
+        // or an unchanged refresh token. `.claude.json` is never used: after a
+        // /login it can name the previous account.
+        if loginIsProvenToBelong(freshJSON, to: profile) { return true }
+        LoggingService.shared.log("⚠️ resyncBeforeSwitching: skipping for '\(profile.name)' — Claude Code's login is not proven to be this account (\(provenLoginAccountUuid(freshJSON) == nil ? "account lookup not resolved" : "a different account"))")
+        return false
+    }
+
     /// Re-syncs credentials from system Keychain before profile switching
     /// This ensures we always have the latest CLI login when switching profiles
     func resyncBeforeSwitching(for profileId: UUID) throws {
@@ -1667,33 +1737,8 @@ class ClaudeCodeSyncService {
         // that rotation is exactly what we must capture here, or the profile keeps a
         // consumed refresh token and every later refresh fails with invalid_grant.
         var profiles = ProfileStore.shared.loadProfiles()
-        if let profile = profiles.first(where: { $0.id == profileId }) {
-            let systemIdentity = loginAccountIdentity(credentials: freshJSON, configOAuthAccount: readOAuthAccount())
-            let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON)
-            if let sys = systemIdentity, let stored = profileIdentity {
-                if sys != stored {
-                    LoggingService.shared.log("⚠️ resyncBeforeSwitching: skipping for '\(profile.name)' — system account (\(sys)) differs from profile account (\(stored))")
-                    return
-                }
-                // Same account — capture even though the refresh token rotated.
-            } else if let storedJSON = profile.cliCredentialsJSON {
-                // Identity unavailable on one side — fall back to the conservative
-                // refresh-token equality check to avoid cross-profile contamination.
-                let freshRefreshToken = extractRefreshToken(from: freshJSON)
-                let storedRefreshToken = extractRefreshToken(from: storedJSON)
-                if let fresh = freshRefreshToken, let stored = storedRefreshToken, fresh != stored {
-                    LoggingService.shared.log("⚠️ resyncBeforeSwitching: skipping for '\(profile.name)' — no account identity available and refresh token differs")
-                    return
-                }
-                // A manually pasted setup token has neither an oauthAccount id
-                // nor a refreshToken, so no identity check can vouch that the
-                // system keychain belongs to the same account — never overwrite
-                // the manual token with potentially foreign credentials.
-                if storedRefreshToken == nil && profileIdentity == nil {
-                    LoggingService.shared.log("⚠️ resyncBeforeSwitching: skipping for '\(profile.name)' — profile uses a manual setup token; account identity unverifiable")
-                    return
-                }
-            }
+        if let profile = profiles.first(where: { $0.id == profileId }), !resyncAllowed(freshJSON: freshJSON, profile: profile) {
+            return
         }
 
         // Capture latest oauthAccount too, so if the user logged in with a
@@ -1728,6 +1773,7 @@ enum ClaudeCodeError: LocalizedError {
     case keychainWriteFailed(status: OSStatus)
     case noProfileCredentials
     case refreshFailed(status: Int, body: String)
+    case loginNotProven(String)
 
     var errorDescription: String? {
         switch self {
@@ -1743,6 +1789,8 @@ enum ClaudeCodeError: LocalizedError {
             return "This profile has no synced CLI account."
         case .refreshFailed(let status, _):
             return "OAuth token refresh failed (status: \(status))."
+        case .loginNotProven(let why):
+            return why
         }
     }
 }

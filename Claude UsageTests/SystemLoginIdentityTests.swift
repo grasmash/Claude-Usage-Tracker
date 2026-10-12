@@ -55,8 +55,10 @@ final class SystemLoginIdentityTests: XCTestCase {
         let creds = login("rt-offline-\(UUID().uuidString)")
         await sync.resolveLoginAccount(credentials: creds)
 
-        XCTAssertEqual(sync.loginAccountIdentity(credentials: creds, configOAuthAccount: madConfig), "u-mad")
-        XCTAssertEqual(sync.loginOAuthAccount(credentials: creds, configOAuthAccount: madConfig), madConfig)
+        XCTAssertEqual(sync.loginAccountIdentity(credentials: creds, configOAuthAccount: madConfig), "u-mad",
+                       "display only: the config's account is a guess")
+        XCTAssertNil(sync.loginOAuthAccount(credentials: creds, configOAuthAccount: madConfig),
+                     "a guess is never STORED with the login (capture-proven-identity)")
     }
 
     func testALoginWithoutARefreshTokenUsesTheConfigAccount() {

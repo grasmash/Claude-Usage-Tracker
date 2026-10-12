@@ -632,7 +632,11 @@ class ProfileManager: ObservableObject {
         let sync = ClaudeCodeSyncService.shared
         guard let systemJSON = try? sync.readSystemCredentials() else { return nil }
         let configAccount = sync.readOAuthAccount()
-        guard let systemIdentity = sync.loginAccountIdentity(credentials: systemJSON, configOAuthAccount: configAccount) else {
+        // Proven identity only: adopting stores this login under the matched
+        // profile, and `.claude.json` can still name the previous account.
+        // Unresolved: wait (lastKeychainIdentity is untouched, so it is
+        // re-checked next cycle once the lookup lands).
+        guard let systemIdentity = sync.provenLoginAccountUuid(systemJSON) else {
             return nil
         }
         let systemAccount = sync.loginOAuthAccount(credentials: systemJSON, configOAuthAccount: configAccount)
