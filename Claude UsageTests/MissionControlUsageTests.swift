@@ -336,6 +336,58 @@ final class MissionControlUsageTests: XCTestCase {
         XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: after, after: current, now: now))
     }
 
+    // MARK: - A missing Fable reading is never "0% Fable"
+
+    func testANullFableMcReadingOverAStaleSpentFableProfileIsNeitherATargetNorHeadroom() throws {
+        let rotate = try XCTUnwrap(McUsage.parseRotateConfig(rotateConfig(), home: home))
+        let current = applicable(email: "matt@example.com", usage: usage(weekly: 100, updatedAt: now))
+        // goose: own reading 4h old, Fable 100% with its window still in force.
+        var gooseUsage = usage(weekly: 20, updatedAt: now.addingTimeInterval(-4 * 3600))
+        gooseUsage.fableWeeklyPercentage = 100
+        gooseUsage.fableWeeklyResetTime = now.addingTimeInterval(2 * 86400)
+        let goose = applicable(email: "goose@example.com", usage: gooseUsage)
+
+        let updates = McUsage.overlay(profiles: [current, goose], activeProfileId: current.id,
+                                      readings: [reading("goose", sampledAt: now.addingTimeInterval(-60), weekly: 20, fable: nil)],
+                                      rotate: rotate, now: now)
+        var after = [current, goose]
+        for u in updates { after[after.firstIndex { $0.id == u.profileId }!].claudeUsage = u.usage }
+
+        XCTAssertNotEqual(after[1].claudeUsage?.fableWeeklyPercentage, 0, "no fabricated Fable headroom")
+        XCTAssertNil(AutoSwitchPolicy.nextAvailableProfile(in: after, after: current, usingFable: true, now: now))
+        XCTAssertFalse(AutoSwitchPolicy.anyProfileHasFableHeadroom([after[1]], now: now))
+        // When it IS carried, it is the profile's own 100% in force, not a fresh 0%.
+        if let u = updates.first { XCTAssertEqual(u.usage.fableWeeklyPercentage, 100) }
+    }
+
+    func testANullFableMcReadingIsNotTakenWhenTheProfilesFableWindowHasPassedOrIsUnknown() {
+        var own = usage(weekly: 100, updatedAt: now.addingTimeInterval(-5 * 3600))
+        own.fableWeeklyPercentage = 100
+        own.fableWeeklyResetTime = now.addingTimeInterval(-60)   // passed
+        let r = reading("a", sampledAt: now.addingTimeInterval(-60), weekly: 0, fable: nil)
+        XCTAssertNil(McUsage.usage(from: r, over: own, now: now))
+        own.fableWeeklyResetTime = nil                           // unknown
+        XCTAssertNil(McUsage.usage(from: r, over: own, now: now))
+        XCTAssertNil(McUsage.usage(from: r, over: nil, now: now))
+        // A measured Fable value is still taken as measured.
+        XCTAssertEqual(McUsage.usage(from: reading("a", sampledAt: now.addingTimeInterval(-60), fable: 5), over: own, now: now)?
+            .fableWeeklyPercentage, 5)
+    }
+
+    func testTheClientRefusesRedirects() {
+        let expectation = expectation(description: "redirect decision")
+        let task = URLSession.shared.dataTask(with: URL(string: "https://mc.example/v1/accounts/usage")!)
+        McUsageClient.NoRedirects().urlSession(
+            URLSession.shared, task: task,
+            willPerformHTTPRedirection: http(302),
+            newRequest: URLRequest(url: URL(string: "https://elsewhere.example/")!)) { next in
+                XCTAssertNil(next, "the bearer token is never forwarded to a redirect target")
+                expectation.fulfill()
+            }
+        task.cancel()
+        wait(for: [expectation], timeout: 1)
+    }
+
     // MARK: - Fixtures
 
     private func rotateConfig() -> Data {
@@ -461,6 +513,16 @@ final class MissionControlTokenStorageTests: XCTestCase {
         XCTAssertEqual(store.loadMissionControlToken(), "")
         XCTAssertNil(store.missionControlConfig())
         XCTAssertFalse(AppEnvironment.userDefaults.dictionaryRepresentation().values.contains { "\($0)".contains(token) })
+    }
+
+    func testALegacyDefaultsCopyIsDeletedOnLoad() {
+        let store = SharedDataStore.shared
+        let saved = store.missionControlTokenStore
+        defer { store.missionControlTokenStore = saved }
+        store.missionControlTokenStore = .init(load: { nil }, save: { _ in true })
+        AppEnvironment.userDefaults.set(token, forKey: "missionControlToken")
+        _ = store.loadMissionControlToken()
+        XCTAssertNil(AppEnvironment.userDefaults.object(forKey: "missionControlToken"))
     }
 
     func testClearingTheTokenTurnsTheFeatureOff() {

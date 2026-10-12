@@ -88,6 +88,9 @@ class SharedDataStore {
     init() {
         // Standard UserDefaults (app container); an isolated suite under tests
         self.defaults = AppEnvironment.userDefaults
+        // The mc token never lives in defaults (the domain is cleartext and mc's
+        // laptop lane exports it); drop any copy an earlier build of this branch left.
+        defaults.removeObject(forKey: Keys.legacyMissionControlToken)
         LoggingService.shared.log("SharedDataStore: Using standard app container storage")
     }
 
@@ -679,6 +682,7 @@ class SharedDataStore {
     }
 
     func loadMissionControlToken() -> String {
+        defaults.removeObject(forKey: Keys.legacyMissionControlToken)
         if let cached = cachedMissionControlToken { return cached }
         let t = missionControlTokenStore.load() ?? ""
         cachedMissionControlToken = t

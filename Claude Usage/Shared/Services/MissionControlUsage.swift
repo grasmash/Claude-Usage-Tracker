@@ -195,11 +195,28 @@ enum McUsage {
         guard now.timeIntervalSince(sampled) < Constants.usageStaleAfter else { return nil }
         if let existing, sampled.timeIntervalSince(existing.lastUpdated) <= echoMargin { return nil }
 
+        // Fable: mc's fable window is often null (its laptop lane posts none). A
+        // missing Fable reading is NOT "0% Fable": under a fresh timestamp that
+        // would fabricate Fable headroom and defeat the fresh-only Opus fallback.
+        // Carry the profile's own Fable reading only while its window is still in
+        // force at mc's sample time; otherwise take nothing and let the profile's
+        // own reading stand.
+        let fablePct: Double
+        let fableReset: Date?
+        if let pct = reading.fablePct {
+            fablePct = pct
+            fableReset = reading.fableResetsAt
+        } else if let existing, let reset = existing.fableWeeklyResetTime, reset > sampled {
+            fablePct = existing.fableWeeklyPercentage
+            fableReset = reset
+        } else {
+            return nil
+        }
+
         // Same defaults the app's own parser uses when the API omits a reset time.
         let sessionReset = reading.sessionResetsAt ?? sampled.addingTimeInterval(Constants.sessionWindow)
         let weeklyReset = reading.weeklyResetsAt ?? sampled.nextMonday1259pm()
         let limit = Constants.weeklyLimit
-        let fablePct = reading.fablePct ?? 0
         return ClaudeUsage(
             sessionTokensUsed: 0,
             sessionLimit: 0,
@@ -219,7 +236,7 @@ enum McUsage {
             designWeeklyResetTime: nil,
             fableWeeklyTokensUsed: Int(Double(limit) * (fablePct / 100.0)),
             fableWeeklyPercentage: fablePct,
-            fableWeeklyResetTime: reading.fableResetsAt,
+            fableWeeklyResetTime: fableReset,
             costUsed: nil,
             costLimit: nil,
             costCurrency: nil,
@@ -305,6 +322,15 @@ final class McUsageClient {
         return _lastStatus
     }
 
+    /// Refuses every redirect: the bearer token goes to the configured mc URL
+    /// and nowhere else. The 3xx then reads as a failed fetch.
+    final class NoRedirects: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
     private static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 10
@@ -312,7 +338,7 @@ final class McUsageClient {
         c.httpCookieStorage = nil
         c.urlCache = nil
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: c)
+        return URLSession(configuration: c, delegate: NoRedirects(), delegateQueue: nil)
     }()
 
     private static let urlSessionTransport: Transport = { request in
