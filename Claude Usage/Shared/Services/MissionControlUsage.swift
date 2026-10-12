@@ -13,6 +13,11 @@ struct McUsageReading: Equatable {
     let weeklyResetsAt: Date?
     let fablePct: Double?
     let fableResetsAt: Date?
+    /// mc's sibling `fable_available`: false = the reporter read the account
+    /// and its response names no Fable window (the account has no Fable);
+    /// true = `usage.fable` is a window; null/missing = NOT MEASURED (every
+    /// laptop-relay and pre-migration row) — never read as "no Fable".
+    var fableAvailable: Bool? = nil
 }
 
 /// Usage for INACTIVE profiles from mission control.
@@ -77,10 +82,14 @@ enum McUsage {
                   let sampled = (u["sampled_at"] as? String).flatMap(parseDate),
                   let session = window(u["session"]), let weekly = window(u["weekly"]) else { continue }
             let fable = window(u["fable"])
-            out.append(McUsageReading(account: name, sampledAt: sampled,
-                                      sessionPct: session.pct, sessionResetsAt: session.resets,
-                                      weeklyPct: weekly.pct, weeklyResetsAt: weekly.resets,
-                                      fablePct: fable?.pct, fableResetsAt: fable?.resets))
+            var reading = McUsageReading(account: name, sampledAt: sampled,
+                                         sessionPct: session.pct, sessionResetsAt: session.resets,
+                                         weeklyPct: weekly.pct, weeklyResetsAt: weekly.resets,
+                                         fablePct: fable?.pct, fableResetsAt: fable?.resets)
+            if let avail = a["fable_available"] as? NSNumber, CFGetTypeID(avail) == CFBooleanGetTypeID() {
+                reading.fableAvailable = avail.boolValue
+            }
+            out.append(reading)
         }
         return out.filter { seen[$0.account] == 1 }
     }
@@ -216,6 +225,12 @@ enum McUsage {
         if let pct = reading.fablePct {
             fablePct = pct
             fableReset = reading.fableResetsAt
+        } else if reading.fableAvailable == false {   // measured: this account has no Fable
+            // No Fable on this account: no Fable headroom, ever. Recorded as
+            // spent with the weekly reset, which is the conservative reading
+            // (it can only keep this account OFF a Fable-bound switch).
+            fablePct = 100
+            fableReset = reading.weeklyResetsAt ?? sampled.nextMonday1259pm()
         } else if let existing, existing.fableWeeklyPercentage >= 100,
                   let reset = existing.fableWeeklyResetTime, reset > sampled {
             fablePct = existing.fableWeeklyPercentage

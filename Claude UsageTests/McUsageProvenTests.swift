@@ -25,6 +25,31 @@ final class McUsageProvenTests: XCTestCase {
         XCTAssertEqual(readings.map(\.account), ["littlewing"], "unproven and legacy rows are not readings")
     }
 
+    /// Sibling `fable_available: false` = the reporter read the account and it
+    /// has no Fable: the reading is taken with NO Fable headroom (spent until
+    /// the weekly reset). `null`/missing = not measured: the profile's own
+    /// reading stands unless its own Fable is spent.
+    func testFableUnavailableIsNoFableHeadroom() {
+        func row(_ avail: String) -> Data {
+            Data(#"{"accounts":[{"name":"goose","proven":true,"fable_available":\#(avail),"usage":{"sampled_at":"\#(iso(Date().addingTimeInterval(-30)))","session":{"used_pct":10,"resets_at":null},"weekly":{"used_pct":3,"resets_at":null},"fable":null,"paused":false}}]}"#.utf8)
+        }
+        let readings = McUsage.parseAccountUsage(row("false")) ?? []
+        XCTAssertEqual(readings.first?.fableAvailable, false)
+        let usage = McUsage.usage(from: readings[0], over: nil, now: Date())
+        XCTAssertEqual(usage?.fableWeeklyPercentage, 100)
+        XCTAssertTrue(usage?.isLimitReached(usingFable: true) ?? false)
+        XCTAssertFalse(usage?.isLimitReached ?? true)
+
+        let unmeasured = McUsage.parseAccountUsage(row("null")) ?? []
+        XCTAssertNil(unmeasured.first?.fableAvailable)
+        XCTAssertNil(McUsage.usage(from: unmeasured[0], over: nil, now: Date()), "not measured: no reading is fabricated")
+        XCTAssertNil((McUsage.parseAccountUsage(row("0")) ?? []).first?.fableAvailable, "0 is not a boolean")
+    }
+
+    private func iso(_ d: Date) -> String {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f.string(from: d)
+    }
+
     func testProvenMustBeAJSONBoolean() {
         let data = body(account("littlewing", proven: "1"))
         XCTAssertEqual(McUsage.parseAccountUsage(data)?.map(\.account) ?? [], [], "1 is not true")
