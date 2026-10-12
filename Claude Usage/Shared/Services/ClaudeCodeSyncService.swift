@@ -80,6 +80,14 @@ class ClaudeCodeSyncService {
         ClaudeCodeSyncService.queryClaudeCodeKeychainServices()
     }
 
+    /// Reads `.claude.json`'s `oauthAccount`; every `readOAuthAccount()` call
+    /// goes through it. Tests replace it so they never read the real file, and
+    /// so a regression that lets this cache decide `storedLoginForUsage` (it
+    /// can name the previous account after a `/login`) fails deterministically.
+    var configOAuthAccountReader: () -> String? = {
+        ClaudeCodeSyncService.shared.readOAuthAccountFromConfigFile()
+    }
+
     /// The stored profile as saved now (read inside the switch mutex, so a
     /// login another caller just refreshed is seen). Tests supply profiles.
     var storedProfileLoader: (UUID) -> Profile? = { id in
@@ -735,6 +743,10 @@ class ClaudeCodeSyncService {
     /// preserves unknown/future fields — Claude Code may add new keys over time,
     /// and we want to faithfully round-trip whatever is present.
     func readOAuthAccount() -> String? {
+        configOAuthAccountReader()
+    }
+
+    fileprivate func readOAuthAccountFromConfigFile() -> String? {
         guard let url = locateClaudeConfigFile() else {
             LoggingService.shared.log("readOAuthAccount: no .claude.json config file found")
             return nil
@@ -1502,6 +1514,16 @@ class ClaudeCodeSyncService {
     }
 
     /// Looks up which account the login in `credentials` belongs to.
+    /// The account uuid looked up for this login, ONLY when the lookup
+    /// succeeded (`.resolved`); nil for no fingerprint, resolving or
+    /// unresolvable. Never consults `.claude.json`.
+    func resolvedLoginAccountUuid(_ credentials: String) -> String? {
+        guard let fingerprint = systemLoginFingerprint(credentials) else { return nil }
+        loginAccountsLock.lock(); defer { loginAccountsLock.unlock() }
+        if case .resolved(let uuid) = loginAccounts[fingerprint] { return uuid }
+        return nil
+    }
+
     func resolveLoginAccount(credentials: String) async {
         guard let fingerprint = systemLoginFingerprint(credentials) else { return }
         loginAccountsLock.lock()
@@ -1697,9 +1719,15 @@ class ClaudeCodeSyncService {
             guard let held = extractRefreshToken(from: json) else { return "keychain item '\(service)' holds no readable login" }
             if held == refreshToken { return "keychain item '\(service)' holds it" }
         }
-        if let file = readCredentialsFile() {
-            guard let held = extractRefreshToken(from: file) else { return "the credentials file holds no readable login" }
-            if held == refreshToken { return "the credentials file holds it" }
+        // The plaintext fallback files, read directly: `readCredentialsFile()` silently skips an
+        // unreadable or invalid-JSON file, and "skipped" must not read as "holds nothing" here.
+        for url in [credentialsFileURL, credentialsFileURL.deletingLastPathComponent().appendingPathComponent("credentials.json")]
+        where FileManager.default.fileExists(atPath: url.path) {
+            guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8),
+                  let held = extractRefreshToken(from: text) else {
+                return "\(url.lastPathComponent) exists but holds no readable login"
+            }
+            if held == refreshToken { return "\(url.lastPathComponent) holds it" }
         }
         return nil
     }
@@ -1718,9 +1746,12 @@ class ClaudeCodeSyncService {
         if let token = extractRefreshToken(from: system), token == profile.cliCredentialsJSON.flatMap(extractRefreshToken) {
             return "the shared login is this stored login"
         }
+        // Only the login's own account lookup decides. `.claude.json`'s oauthAccount (what
+        // `loginAccountIdentity` falls back to) can name the previous account after a /login, so it is
+        // never used here: not looked up (idle expired token, offline) = refuse.
         await resolveLoginAccount(credentials: system)
-        guard let systemIdentity = loginAccountIdentity(credentials: system, configOAuthAccount: readOAuthAccount()) else {
-            return "the shared login's account is unknown"
+        guard let systemIdentity = resolvedLoginAccountUuid(system) else {
+            return "the shared login's account could not be looked up"
         }
         guard let profileIdentity = accountIdentity(fromOAuthAccountJSON: profile.oauthAccountJSON) else {
             return "this profile's account is unknown"

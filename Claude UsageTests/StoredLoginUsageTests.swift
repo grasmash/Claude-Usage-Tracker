@@ -34,6 +34,7 @@ final class StoredLoginUsageTests: XCTestCase {
     private var savedPersister: ((UUID, String) -> Void)!
     private var savedCredentialsFile: URL!
     private var savedFetchUuid: ((String) async -> String?)!
+    private var savedConfigReader: (() -> String?)!
 
     override func setUp() {
         super.setUp()
@@ -45,6 +46,8 @@ final class StoredLoginUsageTests: XCTestCase {
         savedPersister = sync.storedLoginPersister
         savedCredentialsFile = sync.credentialsFileURL
         savedFetchUuid = sync.fetchLoginAccountUuid
+        savedConfigReader = sync.configOAuthAccountReader
+        sync.configOAuthAccountReader = { nil }   // never the real ~/.claude.json
         // Whose login an access token is: "access-main-*" is another account, "access-stored-*" and
         // "access-newer-*" are goose's own (a newer rotation in the shared item is still goose).
         sync.fetchLoginAccountUuid = { at in
@@ -91,6 +94,7 @@ final class StoredLoginUsageTests: XCTestCase {
     override func tearDown() {
         sync.setResolvedServiceNameForTesting(nil)
         sync.fetchLoginAccountUuid = savedFetchUuid
+        sync.configOAuthAccountReader = savedConfigReader
         sync.securityCommandRunner = savedRunner
         sync.tokenRefresher = savedRefresher
         sync.claudeCodeServiceLister = savedLister
@@ -279,7 +283,7 @@ final class StoredLoginUsageTests: XCTestCase {
         XCTAssertEqual(refreshCalls, 0)
     }
 
-    func testASharedLoginWhoseAccountCannotBeToldBlocksTheRefresh() async {
+    func testAProfileWhoseAccountIsUnknownBlocksTheRefresh() async {
         sync.fetchLoginAccountUuid = { at in at.hasPrefix("access-stored-") ? "u-goose" : nil }
         keychain[mainService] = login("unknown", expiresIn: 3600)
         let p = goose(stored: login("stored", expiresIn: -600))
@@ -301,6 +305,27 @@ final class StoredLoginUsageTests: XCTestCase {
     func testAnItemGoneBetweenListAndReadBlocksTheRefresh() async {
         keychain[mainService] = login("main", expiresIn: 3600)
         listed = [mainService, otherDirService]   // listed, but reads back exit 44
+        let r = await sync.storedLoginForUsage(goose(stored: login("stored", expiresIn: -600)), isActive: false)
+        XCTAssertNil(r)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    /// The re-gate probe: the shared login is goose's (newer rotation) but its
+    /// account cannot be looked up (expired access token while idle, or
+    /// offline), and `.claude.json` still names the previous account after a
+    /// `/login`. That cache must never decide: no lookup, no refresh.
+    func testASharedLoginWhoseAccountCannotBeLookedUpBlocksTheRefreshEvenIfClaudeJsonNamesAnother() async {
+        sync.fetchLoginAccountUuid = { _ in nil }
+        sync.configOAuthAccountReader = { #"{"accountUuid":"u-main","emailAddress":"main@x.com"}"# }
+        keychain[mainService] = login("newer", expiresIn: -60)
+        let r = await sync.storedLoginForUsage(goose(stored: login("stored", expiresIn: -600)), isActive: false)
+        XCTAssertNil(r)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testAnUnparsableCredentialsFileBlocksTheRefresh() async throws {
+        keychain[mainService] = login("main", expiresIn: 3600)
+        try "{not json".write(to: sync.credentialsFileURL, atomically: true, encoding: .utf8)
         let r = await sync.storedLoginForUsage(goose(stored: login("stored", expiresIn: -600)), isActive: false)
         XCTAssertNil(r)
         XCTAssertEqual(refreshCalls, 0)
