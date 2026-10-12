@@ -1341,6 +1341,9 @@ class MenuBarManager: NSObject, ObservableObject {
                         // Check if auto-switch should trigger
                         self.checkAutoSwitchIfNeeded(usage: newUsage, currentProfile: profile)
                         self.restoreModelIfFableIsBack()
+                        // The status line's NEXT is written every cycle in this
+                        // mode too, not only when a fetch fails.
+                        self.writeAutoSwitchStatus()
                     }
                 }
 
