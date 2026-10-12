@@ -20,8 +20,23 @@ final class AnthropicUsageProvider: UsageProviderService {
     // are not part of APIServiceProtocol.
     private let apiService: ClaudeAPIService
 
-    init(apiService: ClaudeAPIService = ClaudeAPIService()) {
+    /// Seams for tests (defaults are the live behaviour): the shared keychain
+    /// login read, whether a profile is the tracker's active one, and the
+    /// OAuth usage fetch itself.
+    let readSystemLogin: () -> String?
+    let isActiveProfile: (Profile) -> Bool
+    let fetchWithOAuth: (String) async throws -> ClaudeUsage
+
+    init(
+        apiService: ClaudeAPIService = ClaudeAPIService(),
+        readSystemLogin: (() -> String?)? = nil,
+        isActiveProfile: ((Profile) -> Bool)? = nil,
+        fetchWithOAuth: ((String) async throws -> ClaudeUsage)? = nil
+    ) {
         self.apiService = apiService
+        self.readSystemLogin = readSystemLogin ?? { try? ClaudeCodeSyncService.shared.readSystemCredentials() }
+        self.isActiveProfile = isActiveProfile ?? { $0.id == ProfileManager.shared.activeProfile?.id }
+        self.fetchWithOAuth = fetchWithOAuth ?? { try await apiService.fetchUsageData(oauthAccessToken: $0) }
     }
 
     /// Profile credentials plus the system-keychain CLI fallback that
@@ -67,7 +82,7 @@ final class AnthropicUsageProvider: UsageProviderService {
             if let usableJSON = usableJSON,
                !ClaudeCodeSyncService.shared.isTokenExpired(usableJSON),
                let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: usableJSON) {
-                return try await apiService.fetchUsageData(oauthAccessToken: accessToken)
+                return try await fetchWithOAuth(accessToken)
             }
         }
 
@@ -75,11 +90,11 @@ final class AnthropicUsageProvider: UsageProviderService {
         // Only use system keychain for the active profile — the keychain/credentials file
         // reflects the currently active `claude` CLI session. Using it for a non-active
         // profile would silently return the active profile's stats.
-        if profile.id == ProfileManager.shared.activeProfile?.id,
-           let systemCredentials = try? ClaudeCodeSyncService.shared.readSystemCredentials(),
+        if isActiveProfile(profile),
+           let systemCredentials = readSystemLogin(),
            !ClaudeCodeSyncService.shared.isTokenExpired(systemCredentials),
            let accessToken = ClaudeCodeSyncService.shared.extractAccessToken(from: systemCredentials) {
-            return try await apiService.fetchUsageData(oauthAccessToken: accessToken)
+            return try await fetchWithOAuth(accessToken)
         }
 
         // No usable live credential (e.g. a non-active profile whose CLI token expired and
