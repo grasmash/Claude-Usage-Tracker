@@ -18,6 +18,10 @@ struct AutoSwitchStatus {
     var fableBinding: Bool = false
     /// The active profile's short name (for "opus stays on …").
     var activeName: String = ""
+    /// While the active account is at a limit: when ITS OWN window resets.
+    /// Shown only as secondary information after the account auto-switch is
+    /// really heading for.
+    var activeResetAt: Date?
 
     enum NextSwitch: Equatable {
         /// A profile the switcher would move to right now. `presumed`: its
@@ -73,10 +77,15 @@ struct AutoSwitchStatus {
         var stuck = false
         var next: NextSwitch = .none
         var activeName = ""
+        var activeResetAt: Date?
         if let active = switchable.first(where: { $0.id == activeId }) {
             activeName = shortName(active.name)
             let blocked = isLoginDead(active)
                 || (active.claudeUsage?.isLimitReached(usingFable: usingFable, now: now) ?? false)
+            if blocked, let u = active.claudeUsage {
+                let at = freeAt(u, usingFable: usingFable, now: now)
+                if at > now { activeResetAt = at }
+            }
             stuck = blocked && AutoSwitchPolicy.nextAvailableProfile(
                 in: switchable, after: active, usingFable: usingFable, now: now, isLoginDead: unavailable
             ) == nil
@@ -111,6 +120,7 @@ struct AutoSwitchStatus {
         status.next = next
         status.fableBinding = usingFable
         status.activeName = activeName
+        status.activeResetAt = activeResetAt
         return status
     }
 
@@ -161,7 +171,11 @@ struct AutoSwitchStatus {
             .compactMap { p -> (name: String, at: Date)? in
                 guard let u = p.claudeUsage else { return nil }
                 let at = freeAt(u, usingFable: usingFable, now: now)
-                return at > now ? (shortName(p.name), at) : nil
+                // The active account only counts while its own reset is still ahead.
+                // Another account whose reset has just passed is the one the
+                // switcher is about to take (2026-10-13 1:12 PM: littlewing's 1:11 PM
+                // reset was dropped as "past" and the active matt's 2:09 PM was shown).
+                return (p.id == active.id && at <= now) ? nil : (shortName(p.name), at)
             }
             .min(by: { $0.at < $1.at })
         if let soonest { return .limited(name: soonest.name, at: soonest.at) }
@@ -181,9 +195,13 @@ struct AutoSwitchStatus {
         case .refused(let name):
             return "\(prefix)none · \(name) refused the switch"
         case .limited(let name, let at):
-            return "\(prefix)\(name) · \(timeFormatter(at))"
+            let tag = fableBinding ? "→ (Fable) " : "→ "
+            guard name != activeName else { return "stays on \(name) · \(timeFormatter(at))" }
+            let secondary = activeResetAt.map { " (\(activeName) resets \(timeFormatter($0)))" } ?? ""
+            return "\(tag)\(name) at \(timeFormatter(at))\(secondary)"
         case .none:
-            return "\(prefix)none"
+            // Active account has room and nothing is known: say nothing.
+            return stuck || activeResetAt != nil ? "\(prefix)none" : ""
         }
     }
 

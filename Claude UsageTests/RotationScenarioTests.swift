@@ -82,7 +82,7 @@ final class RotationScenarioTests: XCTestCase {
         let t = tick(&decider, active: active, profiles: [active, b, c])
         XCTAssertEqual(t.decision, .noTarget(notify: true))
         XCTAssertTrue(t.status.stuck)
-        XCTAssertEqual(t.nextLine, "next: mattgg · \(fmt(b.claudeUsage!.sessionResetTime))")
+        XCTAssertEqual(t.nextLine, "→ mattgg at \(fmt(b.claudeUsage!.sessionResetTime)) (madmatter resets \(fmt(active.claudeUsage!.weeklyResetTime)))")
         // Said once; searched again every tick.
         XCTAssertEqual(decider.decide(current: active, profiles: [active, b, c], usingFable: false, now: now), .noTarget(notify: false))
         // mattgg's window resets: picked up on the next tick.
@@ -123,7 +123,7 @@ final class RotationScenarioTests: XCTestCase {
         let stale = profile("littlewing", session: 0, weekly: 100, weeklyResetIn: 3 * 86400, age: 7 * 3600)
         let t = tick(&decider, active: active, profiles: [active, stale])
         XCTAssertEqual(t.decision, .noTarget(notify: true))
-        XCTAssertEqual(t.nextLine, "next: littlewing · \(fmt(stale.claudeUsage!.weeklyResetTime))")
+        XCTAssertEqual(t.nextLine, "→ littlewing at \(fmt(stale.claudeUsage!.weeklyResetTime)) (madmatter resets \(fmt(active.claudeUsage!.weeklyResetTime)))")
     }
 
     func testD_StaleReadingWhoseWindowPassedIsPresumedFree_Replay2359() {
@@ -158,7 +158,7 @@ final class RotationScenarioTests: XCTestCase {
         let isDead: (Profile) -> Bool = { $0.id == dead.id }
         let t = tick(&decider, active: active, profiles: [active, dead], isLoginDead: isDead)
         XCTAssertEqual(t.decision, .noTarget(notify: true))
-        XCTAssertEqual(t.nextLine, "next: madmatter · \(fmt(active.claudeUsage!.sessionResetTime))", "never the dead login; the active account frees itself")
+        XCTAssertEqual(t.nextLine, "stays on madmatter · \(fmt(active.claudeUsage!.sessionResetTime))", "never the dead login; the active account frees itself")
         XCTAssertEqual(t.status.signInNeeded, ["goose"])
         // A target whose stored login turns out dead at apply time: the tracker stays put.
         XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.failure(ClaudeCodeError.noProfileCredentials), selectedBy: "auto"))
@@ -256,10 +256,10 @@ final class RotationScenarioTests: XCTestCase {
             let status = AutoSwitchStatus.build(profiles: profiles, activeId: matt.id, now: tick)
             let time: (Date) -> String = { AutoSwitchStatus.americanTime($0, now: tick, timeZone: self.et) }
             XCTAssertTrue(status.stuck)
-            XCTAssertEqual(status.nextLine(timeFormatter: time), "next: littlewing · 5:10 PM",
+            XCTAssertEqual(status.nextLine(timeFormatter: time), "→ littlewing at 5:10 PM (matt resets Sat 2:59 PM)",
                            "at \(time(tick)): the earliest reset is named, fresh reading or not")
             let state = status.stateFileContents(timeFormatter: time)
-            for expected in ["STUCK=1", "NEXT=next: littlewing · 5:10 PM", "NEXT_KIND=limited", "NEXT_NAME=littlewing", "NEXT_AT=5:10 PM"] {
+            for expected in ["STUCK=1", "NEXT=→ littlewing at 5:10 PM (matt resets Sat 2:59 PM)", "NEXT_KIND=limited", "NEXT_NAME=littlewing", "NEXT_AT=5:10 PM"] {
                 XCTAssertTrue(state.split(separator: "\n").contains(Substring(expected)), "\(expected) missing at \(time(tick)):\n\(state)")
             }
         }
@@ -306,7 +306,7 @@ final class RotationScenarioTests: XCTestCase {
         XCTAssertEqual(decider.decide(current: littlewing, profiles: profiles, usingFable: false, now: tick), .noTarget(notify: true))
         let status = AutoSwitchStatus.build(profiles: profiles, activeId: littlewing.id, now: tick)
         let time: (Date) -> String = { AutoSwitchStatus.americanTime($0, now: tick, timeZone: self.et) }
-        XCTAssertEqual(status.nextLine(timeFormatter: time), "next: littlewing · 10:10 PM")
+        XCTAssertEqual(status.nextLine(timeFormatter: time), "stays on littlewing · 10:10 PM")
         XCTAssertTrue(status.stateFileContents(timeFormatter: time).contains("NEXT_NAME=littlewing\nNEXT_AT=10:10 PM\n"))
         // NEXT_FREE (kept for older status lines) is the next OTHER account free, never the one in use.
         XCTAssertTrue(status.stateFileContents(timeFormatter: time).contains("\nNEXT_FREE=gooseappai Tue 11:59 PM\n"),

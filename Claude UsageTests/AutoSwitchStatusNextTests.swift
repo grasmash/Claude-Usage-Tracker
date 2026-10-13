@@ -50,7 +50,7 @@ final class AutoSwitchStatusNextTests: XCTestCase {
         let limited = profile("mattgg", session: 100, weekly: 20, sessionResetIn: 2 * 3600)
         let status = AutoSwitchStatus.build(profiles: [active, limited], activeId: active.id, now: now)
         let expected = AutoSwitchStatus.americanTime(limited.claudeUsage!.sessionResetTime, now: now, timeZone: et)
-        XCTAssertEqual(line(status), "next: mattgg · \(expected)")
+        XCTAssertEqual(line(status), "→ mattgg at \(expected) (madmatter resets \(AutoSwitchStatus.americanTime(active.claudeUsage!.weeklyResetTime, now: now, timeZone: et)))")
         XCTAssertTrue(status.stuck)
     }
 
@@ -63,7 +63,7 @@ final class AutoSwitchStatusNextTests: XCTestCase {
         let staleB = profile("goose", session: 0, weekly: 100, weeklyResetIn: 86400, age: 20 * 3600)
         let status = AutoSwitchStatus.build(profiles: [active, staleA, staleB], activeId: active.id, now: now)
         let expected = AutoSwitchStatus.americanTime(staleB.claudeUsage!.weeklyResetTime, now: now, timeZone: et)
-        XCTAssertEqual(line(status), "next: goose · \(expected)")
+        XCTAssertEqual(line(status), "→ goose at \(expected) (madmatter resets \(AutoSwitchStatus.americanTime(active.claudeUsage!.weeklyResetTime, now: now, timeZone: et)))")
     }
 
     func testNoOtherAccountAtAll() {
@@ -74,7 +74,25 @@ final class AutoSwitchStatusNextTests: XCTestCase {
         // Nobody else can take over: the active account's own reset is next, and
         // the sessions stay on it.
         let expected = AutoSwitchStatus.americanTime(active.claudeUsage!.sessionResetTime, now: now, timeZone: et)
-        XCTAssertEqual(line(status), "next: madmatter · \(expected)")
+        XCTAssertEqual(line(status), "stays on madmatter · \(expected)")
+    }
+
+    /// 2026-10-13 1:12 PM: the line showed the active matt's own reset (2:09 PM)
+    /// instead of the account the switcher is heading for. The target is named
+    /// first; the active account's own reset is secondary.
+    func testEarliestOtherAccountIsPrimaryActiveResetIsSecondary() {
+        let active = profile("matt", session: 100, weekly: 20, sessionResetIn: 3500)
+        let other = profile("littlewing", session: 100, weekly: 20, sessionResetIn: 600)
+        let status = AutoSwitchStatus.build(profiles: [active, other], activeId: active.id, now: now)
+        let o = AutoSwitchStatus.americanTime(other.claudeUsage!.sessionResetTime, now: now, timeZone: et)
+        let a = AutoSwitchStatus.americanTime(active.claudeUsage!.sessionResetTime, now: now, timeZone: et)
+        XCTAssertEqual(line(status), "→ littlewing at \(o) (matt resets \(a))")
+    }
+
+    func testActiveWithRoomAndNobodyKnownSaysNothing() {
+        let active = profile("matt", session: 10, weekly: 10)
+        let status = AutoSwitchStatus.build(profiles: [active], activeId: active.id, now: now)
+        XCTAssertEqual(line(status), "")
     }
 
     func testFableBindingIsNamed() {

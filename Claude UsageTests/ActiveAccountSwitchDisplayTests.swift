@@ -132,7 +132,7 @@ final class ActiveAccountSwitchDisplayTests: XCTestCase {
         status.stuck = true
         try status.stateFileContents { _ in "5:10 PM" }
             .write(to: claudeDir.appendingPathComponent(".autoswitch-state"), atomically: true, encoding: .utf8)
-        XCTAssertTrue(try render().contains("next: goose · 5:10 PM"))
+        XCTAssertTrue(try render().contains("→ goose at 5:10 PM"))
     }
 
     // MARK: - The bash script is installed even when the fetch script cannot be
