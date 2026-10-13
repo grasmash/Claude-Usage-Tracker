@@ -67,7 +67,7 @@ final class AutoSwitchStatusTests: XCTestCase {
         var paused = makeProfile("p@x.com", session: 100, weekly: 10, sessionResetIn: 60)
         paused.isPaused = true
         let status = AutoSwitchStatus.build(profiles: [active, paused], activeId: active.id, now: now)
-        XCTAssertEqual(status.nextFree?.name, "a")
+        XCTAssertNil(status.nextFree, "neither the paused account nor the active one")
     }
 
     func testSoonestFreeIsTheEarliestResetAmongUsableLogins() {
@@ -81,10 +81,21 @@ final class AutoSwitchStatusTests: XCTestCase {
 
     func testAccountFreesOnlyWhenEveryExhaustedLimitHasReset() {
         // Session resets in 10 min but the weekly limit holds for a day.
-        let active = makeProfile("a@x.com", session: 100, weekly: 100, sessionResetIn: 600, weeklyResetIn: 86400)
-        let status = AutoSwitchStatus.build(profiles: [active], activeId: active.id, now: now)
+        let other = makeProfile("b@x.com", session: 100, weekly: 100, sessionResetIn: 600, weeklyResetIn: 86400)
+        let active = makeProfile("a@x.com", session: 100, weekly: 40, sessionResetIn: 60)
+        let status = AutoSwitchStatus.build(profiles: [active, other], activeId: active.id, now: now)
         let free = try? XCTUnwrap(status.nextFree)
         XCTAssertEqual(free?.at.timeIntervalSince(now) ?? 0, 86400, accuracy: 5)
+    }
+
+    /// NEXT_FREE is the next OTHER account free; the account in use is never
+    /// it (2026-10-12: "NEXT_FREE=matt 8:14 PM" while matt was active).
+    func testNextFreeNeverNamesTheActiveAccount() {
+        let active = makeProfile("matt@x.com", session: 100, weekly: 40, sessionResetIn: 600)
+        let other = makeProfile("lw@x.com", session: 100, weekly: 10, sessionResetIn: 7200)
+        let status = AutoSwitchStatus.build(profiles: [active, other], activeId: active.id, now: now)
+        XCTAssertEqual(status.nextFree?.name, "lw")
+        XCTAssertNil(AutoSwitchStatus.build(profiles: [active], activeId: active.id, now: now).nextFree)
     }
 
     func testStateFileLines() {

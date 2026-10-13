@@ -308,6 +308,9 @@ final class RotationScenarioTests: XCTestCase {
         let time: (Date) -> String = { AutoSwitchStatus.americanTime($0, now: tick, timeZone: self.et) }
         XCTAssertEqual(status.nextLine(timeFormatter: time), "next: littlewing · 10:10 PM")
         XCTAssertTrue(status.stateFileContents(timeFormatter: time).contains("NEXT_NAME=littlewing\nNEXT_AT=10:10 PM\n"))
+        // NEXT_FREE (kept for older status lines) is the next OTHER account free, never the one in use.
+        XCTAssertTrue(status.stateFileContents(timeFormatter: time).contains("\nNEXT_FREE=gooseappai Tue 11:59 PM\n"),
+                      status.stateFileContents(timeFormatter: time))
 
         // 10:10 PM: littlewing's window has reset; the sessions stay where they are.
         let after = at(12, 22, 11)

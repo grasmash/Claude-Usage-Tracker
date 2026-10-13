@@ -97,8 +97,10 @@ struct AutoSwitchStatus {
             }
         }
 
+        // The next OTHER account free (kept for status lines that predate NEXT);
+        // the account in use is never it. NEXT covers the active account's own reset.
         let nextFree = switchable
-            .filter { !unavailable($0) && AutoSwitchPolicy.canBeApplied($0) }
+            .filter { $0.id != activeId && !unavailable($0) && AutoSwitchPolicy.canBeApplied($0) }
             .compactMap { profile -> (name: String, at: Date)? in
                 guard let usage = profile.claudeUsage else { return nil }
                 return (shortName(profile.name), freeAt(usage, usingFable: usingFable, now: now))
