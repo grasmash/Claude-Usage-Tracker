@@ -37,7 +37,7 @@ final class RotationScenarioTests: XCTestCase {
         XCTAssertFalse(isLoginDead(target), "never into a dead login", file: file, line: line)
         XCTAssertTrue(AutoSwitchPolicy.canBeApplied(target), "never into a login that cannot be applied", file: file, line: line)
         // The compare-and-swap never writes over a login the tracker did not capture.
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 0, keychainFingerprint: "someone-elses", knownFingerprints: ["known"]),
+        XCTAssertEqual(MainLoginSwapPolicy.refusal(keychainFingerprint: "someone-elses", knownFingerprints: ["known"]),
                        .unknownKeychainLogin, file: file, line: line)
         // An auto switch whose login could not be applied moves nothing.
         XCTAssertFalse(AutoSwitchPolicy.activateAfterMainLoginSwitch(.failure(ClaudeCodeError.noProfileCredentials), selectedBy: "auto"),
@@ -56,7 +56,7 @@ final class RotationScenarioTests: XCTestCase {
         XCTAssertEqual(t1.nextLine, "next: littlewing (ready)")
         assertSafeSwitch(to: spare)
         // The hand-off writes under working holders, with the reload signal; nothing else blocks.
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 3, keychainFingerprint: "mad", knownFingerprints: ["mad"], keychainLoginNearLimit: true))
+        XCTAssertNil(MainLoginSwapPolicy.refusal(keychainFingerprint: "mad", knownFingerprints: ["mad"]))
         // ... and the replaced lineage is not refreshable until the holders release it.
         let record = MainLoginSwapPolicy.HandoffRecord(fingerprint: "mad", holderPids: [1, 2, 3], at: now)
         XCTAssertFalse(MainLoginSwapPolicy.lineageReleased(record, process: { _ in .running(startedAt: nil) }, hasSession: { _ in true }, requestedAfter: { _, _ in false }))
@@ -69,7 +69,7 @@ final class RotationScenarioTests: XCTestCase {
         let t2 = tick(&strict, active: active, profiles: [active, spare])
         XCTAssertEqual(t2.decision, .switchTo(spare, withoutFable: false))
         XCTAssertEqual(t2.nextLine, "next: littlewing (ready)")
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 3, keychainFingerprint: "mad", knownFingerprints: ["mad"], keychainLoginSpent: true))
+        XCTAssertNil(MainLoginSwapPolicy.refusal(keychainFingerprint: "mad", knownFingerprints: ["mad"]))
     }
 
     // MARK: - B. everything spent

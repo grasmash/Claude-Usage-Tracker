@@ -217,66 +217,32 @@ final class MainLoginSwapPolicyTests: XCTestCase {
 
     // MARK: - Compare-and-swap decision
 
-    func testRefusesWhileAnySessionHoldsTheSharedLogin() {
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 3, keychainFingerprint: "a", knownFingerprints: ["a"]), .sessionsRunning(count: 3))
-    }
-
+    /// Running sessions are not an input to the decision: they follow the swap
+    /// (2026-10-14). The one thing that still refuses is a keychain login the
+    /// tracker does not know.
     func testRefusesALoginTheTrackerHasNotCaptured() {
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 0, keychainFingerprint: "rotated", knownFingerprints: ["a", "b"]), .unknownKeychainLogin)
+        XCTAssertEqual(MainLoginSwapPolicy.refusal(keychainFingerprint: "rotated", knownFingerprints: ["a", "b"]), .unknownKeychainLogin)
     }
 
-    func testAllowsWhenIdleAndKeychainIsAsLastSeen() {
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 0, keychainFingerprint: "a", knownFingerprints: ["a", "b"]))
+    func testAllowsWhenKeychainIsAsLastSeen() {
+        XCTAssertNil(MainLoginSwapPolicy.refusal(keychainFingerprint: "a", knownFingerprints: ["a", "b"]))
     }
 
     func testAllowsWritingAnEmptyKeychain() {
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 0, keychainFingerprint: nil, knownFingerprints: []))
+        XCTAssertNil(MainLoginSwapPolicy.refusal(keychainFingerprint: nil, knownFingerprints: []))
     }
 
-    func testSessionsOutrankAnUnknownLogin() {
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 1, keychainFingerprint: "x", knownFingerprints: []), .sessionsRunning(count: 1))
-    }
-
-    func testSessionsOnASpentKeychainLoginDoNotBlock() {
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 10, keychainFingerprint: "a", knownFingerprints: ["a", "b"], keychainLoginSpent: true))
-    }
-
-    func testASpentLoginStillNeedsTheKeychainToBeAsLastSeen() {
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 2, keychainFingerprint: "rotated", knownFingerprints: ["a"], keychainLoginSpent: true), .unknownKeychainLogin)
-    }
-
-    // MARK: - Which stored logins are spent
-
-    func testSpentLoginsAreThoseAtALimitWhoseWindowHasNotReset() {
-        let weekly = profile("weekly", spentUsage(weekly: 100))
-        let session = profile("session", spentUsage(session: 100))
-        let headroom = profile("headroom", spentUsage(weekly: 99))
-        let rolledOver = profile("rolled", spentUsage(weekly: 100, weeklyResetIn: -60))
-        let unread = Profile(name: "unread", cliCredentialsJSON: "json-unread")
-
-        let spent = MainLoginSwapPolicy.spentLogins(
-            in: [weekly, session, headroom, rolledOver, unread], isLoginDead: { _ in false })
-
-        XCTAssertEqual(spent, ["json-weekly", "json-session"])
-    }
-
-    func testAnOldReadingOfASpentWindowStillCounts() {
-        // The tracker stops polling an account once it is no longer the active
-        // profile; a 100% weekly window stays spent until its reset regardless.
-        let old = profile("old", spentUsage(weekly: 100, updatedAt: Date().addingTimeInterval(-3 * 3600)))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [old], isLoginDead: { _ in false }), ["json-old"])
-    }
-
-    func testASpentFableQuotaIsNotASessionOrWeeklySpentLogin() {
-        let fable = profile("fable", spentUsage(fable: 100))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [fable], isLoginDead: { _ in false }), [])
-    }
-
-    func testFableSpentLoginsAreThoseWhoseFableWeeklyIsAt100() {
-        let fable = profile("fable", spentUsage(fable: 100))
-        let weekly = profile("weekly", spentUsage(weekly: 100))
-        let some = profile("some", spentUsage(fable: 80))
-        XCTAssertEqual(MainLoginSwapPolicy.fableSpentLogins(in: [fable, weekly, some]), ["json-fable"])
+    func testNoRefusalIsAboutRunningSessions() {
+        // Every remaining refusal names a knowledge gap, never a holder count.
+        let all: [MainLoginSwapPolicy.Refusal] = [
+            .unknownKeychainLogin, .notTheSharedLoginEntry(service: "x"), .processListUnavailable,
+            .keychainUnreadable, .untrustedStoredLogin(.unknownProvenance),
+        ]
+        for refusal in all {
+            XCTAssertFalse("\(refusal)".contains("sessionsRunning"), "\(refusal)")
+        }
+        XCTAssertTrue(MainLoginSwapPolicy.isRetryable(.unknownKeychainLogin))
+        XCTAssertFalse(MainLoginSwapPolicy.isRetryable(.notTheSharedLoginEntry(service: "x")))
     }
 
     // MARK: - Is Fable in use by the sessions holding the shared login?
@@ -328,11 +294,6 @@ final class MainLoginSwapPolicyTests: XCTestCase {
 
         XCTAssertEqual(MainLoginSwapPolicy.holderModel(pid: 4242, sessionsDirectory: sessions, projectsDirectory: root.appendingPathComponent("projects")), "claude-fable-5-1")
         XCTAssertNil(MainLoginSwapPolicy.holderModel(pid: 999, sessionsDirectory: sessions, projectsDirectory: root.appendingPathComponent("projects")))
-    }
-
-    func testADeadLoginIsSpent() {
-        let dead = profile("dead", spentUsage(weekly: 10))
-        XCTAssertEqual(MainLoginSwapPolicy.spentLogins(in: [dead], isLoginDead: { $0.name == "dead" }), ["json-dead"])
     }
 
     private func profile(_ name: String, _ usage: ClaudeUsage) -> Profile {

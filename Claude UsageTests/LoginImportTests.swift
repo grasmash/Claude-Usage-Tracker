@@ -70,11 +70,16 @@ final class LoginImportTests: XCTestCase {
         XCTAssertGreaterThan(modified.timeIntervalSince(old), 3000)
     }
 
-    func testSignallingNeverCreatesTheFile() {
-        // No file means credentials live only in the keychain; keep it that way.
+    func testSignallingCreatesOnlyAnEmptyStubNeverACredential() throws {
+        // Credentials live only in the keychain. A missing file is created as
+        // the 0-byte 0600 stub sessions watch (2026-10-14: without it no bare
+        // session could follow a swap); nothing is ever written into it.
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("creds-\(UUID().uuidString).json")
-        XCTAssertFalse(ClaudeCodeSyncService.signalCredentialsReload(at: file))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        defer { try? FileManager.default.removeItem(at: file) }
+        XCTAssertTrue(ClaudeCodeSyncService.signalCredentialsReload(at: file))
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        XCTAssertEqual(attrs[.size] as? Int, 0)
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
 
     func testImportDirectoryKeychainEntryFollowsClaudeCodesNaming() {

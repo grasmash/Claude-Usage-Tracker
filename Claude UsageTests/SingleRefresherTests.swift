@@ -212,51 +212,38 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertTrue(writes.isEmpty)
     }
 
-    // MARK: - A3: the shared login is rewritten only when nothing holds it
-
-    func testSwitchIsRefusedWhileABareClaudeSessionRuns() async throws {
-        keychain[mainService] = login("A", expiresIn: 3600)
-        processes = [bareClaude(500), rotateClaude(501)]
-        let b = imported("B", login("B", expiresIn: -600))
-
-        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
-
-        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)), "the claude-rotate session does not count")
-        XCTAssertEqual(keychain[mainService]?.contains("refresh-A"), true, "A is untouched")
-        XCTAssertEqual(refreshCalls, 0, "B's stored login is not refreshed while the switch is refused")
-        XCTAssertTrue(writes.isEmpty)
-    }
-
-    // MARK: - A3b: sessions stranded on a spent login do not block the switch
+    // MARK: - A3: running sessions FOLLOW the swap (2026-10-14)
     //
-    // 2026-10-11 15:45Z: the shared login (littlewing) hit its weekly limit with
-    // ten bare `claude` sessions on it. Auto-switch chose madmatter, but the
-    // swap was refused as `sessionsRunning(count: 10)` on every retry, so every
-    // session sat on "You've hit your weekly limit" until a manual /login.
-    // Sessions on a spent login can make no request; holding them there
-    // protects nothing.
+    // Measured against Claude Code 2.1.299 (claude-rotate, tests/
+    // test_session_follows_login.sh): a session stats ~/.claude/.credentials.json
+    // before every request and re-reads the keychain when its mtime changed. So
+    // the swap is written under running sessions, the stub is touched, and they
+    // pick the new login up before their next request. Until this date they
+    // REFUSED the swap, which on 2026-10-14 held jrand's sessions on a 90-98%
+    // account for eleven ticks until the limit killed ~20 agents.
 
-    func testSwitchProceedsWhenTheSessionsAreStrandedOnASpentLogin() async throws {
+    func testSwitchUnderABareClaudeSessionWritesAndSignalsIt() async throws {
         let a = login("A", expiresIn: 3600)
         keychain[mainService] = a
-        processes = [bareClaude(500), bareClaude(501)]
+        processes = [bareClaude(500), rotateClaude(501)]
         let b = imported("B", login("B", expiresIn: 3600))
         let creds = sync.credentialsFileURL
         FileManager.default.createFile(atPath: creds.path, contents: Data())
         let past = Date().addingTimeInterval(-3600)
         try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: creds.path)
 
-        let outcome = try await sync.switchMainLogin(
-            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [a])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .applied(racedHolders: 0), "the stranded sessions were there before the write; none raced it")
+        XCTAssertEqual(outcome, .applied(racedHolders: 0), "the bare session was there before the write; none raced it")
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
         XCTAssertEqual(writes.count, 1, "exactly one in-place write: \(writes)")
         let mtime = try FileManager.default.attributesOfItem(atPath: creds.path)[.modificationDate] as? Date
-        XCTAssertGreaterThan(mtime ?? past, past, "the stranded sessions are told to reload onto B")
+        XCTAssertGreaterThan(mtime ?? past, past, "the session is told to reload onto B")
+        let record = sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))
+        XCTAssertEqual(record?.holderPids, [500], "the bare session holds A's lineage until it releases it; the rotate session never held it")
     }
 
-    func testAFailedReloadSignalToStrandedSessionsIsReported() async throws {
+    func testAMissingCredentialsStubIsCreatedSoSessionsCanFollow() async throws {
         let a = login("A", expiresIn: 3600)
         keychain[mainService] = a
         processes = [bareClaude(500)]
@@ -264,13 +251,31 @@ final class SingleRefresherTests: XCTestCase {
         let creds = sync.credentialsFileURL
         XCTAssertFalse(FileManager.default.fileExists(atPath: creds.path))
 
-        let outcome = try await sync.switchMainLogin(
-            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [a])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .applied(racedHolders: 0, strandedSignalled: false),
-                       "the stranded session could not be told to reload; the caller must say so")
+        XCTAssertEqual(outcome, .applied(racedHolders: 0, strandedSignalled: true))
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: creds.path), "the signal never creates the file")
+        let attrs = try FileManager.default.attributesOfItem(atPath: creds.path)
+        XCTAssertEqual(attrs[.size] as? Int, 0, "the stub is 0 bytes: never a credential")
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600, "the stub is 0600, like reload-signal.sh's")
+    }
+
+    func testTheSignalIsSentEvenWhenNoHolderWasSeen() async throws {
+        // The listing can miss a session (libproc fallback, one that started
+        // during the write); the touch is free when nobody is listening.
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = []
+        let b = imported("B", login("B", expiresIn: 3600))
+        let creds = sync.credentialsFileURL
+        FileManager.default.createFile(atPath: creds.path, contents: Data())
+        let past = Date().addingTimeInterval(-3600)
+        try FileManager.default.setAttributes([.modificationDate: past], ofItemAtPath: creds.path)
+
+        _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
+
+        let mtime = try FileManager.default.attributesOfItem(atPath: creds.path)[.modificationDate] as? Date
+        XCTAssertGreaterThan(mtime ?? past, past)
     }
 
     func testSwitchIsRefusedWhenTheKeychainChangesDuringTheStoredLoginRefresh() async throws {
@@ -295,57 +300,30 @@ final class SingleRefresherTests: XCTestCase {
                        "no write to the shared entry: \(writes)")
     }
 
-    func testAFableLimitStrandsTheSessionsWhenEveryHolderIsOnFable() async throws {
-        let a = login("A", expiresIn: 3600)
-        keychain[mainService] = a
-        processes = [bareClaude(500), bareClaude(501)]
-        holderModels = [500: "claude-fable-5-1", 501: "claude-fable-5-1[1m]"]
-        let b = imported("B", login("B", expiresIn: 3600))
-
-        let outcome = try await sync.switchMainLogin(
-            to: b, knownLogins: [a, b.cliCredentialsJSON!], fableSpentLogins: [a])
-
-        XCTAssertEqual(outcome, .applied(racedHolders: 0, strandedSignalled: false))
-        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
-    }
-
-    func testAFableLimitDoesNotOverrideAHolderThatIsNotOnFable() async throws {
+    func testHoldersOnAnyModelFollowTheSwap() async throws {
+        // The holders' model no longer matters to the swap decision.
         let a = login("A", expiresIn: 3600)
         keychain[mainService] = a
         processes = [bareClaude(500), bareClaude(501)]
         holderModels = [500: "claude-fable-5-1", 501: "claude-opus-5-5"]
         let b = imported("B", login("B", expiresIn: 3600))
 
-        let outcome = try await sync.switchMainLogin(
-            to: b, knownLogins: [a, b.cliCredentialsJSON!], fableSpentLogins: [a])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 2)), "the Opus session on A is working")
-        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+        XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON)
+        XCTAssertEqual(sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))?.holderPids.sorted(), [500, 501])
     }
 
-    func testSessionsStillBlockTheSwitchWhenTheSpentLoginIsNotTheSharedOne() async throws {
-        let a = login("A", expiresIn: 3600)
-        keychain[mainService] = a
-        processes = [bareClaude(500)]
-        let b = imported("B", login("B", expiresIn: 3600))
-
-        let outcome = try await sync.switchMainLogin(
-            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [login("C", expiresIn: 3600)])
-
-        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)), "A has headroom: its sessions are working")
-        XCTAssertTrue(writes.isEmpty)
-    }
-
-    func testASpentLoginNeverOverridesTheCompareAndSwap() async throws {
+    func testHoldersNeverOverrideTheCompareAndSwap() async throws {
         keychain[mainService] = login("fresh-login", expiresIn: 3600)
         processes = [bareClaude(500)]
         let a = login("A", expiresIn: 3600)
         let b = imported("B", login("B", expiresIn: 3600))
 
-        let outcome = try await sync.switchMainLogin(
-            to: b, knownLogins: [a, b.cliCredentialsJSON!], spentLogins: [a])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)), "the keychain is not the spent login A")
+        XCTAssertEqual(outcome, .refused(.unknownKeychainLogin), "the keychain holds a login the tracker never captured")
         XCTAssertTrue(writes.isEmpty)
     }
 
@@ -427,7 +405,7 @@ final class SingleRefresherTests: XCTestCase {
 
     // MARK: - F1: a Claude Code run by its versioned path counts as a holder
 
-    func testSwitchIsRefusedWhileHappyRunsClaudeByItsVersionedPath() async throws {
+    func testHappyRunningClaudeByItsVersionedPathIsRecordedAsAHolder() async throws {
         keychain[mainService] = login("A", expiresIn: 3600)
         processes = MainLoginSwapPolicy.parsePsOutput(
             commands: """
@@ -439,11 +417,13 @@ final class SingleRefresherTests: XCTestCase {
             41233 41200 /Users/me/.local/share/claude/versions/2.1.292 --resume 3f2b7a9c-1d2e-4f5a-8b6c-7d8e9f0a1b2c HOME=/Users/me
             """)
         let b = imported("B", login("B", expiresIn: 3600))
+        let a = keychain[mainService]!
 
-        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)))
-        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+        XCTAssertEqual(sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))?.holderPids, [41233],
+                       "the versioned-binary claude under happy holds A's lineage; the launcher itself does not")
     }
 
     // MARK: - F2: never write a keychain entry that is not the shared login's
@@ -611,11 +591,13 @@ final class SingleRefresherTests: XCTestCase {
             commands: "500 1 \(argv)",
             withEnvironment: "500 1 \(argv) HOME=/Users/me TERM=xterm")
         let b = imported("B", login("B", expiresIn: 3600))
+        let a = keychain[mainService]!
 
-        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertEqual(outcome, .refused(.sessionsRunning(count: 1)))
-        XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(outcome, .applied(racedHolders: 0))
+        XCTAssertEqual(sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a)))?.holderPids, [500],
+                       "free text naming CLAUDE_CONFIG_DIR does not hide the holder from the record")
     }
 
     // MARK: - W6: a stored login that may be a copy of a pinned lineage is never written
@@ -750,8 +732,11 @@ final class SingleRefresherTests: XCTestCase {
 
         _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: sync.credentialsFileURL.path),
-                       "the keychain is the only store; no copy on disk")
+        // The keychain is the only store. The file exists only as the 0-byte
+        // reload-signal stub (created by the switch so sessions can follow).
+        let attrs = try FileManager.default.attributesOfItem(atPath: sync.credentialsFileURL.path)
+        XCTAssertEqual(attrs[.size] as? Int, 0, "no copy of any login on disk")
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
 
     func testAnExistingMirrorIsLeftUntouchedBySwitch() async throws {
@@ -857,7 +842,7 @@ final class SingleRefresherTests: XCTestCase {
         try FileManager.default.createDirectory(at: sync.sessionsDirectory, withIntermediateDirectories: true)
         try #"{"sessionId":"s"}"#.write(to: sync.sessionsDirectory.appendingPathComponent("501.json"), atomically: true, encoding: .utf8)
 
-        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!], nearLimitLogins: [a])
+        let outcome = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
 
         XCTAssertEqual(outcome, .applied(racedHolders: 0))
         XCTAssertEqual(keychain[mainService], b.cliCredentialsJSON, "the hand-off wrote B")
@@ -873,7 +858,7 @@ final class SingleRefresherTests: XCTestCase {
         keychain[mainService] = a
         processes = []
         let b = imported("B", login("B", expiresIn: 3600))
-        _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!], nearLimitLogins: [a])
+        _ = try await sync.switchMainLogin(to: b, knownLogins: [a, b.cliCredentialsJSON!])
         XCTAssertNil(sync.handoffRecord(for: try XCTUnwrap(sync.systemLoginFingerprint(a))))
     }
 

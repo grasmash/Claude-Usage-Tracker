@@ -248,7 +248,10 @@ class ProfileManager: ObservableObject {
     /// `handoff`: an automatic PROACTIVE hand-off (the active account is near,
     /// not at, its limit): only it may move working sessions off a near-limit
     /// login, and only a written login moves the tracker.
-    func activateProfile(_ id: UUID, selectedBy: String = "user", handoff: Bool = false) async {
+    /// `reason` is written to `HandoffLog` with the switch (why it happened:
+    /// "near limit: session 86%", "limit reached: weekly", "dead login", a
+    /// click); nil means "<selectedBy> switch".
+    func activateProfile(_ id: UUID, selectedBy: String = "user", handoff: Bool = false, reason: String? = nil) async {
         guard !switchingSemaphore else {
             LoggingService.shared.log("Profile switch already in progress, ignoring")
             return
@@ -296,8 +299,8 @@ class ProfileManager: ObservableObject {
             return
         }
 
-        // The shared Claude Code login (the main keychain entry), but only when
-        // nothing holds it — see `ClaudeCodeSyncService.switchMainLogin`.
+        // The shared Claude Code login (the main keychain entry); running
+        // sessions follow it — see `ClaudeCodeSyncService.switchMainLogin`.
         LoggingService.shared.log("Checking CLI credentials for profile '\(updatedProfile.name)': hasJSON=\(updatedProfile.cliCredentialsJSON != nil)")
 
         if AutoSwitchPolicy.canBeApplied(updatedProfile) {
@@ -306,7 +309,7 @@ class ProfileManager: ObservableObject {
             pendingMainLoginPrevious = previousName
             let result: Result<ClaudeCodeSyncService.MainLoginSwitch, Error>
             do {
-                let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id, handoff: handoff)
+                let outcome = try await cliSyncService.switchMainLogin(to: updatedProfile.id, reason: reason ?? "\(selectedBy) switch")
                 // Reload: the switch may have refreshed and stored the login.
                 profiles = profileStore.loadProfiles()
                 // Once per episode: a refused automatic switch that does not
@@ -495,10 +498,6 @@ class ProfileManager: ObservableObject {
             LoggingService.shared.log("⚠️ Claude Code's shared login NOT switched to '\(profile.name)': \(reason); it stays on '\(previousName)'; new sessions via cca use '\(profile.name)'")
             let text: String
             switch reason {
-            case .sessionsRunning(let count):
-                // Stays pending; `applyPendingMainLoginSwitchIfSafe` retries.
-                guard !announceLater else { return }   // a retry's refusal is routine; say it once, at the switch
-                text = "notification.switch_not_applied.sessions_running".localized(with: count, previousName, profile.name)
             case .unknownKeychainLogin:
                 guard !announceLater else { return }
                 text = "notification.switch_not_applied.unknown_login".localized(with: previousName)
@@ -538,7 +537,7 @@ class ProfileManager: ObservableObject {
         Task {
             defer { Task { @MainActor in self.isApplyingPendingSwitch = false } }
             do {
-                let outcome = try await cliSyncService.switchMainLogin(to: active.id)
+                let outcome = try await cliSyncService.switchMainLogin(to: active.id, reason: "pending switch retried")
                 await MainActor.run {
                     self.reloadStoredCredentialState()
                     if case .applied = outcome { self.lastProfileSwitchAt = Date() }

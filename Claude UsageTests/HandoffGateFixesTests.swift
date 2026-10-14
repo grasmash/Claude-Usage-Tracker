@@ -24,7 +24,7 @@ final class HandoffGateFixesTests: XCTestCase {
                        .handOff(littlewing))
 
         let refusals: [MainLoginSwapPolicy.Refusal] = [
-            .sessionsRunning(count: 3), .unknownKeychainLogin, .processListUnavailable, .keychainUnreadable,
+            .unknownKeychainLogin, .processListUnavailable, .keychainUnreadable,
             .untrustedStoredLogin(.unknownProvenance), .notTheSharedLoginEntry(service: "x"),
         ]
         for refusal in refusals {
@@ -51,8 +51,8 @@ final class HandoffGateFixesTests: XCTestCase {
     func testTheHundredPercentPathStillMovesOnARetryableRefusal() {
         // Unchanged: at the limit, a retryable refusal keeps the switch pending
         // and the tracker moves (the pending retry applies it once safe).
-        XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.sessionsRunning(count: 2))), selectedBy: "auto"))
-        XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.sessionsRunning(count: 2))), selectedBy: "user", handoff: false))
+        XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.keychainUnreadable)), selectedBy: "auto"))
+        XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(.refused(.keychainUnreadable)), selectedBy: "user", handoff: false))
     }
 
     // MARK: - 5. Without ps, a bare node process is a holder
@@ -71,18 +71,9 @@ final class HandoffGateFixesTests: XCTestCase {
         XCTAssertTrue(MainLoginSwapPolicy.sharedLoginHolders(in: [zsh]).isEmpty)
     }
 
-    // MARK: - 6a. nearLimitLogins relaxes only an automatic hand-off
-
-    func testNearLimitLoginsApplyOnlyToAHandoff() {
-        let near = profile("madmatter", session: 92, weekly: 40)
-        XCTAssertEqual(ClaudeCodeSyncService.nearLimitLoginsForSwitch(
-            profiles: [near], handoff: true, proactiveEnabled: true, usingFable: false, now: now), [near.cliCredentialsJSON!])
-        XCTAssertEqual(ClaudeCodeSyncService.nearLimitLoginsForSwitch(
-            profiles: [near], handoff: false, proactiveEnabled: true, usingFable: false, now: now), [],
-            "a user-clicked (or 100%) switch must not move working sessions off a merely near-limit login")
-        XCTAssertEqual(ClaudeCodeSyncService.nearLimitLoginsForSwitch(
-            profiles: [near], handoff: true, proactiveEnabled: false, usingFable: false, now: now), [])
-    }
+    // MARK: - 6a. (2026-10-14) every switch moves running sessions; the
+    // near-limit/holder gating that `nearLimitLoginsForSwitch` provided is
+    // gone with it — sessions follow the swap, see SwapFollowsSessionsTests.
 
     // MARK: - 6b. The effective percentage uses the policy's `now`
 

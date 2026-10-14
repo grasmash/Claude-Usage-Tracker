@@ -1599,7 +1599,8 @@ class MenuBarManager: NSObject, ObservableObject {
         case .handOff(let p):
             let binding = Int(AutoSwitchPolicy.bindingPercentage(usage, usingFable: usingFable))
             LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' is at \(binding)% (near its limit); handing the shared login to '\(p.name)' before the limit interrupts work")
-            performAutoSwitch(from: currentProfile, to: p, handoff: true)
+            performAutoSwitch(from: currentProfile, to: p, handoff: true,
+                              reason: "near limit: \(binding)% (threshold \(Int(AutoSwitchPolicy.proactiveThreshold))%)")
             return
         case .noFableHeadroom(let notify):
             guard notify else { return }
@@ -1623,7 +1624,7 @@ class MenuBarManager: NSObject, ObservableObject {
         }
         LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' hit \(reason) limit, switching to '\(nextProfile.name)'")
 
-        performAutoSwitch(from: currentProfile, to: nextProfile)
+        performAutoSwitch(from: currentProfile, to: nextProfile, reason: "limit reached: \(reason)")
     }
 
     /// Tells the status line whether auto-switch is stuck and which accounts
@@ -1689,7 +1690,7 @@ class MenuBarManager: NSObject, ObservableObject {
         deadLoginLatch.attempted(currentProfile.id)
 
         LoggingService.shared.log("AutoSwitch: '\(currentProfile.name)' login is dead, switching to '\(nextProfile.name)'")
-        performAutoSwitch(from: currentProfile, to: nextProfile)
+        performAutoSwitch(from: currentProfile, to: nextProfile, reason: "dead login")
     }
 
     // MARK: - Opus fallback (operator, 2026-10-11: "App switches default to Opus")
@@ -1772,14 +1773,14 @@ class MenuBarManager: NSObject, ObservableObject {
         }
     }
 
-    private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile, handoff: Bool = false) {
+    private func performAutoSwitch(from currentProfile: Profile, to nextProfile: Profile, handoff: Bool = false, reason: String? = nil) {
         guard !autoSwitchInFlight, !profileManager.isSwitchingProfile, currentProfile.id != nextProfile.id else { return }
         autoSwitchInFlight = true
         let fromName = currentProfile.name
         let toName = nextProfile.name
         let notificationSettings = currentProfile.notificationSettings
         Task {
-            await profileManager.activateProfile(nextProfile.id, selectedBy: "auto", handoff: handoff)
+            await profileManager.activateProfile(nextProfile.id, selectedBy: "auto", handoff: handoff, reason: reason)
 
             await MainActor.run {
                 self.autoSwitchInFlight = false

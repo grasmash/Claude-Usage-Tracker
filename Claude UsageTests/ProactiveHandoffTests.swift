@@ -69,11 +69,13 @@ final class ProactiveHandoffTests: XCTestCase {
     func testDeciderHandsOffAtTheThresholdOncePerWindow() {
         var decider = AutoSwitchDecider()
         let spare = profile("b", session: 10, weekly: 10)
-        var active = profile("a", session: 89, weekly: 30)
-        XCTAssertEqual(decider.decide(current: active, profiles: [active, spare], usingFable: false, now: now), .stay)
+        var active = profile("a", session: 84, weekly: 30)
+        XCTAssertEqual(decider.decide(current: active, profiles: [active, spare], usingFable: false, now: now), .stay,
+                       "below the 85% threshold: stay")
 
-        active.claudeUsage = usage(session: 91, weekly: 30)
-        XCTAssertEqual(decider.decide(current: active, profiles: [active, spare], usingFable: false, now: now), .handOff(spare))
+        active.claudeUsage = usage(session: 86, weekly: 30)
+        XCTAssertEqual(decider.decide(current: active, profiles: [active, spare], usingFable: false, now: now), .handOff(spare),
+                       "at 86% (threshold 85) the hand-off fires, well before the limit card")
         // Same window, next tick: latched.
         active.claudeUsage = usage(session: 93, weekly: 30)
         XCTAssertEqual(decider.decide(current: active, profiles: [active, spare], usingFable: false, now: now), .stay)
@@ -121,25 +123,23 @@ final class ProactiveHandoffTests: XCTestCase {
 
     // MARK: - Swap policy: writing under WORKING holders
 
-    func testRefusalAllowsHoldersOnlyWhenSpentOrNearLimit() {
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 2, keychainFingerprint: "k", knownFingerprints: ["k"]),
-                       .sessionsRunning(count: 2))
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 2, keychainFingerprint: "k", knownFingerprints: ["k"], keychainLoginSpent: true))
-        XCTAssertNil(MainLoginSwapPolicy.refusal(holders: 2, keychainFingerprint: "k", knownFingerprints: ["k"], keychainLoginNearLimit: true))
-        // The compare-and-swap still holds under a hand-off.
-        XCTAssertEqual(MainLoginSwapPolicy.refusal(holders: 2, keychainFingerprint: "x", knownFingerprints: ["k"], keychainLoginNearLimit: true),
-                       .unknownKeychainLogin)
+    /// The threshold sits below the limit with real margin (operator,
+    /// 2026-10-14: the 90% hand-off was refused for eleven ticks and the limit
+    /// card then stranded every in-flight agent). The ceiling keeps hysteresis.
+    func testHandoffThresholdLeavesMarginBelowTheLimit() {
+        XCTAssertEqual(AutoSwitchPolicy.proactiveThreshold, 85)
+        XCTAssertLessThan(AutoSwitchPolicy.handoffTargetCeiling, AutoSwitchPolicy.proactiveThreshold - 5, "hysteresis between target ceiling and hand-off threshold")
+        XCTAssertTrue(AutoSwitchPolicy.isNearLimit(usage(session: 85, weekly: 10), usingFable: false, now: now))
+        XCTAssertFalse(AutoSwitchPolicy.isNearLimit(usage(session: 84.9, weekly: 10), usingFable: false, now: now))
     }
 
-    func testNearLimitLoginsAreFreshReadingsAtOrAboveTheThreshold() {
-        let near = profile("a", session: 91, weekly: 10)
-        let staleNear = profile("b", session: 95, weekly: 10, age: 3600)
-        let fine = profile("c", session: 50, weekly: 10)
-        let fableNear = profile("d", session: 10, weekly: 10, fable: 92)
-        XCTAssertEqual(MainLoginSwapPolicy.nearLimitLogins(in: [near, staleNear, fine, fableNear], usingFable: false, now: now),
-                       [near.cliCredentialsJSON!])
-        XCTAssertEqual(MainLoginSwapPolicy.nearLimitLogins(in: [near, staleNear, fine, fableNear], usingFable: true, now: now),
-                       [near.cliCredentialsJSON!, fableNear.cliCredentialsJSON!])
+    /// Running sessions never refuse the swap: they follow it (the keychain is
+    /// written, the credentials stub touched, each session re-reads the
+    /// keychain before its next request). Only an unknown keychain login does.
+    func testRefusalIgnoresHoldersAndKeepsTheCompareAndSwap() {
+        XCTAssertNil(MainLoginSwapPolicy.refusal(keychainFingerprint: "k", knownFingerprints: ["k"]))
+        XCTAssertNil(MainLoginSwapPolicy.refusal(keychainFingerprint: nil, knownFingerprints: []), "an empty keychain may always be written")
+        XCTAssertEqual(MainLoginSwapPolicy.refusal(keychainFingerprint: "x", knownFingerprints: ["k"]), .unknownKeychainLogin)
     }
 
     /// After a hand-off under working holders the replaced login's lineage may

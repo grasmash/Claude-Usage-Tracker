@@ -555,7 +555,7 @@ final class AutoSwitchPolicyTests: XCTestCase {
     func testAnAutomaticSwitchActivatesWhenTheLoginWasWrittenOrTheRefusalIsRetried() {
         for outcome: ClaudeCodeSyncService.MainLoginSwitch in [
             .applied(racedHolders: 0), .alreadyApplied,
-            .refused(.sessionsRunning(count: 3)), .refused(.unknownKeychainLogin),
+            .refused(.unknownKeychainLogin),
             .refused(.processListUnavailable), .refused(.keychainUnreadable),
         ] {
             XCTAssertTrue(AutoSwitchPolicy.activateAfterMainLoginSwitch(.success(outcome), selectedBy: "auto"), "\(outcome)")

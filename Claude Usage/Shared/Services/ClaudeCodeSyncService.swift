@@ -116,30 +116,42 @@ class ClaudeCodeSyncService {
         return fallback
     }
 
-    private static func runPs(_ arguments: [String]) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            LoggingService.shared.logError("listRunningProcesses: could not run ps \(arguments.first ?? "") (errno \(errno))", error: error)
+    /// Runs `ps` (or, for tests, `executable`) and returns its stdout.
+    ///
+    /// Every pipe end is closed here, explicitly. Measured 2026-10-14: left to
+    /// `Pipe` deallocation, each run leaked one descriptor of its pipe (two when
+    /// the launch itself failed), and after 33 hours the tracker held 4,841 pipe
+    /// descriptors, could not spawn `security` or `ps` at all, and refused
+    /// every hand-off until the limit hit (`ProcessRunnerFdTests`).
+    static func runPs(_ arguments: [String], executable: URL = URL(fileURLWithPath: "/bin/ps")) -> String? {
+        autoreleasepool {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = arguments
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            defer { try? pipe.fileHandleForReading.close() }
+            do {
+                try process.run()
+            } catch {
+                // Never launched: the parent still holds BOTH ends.
+                try? pipe.fileHandleForWriting.close()
+                LoggingService.shared.logError("listRunningProcesses: could not run ps \(arguments.first ?? "") (errno \(errno))", error: error)
+                return nil
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                LoggingService.shared.logError("listRunningProcesses: ps \(arguments.first ?? "") exited \(process.terminationStatus) (reason \(process.terminationReason.rawValue), \(data.count) bytes)")
+                return nil
+            }
+            // ps output is not guaranteed UTF-8 (arguments can be any bytes).
+            if let text = String(data: data, encoding: .utf8) { return text }
+            if let text = String(data: data, encoding: .isoLatin1) { return text }
+            LoggingService.shared.logError("listRunningProcesses: ps output could not be decoded")
             return nil
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            LoggingService.shared.logError("listRunningProcesses: ps \(arguments.first ?? "") exited \(process.terminationStatus) (reason \(process.terminationReason.rawValue), \(data.count) bytes)")
-            return nil
-        }
-        // ps output is not guaranteed UTF-8 (arguments can be any bytes).
-        if let text = String(data: data, encoding: .utf8) { return text }
-        if let text = String(data: data, encoding: .isoLatin1) { return text }
-        LoggingService.shared.logError("listRunningProcesses: ps output could not be decoded")
-        return nil
     }
 
     // MARK: - Cached Availability Check
@@ -242,12 +254,15 @@ class ClaudeCodeSyncService {
         for fileURL in paths {
             guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
 
-            guard let data = try? Data(contentsOf: fileURL),
-                  let jsonString = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !jsonString.isEmpty else {
+            guard let data = try? Data(contentsOf: fileURL) else {
                 LoggingService.shared.log("credentials file exists but could not be read: \(fileURL.lastPathComponent)")
                 continue
             }
+            // A 0-byte file is the reload-signal stub (`signalCredentialsReload`),
+            // not a login: Claude Code keeps the login in the keychain and only
+            // watches this file's mtime. Nothing to read, nothing to report.
+            guard let jsonString = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !jsonString.isEmpty else { continue }
 
             // Validate it's actually valid JSON
             guard let _ = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -282,55 +297,70 @@ class ClaudeCodeSyncService {
     /// If the timeout elapses, the subprocess is terminated and `timedOut` is true.
     /// This is critical: without the timeout, a hung `security` call blocks the
     /// calling thread (and, if called from main, the whole app) indefinitely.
-    private static func runSecurityProcess(
+    ///
+    /// Every pipe end is closed here, explicitly: the read ends after the run
+    /// (or the timeout), and the write ends too when the launch failed, since
+    /// only a launched `Process` closes the parent's copies. See `runPs` for the
+    /// measured leak this closes. `executable` is only overridden by tests.
+    static func runSecurityProcess(
         arguments: [String],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        executable: URL = URL(fileURLWithPath: "/usr/bin/security")
     ) -> SecurityCommandResult? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = arguments
+        autoreleasepool {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = arguments
 
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
-        do {
-            try process.run()
-        } catch {
-            LoggingService.shared.log("runSecurityCommand: failed to launch security: \(error.localizedDescription)")
-            return nil
-        }
-
-        // Wait for the process with a hard deadline. DispatchGroup lets us block
-        // the current thread up to `timeout` seconds, then terminate if still running.
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            process.waitUntilExit()
-            group.leave()
-        }
-
-        let waitResult = group.wait(timeout: .now() + timeout)
-        if waitResult == .timedOut {
-            LoggingService.shared.log("runSecurityCommand: TIMEOUT after \(timeout)s, terminating security subprocess (args: \(arguments.prefix(2).joined(separator: " ")))")
-            process.terminate()
-            // Give it a brief moment to die, then force-kill if needed
-            _ = group.wait(timeout: .now() + 0.5)
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+            defer {
+                try? outputPipe.fileHandleForReading.close()
+                try? errorPipe.fileHandleForReading.close()
             }
-            return SecurityCommandResult(exitCode: -1, stdout: "", stderr: "timeout", timedOut: true)
-        }
 
-        let stdoutData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        return SecurityCommandResult(
-            exitCode: process.terminationStatus,
-            stdout: String(data: stdoutData, encoding: .utf8) ?? "",
-            stderr: String(data: stderrData, encoding: .utf8) ?? "",
-            timedOut: false
-        )
+            do {
+                try process.run()
+            } catch {
+                // Never launched: the parent still holds BOTH ends of each pipe.
+                try? outputPipe.fileHandleForWriting.close()
+                try? errorPipe.fileHandleForWriting.close()
+                LoggingService.shared.log("runSecurityCommand: failed to launch security: \(error.localizedDescription)")
+                return nil
+            }
+
+            // Wait for the process with a hard deadline. DispatchGroup lets us block
+            // the current thread up to `timeout` seconds, then terminate if still running.
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                process.waitUntilExit()
+                group.leave()
+            }
+
+            let waitResult = group.wait(timeout: .now() + timeout)
+            if waitResult == .timedOut {
+                LoggingService.shared.log("runSecurityCommand: TIMEOUT after \(timeout)s, terminating security subprocess (args: \(arguments.prefix(2).joined(separator: " ")))")
+                process.terminate()
+                // Give it a brief moment to die, then force-kill if needed
+                _ = group.wait(timeout: .now() + 0.5)
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+                return SecurityCommandResult(exitCode: -1, stdout: "", stderr: "timeout", timedOut: true)
+            }
+
+            let stdoutData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            return SecurityCommandResult(
+                exitCode: process.terminationStatus,
+                stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+                stderr: String(data: stderrData, encoding: .utf8) ?? "",
+                timedOut: false
+            )
+        }
     }
 
     /// Reads Claude Code credentials from system Keychain using security command
@@ -857,10 +887,10 @@ class ClaudeCodeSyncService {
         /// the scan and the write and may hold the login that was replaced;
         /// nil means the re-scan itself failed, so the window is unverified.
         ///
-        /// `strandedSignalled` is false only when sessions stranded on a spent
-        /// login were switched under but could not be told to reload (the
-        /// credentials file is missing): they stay on the spent login until
-        /// they restart or the user runs /login.
+        /// `strandedSignalled` is false only when the sessions switched under
+        /// could not be told to reload (the credentials-file stub could not be
+        /// touched or created): they stay on the replaced login until they
+        /// restart or the user runs /login.
         case applied(racedHolders: Int?, strandedSignalled: Bool = true)
         /// The keychain already held this profile's login; nothing was written.
         case alreadyApplied
@@ -885,31 +915,37 @@ class ClaudeCodeSyncService {
     }
 
     /// Makes `profile`'s stored main login the shared Claude Code login — the
-    /// one `claude` sessions started without `CLAUDE_CONFIG_DIR` use — when,
-    /// and only when, that is safe:
+    /// one `claude` sessions started without `CLAUDE_CONFIG_DIR` use — and
+    /// moves every running session with it:
     ///
-    /// 1. No Claude Code process is running on the shared login. Every such
-    ///    process holds the login in memory; swapping it under them leaves two
-    ///    holders of one single-use refresh token. Exception: when the shared
-    ///    login's account is spent (in `spentLogins`: at a session or weekly
-    ///    limit, or dead; or in `fableSpentLogins` with every holder on Fable), its
-    ///    sessions are stranded and can make no request, so they do not block;
-    ///    they are told to reload onto the new login after the write.
-    /// 2. The keychain holds a login the tracker has captured (compare-and-
-    ///    swap on its fingerprint), or nothing. A login that changed since the
-    ///    last capture — a `/login`, or a rotation by a refresher the tracker
-    ///    does not know about — is never overwritten.
+    /// 1. Running sessions FOLLOW the swap (measured 2026-10-14, claude-rotate
+    ///    `tests/test_session_follows_login.sh`): after the keychain write the
+    ///    credentials-file stub is touched, and each session re-reads the
+    ///    keychain before its next request. They never block the swap. The
+    ///    holders are written down (`HandoffRecord`) so the replaced login's
+    ///    lineage is not refreshed by the tracker until every one of them has
+    ///    released it (it is a single-use refresh token they may still carry).
+    ///    Until 2026-10-14 running sessions refused the swap; that refusal is
+    ///    what let the 90-98% hand-off fail eleven ticks in a row and ~20
+    ///    agents die at the limit.
+    /// 2. The keychain holds a login the tracker knows — a stored copy
+    ///    (`knownLogins`), or a login PROVEN to belong to one of `owners` by
+    ///    its account lookup (a rotation the tracker has not stored yet) — or
+    ///    nothing. A `/login` the tracker has not adopted is never overwritten.
     /// 3. The write is one in-place `-U` update.
     ///
-    /// Only after 1 and 2 pass is the stored login refreshed if it has expired:
-    /// at that moment the tracker is its only holder. A stored login that is
+    /// Only after 2 passes is the stored login refreshed if it has expired: at
+    /// that moment the tracker is its only holder. A stored login that is
     /// already the keychain login is left entirely alone.
     ///
-    /// `knownLogins` are the main logins the tracker has captured (every
-    /// profile's `cliCredentialsJSON`), for the compare-and-swap.
-    func switchMainLogin(to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], spentLogins: [String] = [], fableSpentLogins: [String] = [], nearLimitLogins: [String] = []) async throws -> MainLoginSwitch {
+    /// `reason` is why the caller is switching (near limit, limit reached, user
+    /// click, pending retry…); it is written to `HandoffLog` with the from/to
+    /// accounts and the outcome.
+    func switchMainLogin(
+        to profile: Profile, knownLogins: [String], pinnedLogins: [String] = [], reason: String = "user", owners: [Profile] = []
+    ) async throws -> MainLoginSwitch {
         try await withSwitchMutex {
-            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, spentLogins: spentLogins, fableSpentLogins: fableSpentLogins, nearLimitLogins: nearLimitLogins)
+            try await performMainLoginSwitch(to: profile, knownLogins: knownLogins, pinnedLogins: pinnedLogins, reason: reason, owners: owners)
         }
     }
 
@@ -925,11 +961,34 @@ class ClaudeCodeSyncService {
         }
     }
 
-    private func performMainLoginSwitch(to profile: Profile, knownLogins: [String], pinnedLogins: [String], spentLogins: [String], fableSpentLogins: [String], nearLimitLogins: [String] = []) async throws -> MainLoginSwitch {
+    private func performMainLoginSwitch(
+        to profile: Profile, knownLogins: [String], pinnedLogins: [String], reason: String, owners: [Profile]
+    ) async throws -> MainLoginSwitch {
+        // Who the keychain login belongs to, as far as can be told: by a stored
+        // copy, or by a proven account lookup. Filled in once the keychain is
+        // read; "unknown login" until then. Names only, never a token.
+        var fromName = "unknown login"
+        var holderCount = 0
+        func logged(_ outcome: MainLoginSwitch, _ extra: [(String, String)] = []) -> MainLoginSwitch {
+            switch outcome {
+            case .applied(let raced, let signalled):
+                HandoffLog.record(.handoff, from: fromName, to: profile.name, reason: reason,
+                                  fields: [("holders", String(holderCount)), ("signalled", signalled ? "yes" : "NO"),
+                                           ("raced", raced.map(String.init) ?? "unverified")] + extra)
+            case .alreadyApplied:
+                HandoffLog.record(.alreadyOn, from: fromName, to: profile.name, reason: reason)
+            case .refused(let refusal):
+                HandoffLog.record(.refused, from: fromName, to: profile.name, reason: reason,
+                                  fields: [("refusal", "\(refusal)"), ("holders", String(holderCount))] + extra)
+            }
+            return outcome
+        }
+
         guard let storedJSON = profile.cliCredentialsJSON, AutoSwitchPolicy.canBeApplied(profile) else {
             // A pinned entry's login is never copied into the main keychain:
             // that puts one single-use refresh token in two config dirs.
             LoggingService.shared.log("switchMainLogin: '\(profile.name)' has no main login of its own; nothing to apply")
+            HandoffLog.record(.failed, from: fromName, to: profile.name, reason: reason, fields: [("why", "no main login of its own")])
             throw ClaudeCodeError.noProfileCredentials
         }
 
@@ -939,7 +998,7 @@ class ClaudeCodeSyncService {
         let service = resolveServiceName()
         guard MainLoginSwapPolicy.isSharedLoginServiceName(service, claudeDirectoryHash: defaultClaudeDirectoryHash) else {
             LoggingService.shared.logError("switchMainLogin: resolved keychain entry '\(service)' is not the shared login's; refusing to write it")
-            return .refused(.notTheSharedLoginEntry(service: service))
+            return logged(.refused(.notTheSharedLoginEntry(service: service)))
         }
 
         // C2: only exit 44 (not found) means the entry is empty. A timeout, a
@@ -949,11 +1008,24 @@ class ClaudeCodeSyncService {
             keychainJSON = try readKeychainCredentials()
         } catch {
             LoggingService.shared.logError("switchMainLogin: cannot read the shared keychain entry; refusing", error: error)
-            return .refused(.keychainUnreadable)
+            return logged(.refused(.keychainUnreadable), [("why", "keychain unreadable: \(error.localizedDescription)")])
         }
         let keychainFingerprint = keychainJSON.flatMap(systemLoginFingerprint)
+        // The account the keychain login belongs to. A stored copy proves it;
+        // so does a resolved account lookup (`loginIsProvenToBelong`), which is
+        // how a login Claude Code rotated since the last capture is still
+        // recognised as, say, jrand's rather than "unknown" — the tracker's
+        // active account and the keychain's must be the same thing.
+        let keychainOwner = keychainJSON.flatMap { json in owners.first { loginIsProvenToBelong(json, to: $0) } }
+        if keychainJSON == nil {
+            fromName = "(empty keychain)"
+        } else if let keychainOwner {
+            fromName = keychainOwner.name
+        } else if let keychainFingerprint, keychainFingerprint == systemLoginFingerprint(storedJSON) {
+            fromName = profile.name
+        }
         if let keychainFingerprint, keychainFingerprint == systemLoginFingerprint(storedJSON) {
-            return .alreadyApplied
+            return logged(.alreadyApplied)
         }
 
         // W6/W15: a stored login that is (or may be) a copy of a lineage someone
@@ -967,46 +1039,34 @@ class ClaudeCodeSyncService {
             provenance: profile.mainLoginProvenance
         ) {
             LoggingService.shared.logError("switchMainLogin: not writing '\(profile.name)''s stored login: \(distrust); re-import it with claude-usage-login")
-            return .refused(.untrustedStoredLogin(distrust))
+            return logged(.refused(.untrustedStoredLogin(distrust)))
         }
 
-        // C1: no process list means no knowledge of holders; refuse.
+        // C1: no process list means no knowledge of holders. They no longer
+        // block the swap, but they must be written down (the replaced lineage
+        // is held back from any refresh until they release it), so refuse.
         guard let processes = runningProcesses() else {
             LoggingService.shared.logError("switchMainLogin: cannot list processes; refusing to switch to '\(profile.name)'")
-            return .refused(.processListUnavailable)
+            return logged(.refused(.processListUnavailable))
         }
         let holders = MainLoginSwapPolicy.sharedLoginHolders(in: processes)
-        let known = Set(knownLogins.compactMap(systemLoginFingerprint))
-        // Sessions on a spent login are stranded, not working: they do not block.
-        // A spent Fable quota strands them only if every holder is on Fable.
-        func listed(_ logins: [String]) -> Bool {
-            keychainFingerprint.map { Set(logins.compactMap(systemLoginFingerprint)).contains($0) } ?? false
-        }
-        let keychainLoginSpent = listed(spentLogins)
-            || (listed(fableSpentLogins) && !holders.isEmpty && MainLoginSwapPolicy.allHoldersOnFable(holders, modelOf: holderModel))
-        // A proactive hand-off: the keychain login's account is near its limit
-        // on a fresh reading. Working holders are moved (and told to reload);
-        // the replaced lineage is then held back from any refresh until they
-        // have released it (`HandoffRecord`).
-        let keychainLoginNearLimit = !keychainLoginSpent && listed(nearLimitLogins)
-        if let refusal = MainLoginSwapPolicy.refusal(
-            holders: holders.count, keychainFingerprint: keychainFingerprint, knownFingerprints: known,
-            keychainLoginSpent: keychainLoginSpent, keychainLoginNearLimit: keychainLoginNearLimit
-        ) {
-            LoggingService.shared.log("switchMainLogin: not switching Claude Code to '\(profile.name)': \(refusal)")
-            return .refused(refusal)
+        holderCount = holders.count
+        var known = Set(knownLogins.compactMap(systemLoginFingerprint))
+        if let keychainFingerprint, keychainOwner != nil { known.insert(keychainFingerprint) }
+        if let refusal = MainLoginSwapPolicy.refusal(keychainFingerprint: keychainFingerprint, knownFingerprints: known) {
+            LoggingService.shared.log("switchMainLogin: not switching Claude Code from '\(fromName)' to '\(profile.name)' (\(reason)): \(refusal)")
+            return logged(.refused(refusal))
         }
         if !holders.isEmpty {
-            if keychainLoginSpent {
-                LoggingService.shared.log("switchMainLogin: \(holders.count) Claude Code session(s) are stranded on a spent login; switching them to '\(profile.name)'")
-            } else {
-                LoggingService.shared.log("switchMainLogin: hand-off: \(holders.count) working Claude Code session(s) are on a login near its limit; moving them to '\(profile.name)' before it interrupts them")
-            }
+            LoggingService.shared.log("switchMainLogin: hand-off (\(reason)): \(holders.count) Claude Code session(s) on '\(fromName)' will follow the shared login to '\(profile.name)'")
         }
 
-        // Nothing holds the shared login and the keychain is what we last saw.
-        // The stored login's only holder is this app, so it may be refreshed.
+        // The keychain is what we last saw. The stored login's only holder is
+        // this app (or a lineage whose holders have all released it), so it
+        // may be refreshed.
         guard let jsonData = await refreshStoredMainLoginIfExpired(storedJSON, profileId: profile.id, profileName: profile.name) else {
+            HandoffLog.record(.failed, from: fromName, to: profile.name, reason: reason,
+                              fields: [("why", "stored login could not be refreshed (dead, held by an unreleased hand-off, or no refresh token)")])
             throw ClaudeCodeError.noProfileCredentials
         }
 
@@ -1018,11 +1078,11 @@ class ClaudeCodeSyncService {
             keychainNow = try readKeychainCredentials()
         } catch {
             LoggingService.shared.logError("switchMainLogin: cannot re-read the shared keychain entry before writing; refusing", error: error)
-            return .refused(.keychainUnreadable)
+            return logged(.refused(.keychainUnreadable), [("why", "re-read before write failed")])
         }
         if keychainNow.flatMap(systemLoginFingerprint) != keychainFingerprint {
             LoggingService.shared.log("switchMainLogin: the shared login changed while '\(profile.name)''s stored login was refreshed; not writing")
-            return .refused(.unknownKeychainLogin)
+            return logged(.refused(.unknownKeychainLogin), [("why", "keychain login changed during the stored login's refresh")])
         }
 
         try writeSystemCredentials(jsonData)
@@ -1050,9 +1110,9 @@ class ClaudeCodeSyncService {
         }
         lastSeenSystemLoginFingerprint = systemLoginFingerprint(jsonData)
 
-        // A hand-off under working holders: remember who may still carry the
-        // replaced lineage, so it is not refreshed until they have released it.
-        if keychainLoginNearLimit, !holders.isEmpty, let replaced = keychainFingerprint {
+        // A swap under holders: remember who may still carry the replaced
+        // lineage, so it is not refreshed until they have released it.
+        if !holders.isEmpty, let replaced = keychainFingerprint {
             var started: [String: Date] = [:]
             for holder in holders {
                 if case .running(let at?) = holderProcess(holder.pid) { started[String(holder.pid)] = at }
@@ -1063,17 +1123,16 @@ class ClaudeCodeSyncService {
                 holdersByNameOnly: holders.filter(MainLoginSwapPolicy.isNameOnlyNode).map(\.pid)))
         }
 
-        // Stranded sessions (on a spent login) were there before the write and
-        // are expected; tell them to reload onto the new login now. The signal
-        // never creates the file; a failure is reported to the caller.
-        var strandedSignalled = true
-        if !holders.isEmpty {
-            strandedSignalled = Self.signalCredentialsReload(at: credentialsFileURL)
-            if strandedSignalled {
-                LoggingService.shared.log("switchMainLogin: touched the credentials file so the \(holders.count) stranded session(s) reload onto '\(profile.name)'")
-            } else {
-                LoggingService.shared.logError("⚠️ switchMainLogin: could not signal the \(holders.count) stranded session(s) to reload (no \(credentialsFileURL.lastPathComponent)); they stay on the spent login until restarted or /login")
-            }
+        // Tell every session to reload onto the new login: ALWAYS, not only
+        // when holders were seen — the listing can miss one (the libproc
+        // fallback, a session that started during the write) and the signal is
+        // a touch of a stub, free when nobody is listening. The stub is created
+        // when missing; a failure is reported to the caller.
+        let strandedSignalled = Self.signalCredentialsReload(at: credentialsFileURL)
+        if strandedSignalled {
+            LoggingService.shared.log("switchMainLogin: touched \(credentialsFileURL.lastPathComponent) so the \(holders.count) session(s) on '\(fromName)' reload onto '\(profile.name)' before their next request")
+        } else {
+            LoggingService.shared.logError("⚠️ switchMainLogin: could not touch or create \(credentialsFileURL.lastPathComponent); the \(holders.count) session(s) stay on '\(fromName)' until restarted or /login")
         }
 
         // Re-scan: a `claude` that started between the scan above and the write
@@ -1099,7 +1158,7 @@ class ClaudeCodeSyncService {
 
         // Restore the profile's captured oauthAccount (if any) so Claude Code's
         // /status Status tab shows the right email/org/plan for this profile.
-        // No working session is running (see 1); a stranded one reloads.
+        // Running sessions reload onto the new login (the stub was touched).
         if let storedOAuthAccount = profile.oauthAccountJSON {
             do {
                 try writeOAuthAccount(storedOAuthAccount)
@@ -1108,44 +1167,28 @@ class ClaudeCodeSyncService {
             }
         }
 
-        LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)'")
-        return .applied(racedHolders: verified ? racedCount : nil, strandedSignalled: strandedSignalled)
+        LoggingService.shared.log("✅ switchMainLogin: Claude Code's shared login is now '\(profile.name)' (was '\(fromName)'; \(reason))")
+        return logged(.applied(racedHolders: verified ? racedCount : nil, strandedSignalled: strandedSignalled))
     }
 
-    /// `switchMainLogin(to:knownLogins:pinnedLogins:)` for a stored profile,
-    /// with every profile's captured main login as the known set and every
+    /// `switchMainLogin(to:knownLogins:pinnedLogins:reason:owners:)` for a
+    /// stored profile, with every profile's captured main login as the known
+    /// set, every profile as a possible owner of the keychain login, and every
     /// pinned entry's current contents (read-only) for the copy check. The
     /// store is loaded INSIDE the mutex, so a queued caller sees the login the
     /// previous switch just refreshed and stored (`.alreadyApplied`), not a
     /// stale copy it would then mis-read as an unknown keychain login.
-    func switchMainLogin(to profileId: UUID, handoff: Bool = false) async throws -> MainLoginSwitch {
+    func switchMainLogin(to profileId: UUID, reason: String) async throws -> MainLoginSwitch {
         try await withSwitchMutex {
             let profiles = ProfileStore.shared.loadProfiles()
             guard let profile = profiles.first(where: { $0.id == profileId }) else {
                 throw ClaudeCodeError.noProfileCredentials
             }
             let pinned = Set(profiles.compactMap(\.customKeychainServiceName)).compactMap { readKeychainCredentials(serviceName: $0) }
-            let spent = MainLoginSwapPolicy.spentLogins(in: profiles, isLoginDead: isLoginDead(for:))
-            let usingFable = AutoSwitchPolicy.isClaudeCodeUsingFable() || ModelFallback().isActive
-            let nearLimit = Self.nearLimitLoginsForSwitch(
-                profiles: profiles, handoff: handoff,
-                proactiveEnabled: SharedDataStore.shared.loadAutoSwitchProactiveEnabled(), usingFable: usingFable)
             return try await performMainLoginSwitch(
-                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned, spentLogins: spent,
-                fableSpentLogins: MainLoginSwapPolicy.fableSpentLogins(in: profiles), nearLimitLogins: nearLimit)
+                to: profile, knownLogins: profiles.compactMap(\.cliCredentialsJSON), pinnedLogins: pinned,
+                reason: reason, owners: profiles)
         }
-    }
-
-    /// The near-limit logins a switch may move working sessions off.
-    static func nearLimitLoginsForSwitch(
-        profiles: [Profile], handoff: Bool, proactiveEnabled: Bool, usingFable: Bool, now: Date = Date()
-    ) -> [String] {
-        // Only an automatic hand-off may move working sessions off a login
-        // that is merely NEAR its limit. A switch the user clicked, or the
-        // 100% path (whose login is spent and listed in `spentLogins`), keeps
-        // the rule that running sessions block the swap.
-        guard handoff, proactiveEnabled else { return [] }
-        return MainLoginSwapPolicy.nearLimitLogins(in: profiles, usingFable: usingFable, now: now)
     }
 
     /// Removes CLI credentials from profile (doesn't affect system)
@@ -1432,10 +1475,25 @@ class ClaudeCodeSyncService {
         extractRefreshToken(from: keychainJSON).map { sha256HexPrefix($0, length: 64) }
     }
 
-    /// Bumps the file's modification time, leaving its contents alone. Returns
-    /// false (and creates nothing) when the file does not exist.
+    /// Bumps the file's modification time, leaving its contents alone, so every
+    /// running Claude Code session re-reads the keychain before its next
+    /// request (measured against Claude Code 2.1.299, 2026-10-14: a session
+    /// stats this file before EVERY request and drops its cached login when the
+    /// mtime changed; the content is not consulted on macOS, the keychain is).
+    ///
+    /// When the file is missing it is CREATED as a 0-byte, mode 0600 stub — the
+    /// same stub claude-rotate's `reload-signal.sh` writes. Without the file
+    /// there is nothing for sessions to watch, so a swap could not reach them.
+    /// Nothing is ever written into it. Returns false only on a filesystem
+    /// error (no config dir, permission denied).
     static func signalCredentialsReload(at fileURL: URL) -> Bool {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            guard FileManager.default.createFile(atPath: fileURL.path, contents: Data(), attributes: [.posixPermissions: 0o600]) else {
+                return false
+            }
+            LoggingService.shared.log("signalCredentialsReload: created the 0-byte stub \(fileURL.lastPathComponent) so sessions can follow the shared login")
+            return true
+        }
         return (try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: fileURL.path)) != nil
     }
 

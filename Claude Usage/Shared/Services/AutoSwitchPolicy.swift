@@ -126,10 +126,14 @@ enum AutoSwitchPolicy {
     /// reading) hands the shared login to another account before the limit
     /// interrupts work. Operator, 2026-10-12: every limit hit that day killed
     /// in-flight subagents with 429s before the 100% switch could land.
-    static let proactiveThreshold: Double = 90
+    /// 85, not 90, since 2026-10-14: at 90% the account climbed to the limit
+    /// in eleven ticks (~5.5 min) under ~20 agents; a session parked on the
+    /// "Usage limit reached" card does not retry until the reset, so the
+    /// hand-off has to land with real margin, not at the last tick.
+    static let proactiveThreshold: Double = 85
 
     /// A hand-off target has EVERY binding window at or below this. The gap to
-    /// `proactiveThreshold` is the hysteresis: an account handed off at 90%
+    /// `proactiveThreshold` is the hysteresis: an account handed off at 85%
     /// cannot be handed back to until its window resets, so two accounts never
     /// ping-pong, and the target has real room, not a sliver.
     static let handoffTargetCeiling: Double = 75

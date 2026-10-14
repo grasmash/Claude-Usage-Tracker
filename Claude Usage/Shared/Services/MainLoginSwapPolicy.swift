@@ -5,12 +5,19 @@ import Foundation
 /// uses.
 ///
 /// Claude Code OAuth refresh tokens are single-use, and every running session
-/// keeps its login in memory. Rewriting the shared login while a session holds
-/// it leaves two holders of one lineage: whichever refreshes second is logged
-/// out ("Login expired · Please run /login"), and a session that still has the
-/// old login writes it back over the new one. So the shared login is rewritten
-/// only when nothing holds it, only over a login the tracker has seen — never
-/// over a `/login` it has not yet captured — and only into the keychain entry
+/// keeps its login in memory — but a session re-reads the keychain before its
+/// next request once `~/.claude/.credentials.json`'s mtime changes (measured
+/// 2026-10-14 against Claude Code 2.1.299; claude-rotate
+/// `tests/test_session_follows_login.sh`). So running sessions FOLLOW a swap:
+/// the tracker writes the keychain, touches the stub, and writes the holders
+/// down (`HandoffRecord`) so the replaced lineage is not refreshed until every
+/// one of them has released it. They never block the swap. (Until 2026-10-14
+/// they did, and that refusal — eleven ticks of `sessionsRunning` while the
+/// account climbed from 90% to the limit — killed ~20 agents.)
+///
+/// What still refuses: the shared login is rewritten only over a login the
+/// tracker knows — a stored copy, or one proven by its account lookup — never
+/// over a `/login` it has not yet captured; and only into the keychain entry
 /// that IS the shared login, never a per-config-dir one. When any of that
 /// cannot be established (no process list, keychain unreadable) the answer is
 /// refuse, never "probably fine".
@@ -210,8 +217,6 @@ enum MainLoginSwapPolicy {
 
     /// Why a rewrite of the shared login was not done.
     enum Refusal: Equatable {
-        /// Claude Code sessions are running on the shared login; they hold it.
-        case sessionsRunning(count: Int)
         /// The keychain holds a login the tracker never captured (a `/login` it
         /// has not adopted yet, or a foreign account). Never overwrite it.
         case unknownKeychainLogin
@@ -232,79 +237,32 @@ enum MainLoginSwapPolicy {
     static func isRetryable(_ refusal: Refusal) -> Bool {
         switch refusal {
         case .untrustedStoredLogin, .notTheSharedLoginEntry: return false
-        case .sessionsRunning, .unknownKeychainLogin, .processListUnavailable, .keychainUnreadable: return true
+        case .unknownKeychainLogin, .processListUnavailable, .keychainUnreadable: return true
         }
     }
 
-    /// Decides a compare-and-swap of the shared login.
+    /// Decides a compare-and-swap of the shared login. Running sessions are
+    /// not an input: they follow the swap (see the type comment).
     ///
-    /// - `holders`: Claude Code processes on the shared login right now.
     /// - `keychainFingerprint`: fingerprint of the login in the keychain now
     ///   (nil when the entry is empty or missing).
-    /// - `knownFingerprints`: fingerprints of the logins the tracker has
-    ///   captured from the keychain. The keychain login must be one of them,
-    ///   so a login that rotated or changed since the last capture (another
-    ///   refresher exists, or the user ran `/login`) is never overwritten.
-    ///
-    /// - `keychainLoginSpent`: the keychain login's account is at a limit (or
-    ///   its login is dead). Its sessions are stranded: every request they make
-    ///   is refused, so holding them there protects nothing, and leaving them
-    ///   is the outage auto-switch exists to prevent (2026-10-11: ten sessions
-    ///   sat on a spent weekly limit while the swap was refused each cycle).
-    ///   Running sessions then do not block; the compare-and-swap still does.
+    /// - `knownFingerprints`: fingerprints of the logins the tracker knows —
+    ///   its stored copies, plus the keychain login itself when its account
+    ///   lookup proved it to be one of the profiles'. The keychain login must
+    ///   be one of them, so a `/login` to an account the tracker has not
+    ///   adopted is never overwritten.
     ///
     /// Returns nil when the rewrite may proceed. An empty keychain may always
     /// be written: there is nothing to clobber.
-    /// - `keychainLoginNearLimit`: the keychain login's account is near its
-    ///   limit on a fresh reading (`AutoSwitchPolicy.isNearLimit`) and a
-    ///   proactive hand-off is wanted. Working sessions then do not block
-    ///   either: they are told to reload (the credentials file is touched) and
-    ///   pick the new login up before their next request, while the replaced
-    ///   login's lineage is held back from any refresh until every holder has
-    ///   released it (`lineageReleased`). The compare-and-swap still holds.
-    static func refusal(
-        holders: Int,
-        keychainFingerprint: String?,
-        knownFingerprints: Set<String>,
-        keychainLoginSpent: Bool = false,
-        keychainLoginNearLimit: Bool = false
-    ) -> Refusal? {
-        if holders > 0 && !keychainLoginSpent && !keychainLoginNearLimit { return .sessionsRunning(count: holders) }
+    static func refusal(keychainFingerprint: String?, knownFingerprints: Set<String>) -> Refusal? {
         if let current = keychainFingerprint, !knownFingerprints.contains(current) {
             return .unknownKeychainLogin
         }
         return nil
     }
 
-    /// The stored main logins of every account Claude Code cannot use right
-    /// now: a session, weekly (or, on Fable, Fable weekly) window at 100% that
-    /// has not reset yet, or a dead login. The reading need not be fresh: a
-    /// spent window stays spent until its reset time, which the effective
-    /// percentages already honour, and the tracker stops polling an account
-    /// once it is no longer the active profile. A spent Fable-weekly quota
-    /// is not here: see `fableSpentLogins`.
-    static func spentLogins(in profiles: [Profile], isLoginDead: (Profile) -> Bool) -> [String] {
-        profiles.compactMap { profile in
-            guard let json = profile.cliCredentialsJSON else { return nil }
-            let atLimit = profile.claudeUsage?.isLimitReached ?? false
-            return atLimit || isLoginDead(profile) ? json : nil
-        }
-    }
-
-    /// The stored main logins of every account whose FRESH reading is at or
-    /// above the hand-off threshold (`AutoSwitchPolicy.isNearLimit`). A stale
-    /// reading is not here: a hand-off moves working sessions, and that is
-    /// done on evidence only.
-    static func nearLimitLogins(in profiles: [Profile], usingFable: Bool, now: Date = Date()) -> [String] {
-        profiles.compactMap { profile in
-            guard let json = profile.cliCredentialsJSON, let usage = profile.claudeUsage,
-                  AutoSwitchPolicy.isNearLimit(usage, usingFable: usingFable, now: now) else { return nil }
-            return json
-        }
-    }
-
-    /// A shared login replaced under WORKING holders (a proactive hand-off):
-    /// which processes held it, and when the reload signal was sent.
+    /// A shared login replaced under holders: which processes held it, and
+    /// when the reload signal was sent.
     struct HandoffRecord: Equatable, Codable {
         let fingerprint: String
         let holderPids: [Int32]
@@ -413,19 +371,9 @@ enum MainLoginSwapPolicy {
         fractionalTimestamp.date(from: text) ?? plainTimestamp.date(from: text)
     }
 
-    /// The stored main logins whose Fable weekly quota is at 100% and has not
-    /// reset. Spent for the swap only when every holder is on Fable
-    /// (`allHoldersOnFable`): a session on another model is still working.
-    static func fableSpentLogins(in profiles: [Profile]) -> [String] {
-        profiles.compactMap { profile in
-            guard let json = profile.cliCredentialsJSON,
-                  let usage = profile.claudeUsage, usage.effectiveFableWeeklyPercentage >= 100.0 else { return nil }
-            return json
-        }
-    }
-
     /// True when every holder's session is on Fable. A holder on another model,
-    /// or one whose model cannot be read, is not assumed stranded.
+    /// or one whose model cannot be read, is not assumed to need the Opus
+    /// fallback (`fallBackToOpusIfHoldersOnFable`).
     static func allHoldersOnFable(_ holders: [RunningProcess], modelOf: (Int32) -> String?) -> Bool {
         !holders.isEmpty && holders.allSatisfy { AutoSwitchPolicy.isFableModel(modelOf($0.pid)) }
     }
