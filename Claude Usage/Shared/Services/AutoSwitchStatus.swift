@@ -39,6 +39,11 @@ struct AutoSwitchStatus {
         /// (an untrusted stored login, a hand-off refused tick after tick):
         /// it is not "ready" until that is fixed.
         case refused(name: String)
+        /// This account has room, but its stored login is held back by a
+        /// hand-off an open session has not released (that session still
+        /// carries the refresh token). Nobody else has room, so the line must
+        /// say so instead of naming a far-off reset (2026-10-18 21:20).
+        case held(name: String)
         /// Nothing known at all.
         case none
     }
@@ -101,7 +106,14 @@ struct AutoSwitchStatus {
                 case .ready(let name, _), .readyWithoutFable(let name, _):
                     next = .refused(name: name)
                 default:
-                    break
+                    // Still nobody: is there an account with room that is only held back?
+                    switch nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
+                                      now: now, isLoginDead: { isLoginDead($0) || isRefusing($0) }) {
+                    case .ready(let name, _), .readyWithoutFable(let name, _):
+                        next = .held(name: name)
+                    default:
+                        break
+                    }
                 }
             }
         }
@@ -194,6 +206,8 @@ struct AutoSwitchStatus {
             return "next (Fable): none · opus stays on \(activeName)"
         case .refused(let name):
             return "\(prefix)none · \(name) refused the switch"
+        case .held(let name):
+            return "\(prefix)none · \(name) held by an open session"
         case .limited(let name, let at):
             let tag = fableBinding ? "→ (Fable) " : "→ "
             guard name != activeName else { return "stays on \(name) · \(timeFormatter(at))" }
@@ -239,6 +253,7 @@ struct AutoSwitchStatus {
         case .ready(let n, let p), .readyWithoutFable(let n, let p): (kind, name, at, presumed) = ("ready", n, "", p)
         case .limited(let n, let d): (kind, name, at, presumed) = ("limited", n, timeFormatter(d), false)
         case .refused(let n): (kind, name, at, presumed) = ("refused", n, "", false)
+        case .held(let n): (kind, name, at, presumed) = ("held", n, "", false)
         case .noFableHeadroom, .none: (kind, name, at, presumed) = ("none", "", "", false)
         }
         return "STUCK=\(stuck ? 1 : 0)\nNEXT_FREE=\(free)\nNEEDS_LOGIN=\(needsLogin.joined(separator: ", "))\n"

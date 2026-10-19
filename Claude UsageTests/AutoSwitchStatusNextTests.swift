@@ -133,6 +133,25 @@ final class AutoSwitchStatusNextTests: XCTestCase {
 
     // MARK: - Fixtures
 
+    /// 2026-10-18 21:20: matt@guitargate.com at 100% weekly, madmatter at 46%
+    /// and the only account with room, yet the status line said "no account
+    /// free · littlewing Tue 10:59 AM". madmatter was held back by an
+    /// unreleased hand-off (an idle session still carries its refresh token),
+    /// which `AutoSwitchStatus` folded into "unavailable" without saying so.
+    /// The line must name the held account and why, not pretend nobody has room.
+    func testHeldAccountWithRoomIsNamedNotHidden() {
+        let active = profile("mattgg", session: 40, weekly: 100, weeklyResetIn: 6 * 86400)
+        let held = profile("madmatter", session: 0, weekly: 46)
+        let far = profile("littlewing", session: 0, weekly: 100, weeklyResetIn: 2 * 86400)
+        let status = AutoSwitchStatus.build(
+            profiles: [active, held, far], activeId: active.id, now: now,
+            isHeldBack: { $0.id == held.id })
+        XCTAssertTrue(status.stuck)
+        XCTAssertEqual(line(status), "next: none · madmatter held by an open session")
+        let file = status.stateFileContents(timeFormatter: { _ in "t" })
+        XCTAssertTrue(file.contains("NEXT_KIND=held\nNEXT_NAME=madmatter\n"), file)
+    }
+
     private func profile(_ name: String, session: Double, weekly: Double, fable: Double = 0,
                          sessionResetIn: TimeInterval = 3600, weeklyResetIn: TimeInterval = 86400,
                          age: TimeInterval = 0) -> Profile {
