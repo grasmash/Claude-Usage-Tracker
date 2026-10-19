@@ -441,3 +441,44 @@ actor AsyncMutex {
         }
     }
 }
+
+
+/// Which accounts have a live claude-rotate CLOUD run (operator, 2026-10-18).
+/// Local Claude Code sessions are signalled to reload the shared login on a
+/// switch, so they never hold an account; a cloud session launched on an
+/// account is the only thing a token refresh could break.
+enum CloudRunHold {
+    /// A launched run with no end marker is treated as live for this long.
+    /// (The ledger has ~1200 launched runs that never recorded an end.)
+    static let liveWindow: TimeInterval = 12 * 3600
+    private static let endMarkers = ["closed", "landed", "stopped", "dead", "superseded_by"]
+
+    /// Account names (claude-rotate names, e.g. "madmatter") with a live run
+    /// in `ndjson` (`~/.claude/cloud/runs.ndjson`: one JSON object per line,
+    /// merged per `run`).
+    static func activeAccounts(ndjson: String, now: Date = Date()) -> Set<String> {
+        var runs: [String: [String: Any]] = [:]
+        for line in ndjson.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let run = e["run"] as? String else { continue }
+            runs[run, default: [:]].merge(e) { _, new in new }
+        }
+        let iso = ISO8601DateFormatter()
+        var out = Set<String>()
+        for (_, r) in runs {
+            guard let account = r["account"] as? String, let launched = (r["launched"] as? String).flatMap(iso.date(from:)),
+                  now.timeIntervalSince(launched) < liveWindow,
+                  !endMarkers.contains(where: { r[$0] != nil }) else { continue }
+            out.insert(account)
+        }
+        return out
+    }
+
+    /// claude-rotate account name for an email, from `~/.claude-rotate/config.json`.
+    static func accountName(forEmail email: String, configJSON: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: configJSON) as? [String: Any],
+              let accounts = root["accounts"] as? [[String: Any]] else { return nil }
+        return accounts.first { ($0["email"] as? String)?.lowercased() == email.lowercased() }?["name"] as? String
+    }
+}

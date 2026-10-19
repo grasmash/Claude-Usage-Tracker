@@ -41,8 +41,12 @@ final class SingleRefresherTests: XCTestCase {
         savedCredentialsFile = sync.credentialsFileURL
         savedSessionsDirectory = sync.sessionsDirectory
         savedProjectsDirectory = sync.projectsDirectory
+        savedCloudRunsURL = sync.cloudRunsURL
+        savedRotateConfigURL = sync.rotateConfigURL
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        sync.cloudRunsURL = tempDir.appendingPathComponent("runs.ndjson")          // absent: no cloud runs
+        sync.rotateConfigURL = tempDir.appendingPathComponent("rotate-config.json")
         sync.sessionsDirectory = tempDir.appendingPathComponent("sessions")
         sync.projectsDirectory = tempDir.appendingPathComponent("projects")
         sync.resetHandoffRecordsForTesting()
@@ -97,6 +101,8 @@ final class SingleRefresherTests: XCTestCase {
         sync.credentialsFileURL = savedCredentialsFile
         sync.sessionsDirectory = savedSessionsDirectory
         sync.projectsDirectory = savedProjectsDirectory
+        sync.cloudRunsURL = savedCloudRunsURL
+        sync.rotateConfigURL = savedRotateConfigURL
         sync.resetHandoffRecordsForTesting()
         try? FileManager.default.removeItem(at: tempDir)
         super.tearDown()
@@ -113,6 +119,18 @@ final class SingleRefresherTests: XCTestCase {
 
     /// An unpinned profile whose stored main login this build imported, i.e. a
     /// trusted switch target (W15: a login with no recorded origin is refused).
+    private var savedCloudRunsURL: URL!
+    private var savedRotateConfigURL: URL!
+
+    /// A live claude-rotate cloud run launched on the account named `account` (email `email`).
+    private func startCloudRun(account: String, email: String, ended: Bool = false) throws {
+        try #"{"accounts":[{"name":"\#(account)","email":"\#(email)"}]}"#.write(to: sync.rotateConfigURL, atomically: true, encoding: .utf8)
+        let ts = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-600))
+        var lines = [#"{"run":"r1","created":"\#(ts)"}"#, #"{"run":"r1","account":"\#(account)","launched":"\#(ts)"}"#]
+        if ended { lines.append(#"{"run":"r1","closed":"\#(ts)"}"#) }
+        try lines.joined(separator: "\n").write(to: sync.cloudRunsURL, atomically: true, encoding: .utf8)
+    }
+
     private func imported(_ name: String, _ json: String) -> Profile {
         var p = Profile(name: name, cliCredentialsJSON: json)
         p.mainLoginProvenance = "import"
@@ -864,56 +882,84 @@ final class SingleRefresherTests: XCTestCase {
 
     // MARK: - Gate fix 3b: an unreleased hand-off blocks the refresh
 
-    /// B's lineage was handed off under a session that is still alive and has
-    /// made no request since; B's stored login has expired. Switching back to
-    /// B must not refresh it (a second use of a single-use refresh token).
-    /// (Mutant: drop the `lineageIsReleased` guard -> the refresher is called.)
-    func testUnreleasedHandoffBlocksTheRefreshOfTheStoredLogin() async throws {
+    /// B's stored login has expired and a CLOUD run is live on B's account:
+    /// refreshing it could break that run. The switch must not refresh it.
+    /// (Operator, 2026-10-18: only cloud runs hold an account.)
+    func testLiveCloudRunBlocksTheRefreshOfTheStoredLogin() async throws {
         let a = login("A", expiresIn: 3600)
         keychain[mainService] = a
         processes = []
         let bJSON = login("B", expiresIn: -600)
-        let b = imported("B", bJSON)
-        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
-            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(bJSON)), holderPids: [getpid()], at: Date()))
+        let b = imported("b@x.com", bJSON)
+        try startCloudRun(account: "bee", email: "b@x.com")
 
         do {
             _ = try await sync.switchMainLogin(to: b, knownLogins: [a, bJSON])
             XCTFail("the switch cannot proceed without a usable login")
         } catch {}
 
-        XCTAssertEqual(refreshCalls, 0, "the held lineage was refreshed")
+        XCTAssertEqual(refreshCalls, 0, "an account with a live cloud run was refreshed")
         XCTAssertTrue(writes.isEmpty, "\(writes)")
         XCTAssertEqual(keychain[mainService], a)
+    }
+
+    /// Replay 2026-10-18: pid 93749, an interactive session idle since before
+    /// the 23:28 hand-off, pinned madmatter and left no account free. A local
+    /// holder (even a live one named in the hand-off record) never holds now.
+    func testIdleLocalHolderNeverBlocksTheRefreshOrTheCandidate() async throws {
+        let a = login("A", expiresIn: 3600)
+        keychain[mainService] = a
+        processes = []
+        let bJSON = login("B", expiresIn: -600)
+        let b = imported("b@x.com", bJSON)
+        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
+            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(bJSON)), holderPids: [getpid()], at: Date()))
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: b), "a live local holder must not hold an account")
+        _ = try? await sync.switchMainLogin(to: b, knownLogins: [a, bJSON])
+        XCTAssertGreaterThan(refreshCalls, 0, "the expired stored login should have been refreshed")
     }
 
     // MARK: - Gate fix 4: held back + expired = not a candidate
 
     func testHeldBackExpiredLoginIsNotASwitchCandidate() throws {
         let bJSON = login("B", expiresIn: -600)
-        let b = imported("B", bJSON)
-        let cJSON = login("C", expiresIn: 3600)
-        let c = imported("C", cJSON)
-        XCTAssertFalse(sync.isUnavailableAsTarget(for: b), "no record: B is a candidate (the switch refreshes it)")
+        let b = imported("b@x.com", bJSON)
+        let c = imported("C", login("C", expiresIn: 3600))
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: b), "no cloud run: B is a candidate (the switch refreshes it)")
 
-        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
-            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(bJSON)), holderPids: [getpid()], at: Date()))
+        try startCloudRun(account: "bee", email: "b@x.com")
         XCTAssertTrue(sync.isUnavailableAsTarget(for: b),
-                      "held back and expired: switching to it would throw every tick (a notification storm)")
+                      "live cloud run and expired: switching to it would throw every tick (a notification storm)")
 
-        // A held-back login that has NOT expired needs no refresh: still a candidate.
-        let freshB = imported("B2", login("B2", expiresIn: 3600))
-        sync.recordHandoff(MainLoginSwapPolicy.HandoffRecord(
-            fingerprint: try XCTUnwrap(sync.systemLoginFingerprint(freshB.cliCredentialsJSON!)), holderPids: [getpid()], at: Date()))
+        try startCloudRun(account: "bee", email: "b@x.com", ended: true)
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: b), "the run ended: released")
+
+        // A cloud-held login that has NOT expired needs no refresh: still a candidate.
+        try startCloudRun(account: "bee", email: "fresh@x.com")
+        let freshB = imported("fresh@x.com", login("B2", expiresIn: 3600))
         XCTAssertFalse(sync.isUnavailableAsTarget(for: freshB))
 
-        // The policy skips it and picks C.
+        // The policy skips a held B and picks C.
+        try startCloudRun(account: "bee", email: "b@x.com")
         var active = Profile(name: "A", cliCredentialsJSON: login("A", expiresIn: 3600))
         active.claudeUsage = Self.usage(session: 100)
         var bp = b; bp.claudeUsage = Self.usage(session: 0)
         var cp = c; cp.claudeUsage = Self.usage(session: 10)
         XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [active, bp, cp], after: active, usingFable: false, blockedBeyondFable: true,
                                                      isLoginDead: sync.isUnavailableAsTarget(for:)), .profile(cp))
+    }
+
+    func testCloudLedgerIgnoresEndedAndAncientRuns() {
+        let now = Date()
+        let iso = ISO8601DateFormatter()
+        let fresh = iso.string(from: now.addingTimeInterval(-60)), old = iso.string(from: now.addingTimeInterval(-13 * 3600))
+        let ledger = [
+            #"{"run":"a","account":"live","launched":"\#(fresh)"}"#,
+            #"{"run":"b","account":"done","launched":"\#(fresh)"}"#, #"{"run":"b","landed":"\#(fresh)"}"#,
+            #"{"run":"c","account":"ancient","launched":"\#(old)"}"#,
+            #"{"run":"d","account":"notlaunched","launching":"\#(fresh)"}"#,
+        ].joined(separator: "\n")
+        XCTAssertEqual(CloudRunHold.activeAccounts(ndjson: ledger, now: now), ["live"])
     }
 
     // MARK: - Gate fix 2: what "released" means

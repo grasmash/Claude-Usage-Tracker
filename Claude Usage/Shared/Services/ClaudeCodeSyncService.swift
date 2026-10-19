@@ -1794,13 +1794,11 @@ class ClaudeCodeSyncService {
         // A lineage handed off under working holders may still sit in a
         // session's memory; refreshing it here would be a second use of its
         // single-use refresh token. Wait until every holder has released it.
-        if let fingerprint = systemLoginFingerprint(mainJSON), let record = handoffRecord(for: fingerprint) {
-            guard lineageIsReleased(record) else {
-                LoggingService.shared.log("switchMainLogin: '\(profileName)''s stored login was handed off under \(record.holderPids.count) working session(s) and not every one has released it yet; not refreshing it (retried next tick)")
-                return nil
-            }
-            forgetHandoff(fingerprint)
+        if hasLiveCloudRun(profileName: profileName) {
+            LoggingService.shared.log("switchMainLogin: '\(profileName)' has a live cloud run; not refreshing its stored login (retried next tick)")
+            return nil
         }
+        if let fingerprint = systemLoginFingerprint(mainJSON) { forgetHandoff(fingerprint) }
         do {
             let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
             guard let updatedJSON = mergeRefreshedCredentials(into: mainJSON, refreshed: refreshed) else { return nil }
@@ -1928,13 +1926,26 @@ class ClaudeCodeSyncService {
     /// holders that have not released it AND it needs a refresh before it can
     /// be written: a switch to it would refuse to refresh and throw, every
     /// tick, so it is not a switch target until released.
+    ///
+    /// Operator, 2026-10-18: local sessions never hold an account (they are
+    /// signalled to reload on a switch); only a live CLOUD run on the account does.
     func isHeldByHandoff(_ profile: Profile, now: Date = Date()) -> Bool {
-        guard let json = profile.cliCredentialsJSON, let fingerprint = systemLoginFingerprint(json),
-              let record = handoffRecord(for: fingerprint) else { return false }
+        guard let json = profile.cliCredentialsJSON else { return false }
         if let expiry = extractTokenExpiry(from: json), expiry.timeIntervalSince(now) > Self.refreshLeewaySeconds {
             return false   // usable as stored: the switch writes it without a refresh
         }
-        return !lineageIsReleased(record)
+        return hasLiveCloudRun(profileName: profile.name, now: now)
+    }
+
+    var cloudRunsURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/cloud/runs.ndjson")
+    var rotateConfigURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-rotate/config.json")
+
+    /// True when claude-rotate has a live cloud run launched on this profile's account.
+    func hasLiveCloudRun(profileName: String, now: Date = Date()) -> Bool {
+        guard let config = try? Data(contentsOf: rotateConfigURL),
+              let account = CloudRunHold.accountName(forEmail: profileName, configJSON: config),
+              let ledger = try? String(contentsOf: cloudRunsURL, encoding: .utf8) else { return false }
+        return CloudRunHold.activeAccounts(ndjson: ledger, now: now).contains(account)
     }
 
     /// Not a switch target now: a dead login, a stored login held back by an
