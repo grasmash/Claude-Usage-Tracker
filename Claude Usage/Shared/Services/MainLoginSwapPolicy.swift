@@ -469,7 +469,7 @@ enum CloudRunHold {
         for (_, r) in runs {
             guard let account = r["account"] as? String, let launched = (r["launched"] as? String).flatMap(iso.date(from:)),
                   now.timeIntervalSince(launched) < liveWindow,
-                  !endMarkers.contains(where: { r[$0] != nil }) else { continue }
+                  !endMarkers.contains(where: { r[$0] != nil && !(r[$0] is NSNull) }) else { continue }
             out.insert(account)
         }
         return out

@@ -958,8 +958,9 @@ final class SingleRefresherTests: XCTestCase {
             #"{"run":"b","account":"done","launched":"\#(fresh)"}"#, #"{"run":"b","landed":"\#(fresh)"}"#,
             #"{"run":"c","account":"ancient","launched":"\#(old)"}"#,
             #"{"run":"d","account":"notlaunched","launching":"\#(fresh)"}"#,
+            #"{"run":"e","account":"cleared","launched":"\#(fresh)"}"#, #"{"run":"e","stopped":null}"#,
         ].joined(separator: "\n")
-        XCTAssertEqual(CloudRunHold.activeAccounts(ndjson: ledger, now: now), ["live"])
+        XCTAssertEqual(CloudRunHold.activeAccounts(ndjson: ledger, now: now), ["live", "cleared"], "stopped:null is a cleared stop, not an end")
     }
 
     // MARK: - Gate fix 2: what "released" means
