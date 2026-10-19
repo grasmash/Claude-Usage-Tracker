@@ -152,6 +152,28 @@ final class AutoSwitchStatusNextTests: XCTestCase {
         XCTAssertTrue(file.contains("NEXT_KIND=held\nNEXT_NAME=madmatter\n"), file)
     }
 
+    func testDeadOnlyAccountIsNotReportedAsHeld() {
+        let active = profile("mattgg", session: 40, weekly: 100, weeklyResetIn: 6 * 86400)
+        let dead = profile("madmatter", session: 0, weekly: 46)
+        let status = AutoSwitchStatus.build(profiles: [active, dead], activeId: active.id, now: now,
+                                            isLoginDead: { $0.id == dead.id })
+        XCTAssertFalse(line(status).contains("held"))
+        XCTAssertEqual(status.signInNeeded, ["madmatter"])
+    }
+
+    func testRefusedOutranksHeldAndReadyOutranksBoth() {
+        let active = profile("mattgg", session: 40, weekly: 100, weeklyResetIn: 6 * 86400)
+        let held = profile("madmatter", session: 0, weekly: 46)
+        let refusing = profile("goose", session: 0, weekly: 30)
+        let both = AutoSwitchStatus.build(profiles: [active, held, refusing], activeId: active.id, now: now,
+                                          isHeldBack: { $0.id == held.id }, isRefusing: { $0.id == refusing.id })
+        XCTAssertEqual(line(both), "next: none · goose refused the switch")
+        let ready = profile("littlewing", session: 0, weekly: 10)
+        let withReady = AutoSwitchStatus.build(profiles: [active, held, ready], activeId: active.id, now: now,
+                                               isHeldBack: { $0.id == held.id })
+        XCTAssertEqual(line(withReady), "next: littlewing (ready)")
+    }
+
     private func profile(_ name: String, session: Double, weekly: Double, fable: Double = 0,
                          sessionResetIn: TimeInterval = 3600, weeklyResetIn: TimeInterval = 86400,
                          age: TimeInterval = 0) -> Profile {
