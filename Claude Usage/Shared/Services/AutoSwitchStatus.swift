@@ -147,7 +147,8 @@ struct AutoSwitchStatus {
         let usage = active.claudeUsage
         if proactive, let usage, !usage.isLimitReached(usingFable: usingFable, now: now),
            AutoSwitchPolicy.isNearLimit(usage, usingFable: usingFable, now: now),
-           let target = AutoSwitchPolicy.handoffTarget(in: profiles, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead) {
+           let target = AutoSwitchPolicy.handoffTarget(in: profiles, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
+            ?? AutoSwitchPolicy.lastResortHandoffTarget(in: profiles, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead) {
             return .ready(name: shortName(target.name), presumed: false)
         }
         // Only when Fable alone is spent does the Opus fallback keep the sessions here.

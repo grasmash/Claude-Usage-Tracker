@@ -455,7 +455,16 @@ enum CloudRunHold {
 
     /// Account names (claude-rotate names, e.g. "madmatter") with a live run
     /// in `ndjson` (`~/.claude/cloud/runs.ndjson`: one JSON object per line,
-    /// merged per `run`).
+    /// merged per `run`) that was launched THROUGH THE SHARED LOGIN
+    /// (`"via":"default"`, the stock ~/.claude login).
+    ///
+    /// Only such a run can hold the tracker's stored main login. `cloud`
+    /// launches every other run with `CLAUDE_CONFIG_DIR=~/.claude-rotate/accounts/<name>`,
+    /// whose keychain entry is the profile's PINNED entry, a separate lineage
+    /// from the stored main login (`Profile.hasOwnMainLogin`); refreshing the
+    /// main login cannot touch it. 2026-10-20 9:12 PM: ten such runs on
+    /// madmatter made it "held", the only account with room was skipped, and
+    /// the coordinator sat on littlewing's spent session until a manual /login.
     static func activeAccounts(ndjson: String, now: Date = Date()) -> Set<String> {
         var runs: [String: [String: Any]] = [:]
         for line in ndjson.split(separator: "\n") {
@@ -467,7 +476,8 @@ enum CloudRunHold {
         let iso = ISO8601DateFormatter()
         var out = Set<String>()
         for (_, r) in runs {
-            guard let account = r["account"] as? String, let launched = (r["launched"] as? String).flatMap(iso.date(from:)),
+            guard let account = r["account"] as? String, r["via"] as? String == "default",
+                  let launched = (r["launched"] as? String).flatMap(iso.date(from:)),
                   now.timeIntervalSince(launched) < liveWindow,
                   !endMarkers.contains(where: { r[$0] != nil && !(r[$0] is NSNull) }) else { continue }
             out.insert(account)
