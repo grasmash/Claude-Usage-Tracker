@@ -516,7 +516,7 @@ struct AutoSwitchDecider {
         if let latched = handedOff[current.id], latched == window { return .stay }
         // Accounts handed off from in their still-open window are never a
         // last-resort target: that is the ping-pong the ceiling prevents.
-        let handedOffFrom = Set(handedOff.filter { $0.key != current.id && $0.value > now }.keys)
+        let handedOffFrom = handedOffFrom(activeId: current.id, now: now)
         guard let target = AutoSwitchPolicy.handoffTarget(
             in: profiles, after: current, usingFable: usingFable, now: now, isLoginDead: isLoginDead
         ) ?? AutoSwitchPolicy.lastResortHandoffTarget(
@@ -524,6 +524,13 @@ struct AutoSwitchDecider {
         ) else { return .stay }
         handedOff[current.id] = window
         return .handOff(target)
+    }
+
+    /// Accounts handed off from in a window still open at `now` (other than
+    /// the active one): never a last-resort target. The status line takes the
+    /// same set so it names the account the decider would pick.
+    func handedOffFrom(activeId: UUID?, now: Date) -> Set<UUID> {
+        Set(handedOff.filter { $0.key != activeId && $0.value > now }.keys)
     }
 
     /// The reset time of the window that binds (minute precision: the API's

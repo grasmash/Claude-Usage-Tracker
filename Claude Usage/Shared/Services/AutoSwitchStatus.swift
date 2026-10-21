@@ -61,7 +61,8 @@ struct AutoSwitchStatus {
         now: Date = Date(),
         isLoginDead: (Profile) -> Bool = { _ in false },
         isHeldBack: (Profile) -> Bool = { _ in false },
-        isRefusing: (Profile) -> Bool = { _ in false }
+        isRefusing: (Profile) -> Bool = { _ in false },
+        handedOffFrom: Set<UUID> = []
     ) -> AutoSwitchStatus {
         // Not a switch target: dead, or held back by an unreleased hand-off
         // (the same predicate the switcher uses). Only DEAD logins need a sign-in.
@@ -95,20 +96,20 @@ struct AutoSwitchStatus {
                 in: switchable, after: active, usingFable: usingFable, now: now, isLoginDead: unavailable
             ) == nil
             next = nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
-                              now: now, isLoginDead: unavailable)
+                              now: now, isLoginDead: unavailable, handedOffFrom: handedOffFrom)
             // Nobody is ready, but one WOULD be if its swap were not refused: say that.
             switch next {
             case .ready, .readyWithoutFable:
                 break
             default:
                 switch nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
-                                  now: now, isLoginDead: unavailableButForRefusal) {
+                                  now: now, isLoginDead: unavailableButForRefusal, handedOffFrom: handedOffFrom) {
                 case .ready(let name, _), .readyWithoutFable(let name, _):
                     next = .refused(name: name)
                 default:
                     // Still nobody: is there an account with room that is only held back?
                     switch nextSwitch(active: active, in: switchable, usingFable: usingFable, proactive: proactive,
-                                      now: now, isLoginDead: { isLoginDead($0) || isRefusing($0) }) {
+                                      now: now, isLoginDead: { isLoginDead($0) || isRefusing($0) }, handedOffFrom: handedOffFrom) {
                     case .ready(let name, _), .readyWithoutFable(let name, _):
                         next = .held(name: name)
                     default:
@@ -142,13 +143,14 @@ struct AutoSwitchStatus {
     /// at a limit: the one whose limit resets first.
     static func nextSwitch(
         active: Profile, in profiles: [Profile], usingFable: Bool, proactive: Bool,
-        now: Date, isLoginDead: (Profile) -> Bool
+        now: Date, isLoginDead: (Profile) -> Bool, handedOffFrom: Set<UUID> = []
     ) -> NextSwitch {
         let usage = active.claudeUsage
         if proactive, let usage, !usage.isLimitReached(usingFable: usingFable, now: now),
            AutoSwitchPolicy.isNearLimit(usage, usingFable: usingFable, now: now),
            let target = AutoSwitchPolicy.handoffTarget(in: profiles, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
-            ?? AutoSwitchPolicy.lastResortHandoffTarget(in: profiles, after: active, usingFable: usingFable, now: now, isLoginDead: isLoginDead) {
+            ?? AutoSwitchPolicy.lastResortHandoffTarget(in: profiles, after: active, usingFable: usingFable, now: now,
+                                                       excluding: handedOffFrom, isLoginDead: isLoginDead) {
             return .ready(name: shortName(target.name), presumed: false)
         }
         // Only when Fable alone is spent does the Opus fallback keep the sessions here.

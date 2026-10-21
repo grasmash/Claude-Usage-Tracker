@@ -1642,7 +1642,8 @@ class MenuBarManager: NSObject, ObservableObject {
             proactive: SharedDataStore.shared.loadAutoSwitchProactiveEnabled(),
             isLoginDead: ClaudeCodeSyncService.shared.isLoginDead(for:),
             isHeldBack: { ClaudeCodeSyncService.shared.isHeldByHandoff($0) },
-            isRefusing: { ClaudeCodeSyncService.shared.isRefusingSwitch($0) }
+            isRefusing: { ClaudeCodeSyncService.shared.isRefusingSwitch($0) },
+            handedOffFrom: autoSwitchDecider.handedOffFrom(activeId: profileManager.activeProfile?.id, now: Date())
         )
         let contents = status.stateFileContents { AutoSwitchStatus.americanTime($0) }
         let url = Constants.ClaudePaths.claudeDirectory.appendingPathComponent(".autoswitch-state")

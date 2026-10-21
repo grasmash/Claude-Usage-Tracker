@@ -27,7 +27,8 @@ final class RotationScenarioTests: XCTestCase {
     private func tick(_ decider: inout AutoSwitchDecider, active: Profile, profiles: [Profile], usingFable: Bool = false,
                       isLoginDead: @escaping (Profile) -> Bool = { _ in false }) -> Tick {
         let decision = decider.decide(current: active, profiles: profiles, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
-        let status = AutoSwitchStatus.build(profiles: profiles, activeId: active.id, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
+        let status = AutoSwitchStatus.build(profiles: profiles, activeId: active.id, usingFable: usingFable, now: now, isLoginDead: isLoginDead,
+                                            handedOffFrom: decider.handedOffFrom(activeId: active.id, now: now))
         return Tick(decision: decision, status: status, nextLine: status.nextLine(timeFormatter: fmt))
     }
 
@@ -386,6 +387,25 @@ final class RotationScenarioTests: XCTestCase {
         let better = profile("c", session: 0, weekly: 80)
         XCTAssertEqual(decider.decide(current: active, profiles: [active, worse, better], usingFable: false, now: now), .handOff(better),
                        "among last-resort targets, the most headroom wins")
+    }
+
+    /// The exclusion alone decides: A hands off to B (last resort, weekly
+    /// binding), then B's session climbs past the threshold. A (more room)
+    /// is not handed back to inside the window it was left in; C is. The
+    /// status line names the same target as the decider.
+    func testJ_LastResortNeverHandsBackInsideTheOpenWindow_StatusAgrees() {
+        var decider = AutoSwitchDecider()
+        let a = profile("a", session: 10, weekly: 90, weeklyResetIn: 2 * 86400)
+        let b = profile("b", session: 0, weekly: 80)
+        let c = profile("c", session: 0, weekly: 95)
+        XCTAssertEqual(tick(&decider, active: a, profiles: [a, b, c]).decision, .handOff(b))
+        var bHot = b; bHot.claudeUsage = profile("b", session: 86, weekly: 80).claudeUsage
+        let t = tick(&decider, active: bHot, profiles: [a, bHot, c])
+        XCTAssertEqual(t.decision, .handOff(c), "A was left in this window: C, not A")
+        XCTAssertEqual(t.nextLine, "next: c (ready)", "the status line names the decider's target")
+        // Without the hand-off history, A (most headroom) would win: the exclusion is what decided.
+        var fresh = AutoSwitchDecider()
+        XCTAssertEqual(fresh.decide(current: bHot, profiles: [a, bHot, c], usingFable: false, now: now), .handOff(a))
     }
 
     // MARK: - Fixtures
