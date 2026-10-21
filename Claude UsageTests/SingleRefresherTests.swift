@@ -123,10 +123,15 @@ final class SingleRefresherTests: XCTestCase {
     private var savedRotateConfigURL: URL!
 
     /// A live claude-rotate cloud run launched on the account named `account` (email `email`).
-    private func startCloudRun(account: String, email: String, ended: Bool = false) throws {
+    /// `throughSharedLogin` (the default) records it the way `cloud` does for a run
+    /// reached through the stock ~/.claude login (`"via":"default"`): the only kind
+    /// that can hold the tracker's stored main login. `false` is a run launched
+    /// under the account's own claude-rotate dir (`CLAUDE_CONFIG_DIR`).
+    private func startCloudRun(account: String, email: String, ended: Bool = false, throughSharedLogin: Bool = true) throws {
         try #"{"accounts":[{"name":"\#(account)","email":"\#(email)"}]}"#.write(to: sync.rotateConfigURL, atomically: true, encoding: .utf8)
         let ts = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-600))
-        var lines = [#"{"run":"r1","created":"\#(ts)"}"#, #"{"run":"r1","account":"\#(account)","launched":"\#(ts)"}"#]
+        let via = throughSharedLogin ? #","via":"default""# : ""
+        var lines = [#"{"run":"r1","created":"\#(ts)"}"#, #"{"run":"r1","account":"\#(account)","launched":"\#(ts)"\#(via)}"#]
         if ended { lines.append(#"{"run":"r1","closed":"\#(ts)"}"#) }
         try lines.joined(separator: "\n").write(to: sync.cloudRunsURL, atomically: true, encoding: .utf8)
     }
@@ -954,13 +959,46 @@ final class SingleRefresherTests: XCTestCase {
         let iso = ISO8601DateFormatter()
         let fresh = iso.string(from: now.addingTimeInterval(-60)), old = iso.string(from: now.addingTimeInterval(-13 * 3600))
         let ledger = [
-            #"{"run":"a","account":"live","launched":"\#(fresh)"}"#,
-            #"{"run":"b","account":"done","launched":"\#(fresh)"}"#, #"{"run":"b","landed":"\#(fresh)"}"#,
-            #"{"run":"c","account":"ancient","launched":"\#(old)"}"#,
-            #"{"run":"d","account":"notlaunched","launching":"\#(fresh)"}"#,
-            #"{"run":"e","account":"cleared","launched":"\#(fresh)"}"#, #"{"run":"e","stopped":null}"#,
+            #"{"run":"a","account":"live","launched":"\#(fresh)","via":"default"}"#,
+            #"{"run":"b","account":"done","launched":"\#(fresh)","via":"default"}"#, #"{"run":"b","landed":"\#(fresh)"}"#,
+            #"{"run":"c","account":"ancient","launched":"\#(old)","via":"default"}"#,
+            #"{"run":"d","account":"notlaunched","launching":"\#(fresh)","via":"default"}"#,
+            #"{"run":"e","account":"cleared","launched":"\#(fresh)","via":"default"}"#, #"{"run":"e","stopped":null}"#,
+            #"{"run":"f","account":"owndir","launched":"\#(fresh)"}"#,
         ].joined(separator: "\n")
-        XCTAssertEqual(CloudRunHold.activeAccounts(ndjson: ledger, now: now), ["live", "cleared"], "stopped:null is a cleared stop, not an end")
+        XCTAssertEqual(CloudRunHold.activeAccounts(ndjson: ledger, now: now), ["live", "cleared"],
+                       "stopped:null is a cleared stop, not an end; a run under its own account dir holds nothing")
+    }
+
+    /// Replay 2026-10-20 9:12 PM ET. littlewing hit its session limit; madmatter
+    /// (97% weekly, ~0% session) was the only account with room. madmatter's
+    /// stored main login had been captured at the 11:35 AM hand-off, so its
+    /// access token had expired, and the ledger held ten unended `om-work` cloud
+    /// runs on madmatter, launched by `cloud` with
+    /// `CLAUDE_CONFIG_DIR=~/.claude-rotate/accounts/madmatter`: no `via`. That
+    /// dir's login is the profile's PINNED keychain entry, a different lineage
+    /// from the stored main login (`hasOwnMainLogin`), so refreshing the main
+    /// login cannot touch those runs. The hold counted them anyway, madmatter
+    /// was "unavailable", the switcher logged "All profiles at session/weekly
+    /// limit or unavailable" and the coordinator sat on a dead account until
+    /// the operator ran /login by hand.
+    func testReplay20261020_OwnDirCloudRunsDoNotHoldTheStoredMainLogin() throws {
+        let madJSON = login("mad", expiresIn: -5 * 3600)   // captured 15:35Z, expired by 01:12Z
+        var mad = imported("madmatter23@gmail.com", madJSON)
+        mad.claudeUsage = Self.usage(session: 0)
+        try startCloudRun(account: "madmatter", email: "madmatter23@gmail.com", throughSharedLogin: false)
+        XCTAssertFalse(sync.isUnavailableAsTarget(for: mad),
+                       "a cloud run under the account's own dir cannot hold the tracker's stored main login")
+
+        var littlewing = imported("littlewing@guitargate.com", login("lw", expiresIn: 3600))
+        littlewing.claudeUsage = Self.usage(session: 100)
+        XCTAssertEqual(AutoSwitchPolicy.switchTarget(in: [littlewing, mad], after: littlewing, usingFable: false,
+                                                     blockedBeyondFable: true, isLoginDead: sync.isUnavailableAsTarget(for:)),
+                       .profile(mad))
+
+        // A run reached through the shared login (`via: default`) still holds it.
+        try startCloudRun(account: "madmatter", email: "madmatter23@gmail.com", throughSharedLogin: true)
+        XCTAssertTrue(sync.isUnavailableAsTarget(for: mad))
     }
 
     // MARK: - Gate fix 2: what "released" means

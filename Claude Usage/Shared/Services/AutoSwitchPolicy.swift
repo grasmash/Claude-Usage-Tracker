@@ -172,6 +172,45 @@ enum AutoSwitchPolicy {
         return nil
     }
 
+    /// The last-resort hand-off, used only when `handoffTarget` finds nobody at
+    /// or below the ceiling (2026-10-20 9:12 PM: littlewing climbed through its
+    /// session window, every account but madmatter was at 100% weekly, and
+    /// madmatter at 97% weekly with an empty session was above the 75% ceiling,
+    /// so nothing moved until littlewing's 100% killed every subagent with a
+    /// 429). Waiting for the limit only guarantees the 429; moving to the
+    /// account with the most room does not.
+    ///
+    /// A candidate is applicable, not paused, not dead, FRESH, under every
+    /// limit, not in `excluding` (accounts handed off from in their current
+    /// window), and has its SESSION window at or below the ceiling, so it can
+    /// absorb the burst that is about to close the current one. It must also
+    /// be a real gain: either the active account's session window is the one
+    /// near its limit (minutes away, and the candidate has session room), or
+    /// the candidate's binding window is lower than the active one's. Among
+    /// candidates the lowest binding (most headroom) wins; ties keep the
+    /// wrap-around order.
+    static func lastResortHandoffTarget(
+        in profiles: [Profile], after current: Profile, usingFable: Bool, now: Date = Date(),
+        excluding: Set<UUID> = [], isLoginDead: (Profile) -> Bool = { _ in false }
+    ) -> Profile? {
+        guard let currentIndex = profiles.firstIndex(where: { $0.id == current.id }), profiles.count > 1,
+              let currentUsage = current.claudeUsage else { return nil }
+        let currentBinding = bindingPercentage(currentUsage, usingFable: usingFable, now: now)
+        let sessionNear = currentUsage.effectiveSessionPercentage(now: now) >= proactiveThreshold
+        var best: (profile: Profile, binding: Double)?
+        for offset in 1..<profiles.count {
+            let candidate = profiles[(currentIndex + offset) % profiles.count]
+            guard !excluding.contains(candidate.id), !candidate.isPaused, canBeApplied(candidate), !isLoginDead(candidate),
+                  let usage = candidate.claudeUsage, !usage.isStale(now: now),
+                  !usage.isLimitReached(usingFable: usingFable, now: now),
+                  usage.effectiveSessionPercentage(now: now) <= handoffTargetCeiling else { continue }
+            let binding = bindingPercentage(usage, usingFable: usingFable, now: now)
+            guard sessionNear || binding < currentBinding else { continue }
+            if best == nil || binding < best!.binding { best = (candidate, binding) }
+        }
+        return best?.profile
+    }
+
     /// Whether an auto-switch may make `target` the tracker's active profile
     /// given what `switchMainLogin` did with the shared login.
     ///
@@ -475,11 +514,23 @@ struct AutoSwitchDecider {
         }
         let window = Self.bindingWindowReset(usage, usingFable: usingFable, now: now)
         if let latched = handedOff[current.id], latched == window { return .stay }
+        // Accounts handed off from in their still-open window are never a
+        // last-resort target: that is the ping-pong the ceiling prevents.
+        let handedOffFrom = handedOffFrom(activeId: current.id, now: now)
         guard let target = AutoSwitchPolicy.handoffTarget(
             in: profiles, after: current, usingFable: usingFable, now: now, isLoginDead: isLoginDead
+        ) ?? AutoSwitchPolicy.lastResortHandoffTarget(
+            in: profiles, after: current, usingFable: usingFable, now: now, excluding: handedOffFrom, isLoginDead: isLoginDead
         ) else { return .stay }
         handedOff[current.id] = window
         return .handOff(target)
+    }
+
+    /// Accounts handed off from in a window still open at `now` (other than
+    /// the active one): never a last-resort target. The status line takes the
+    /// same set so it names the account the decider would pick.
+    func handedOffFrom(activeId: UUID?, now: Date) -> Set<UUID> {
+        Set(handedOff.filter { $0.key != activeId && $0.value > now }.keys)
     }
 
     /// The reset time of the window that binds (minute precision: the API's

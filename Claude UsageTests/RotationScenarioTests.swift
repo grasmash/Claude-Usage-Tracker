@@ -27,7 +27,8 @@ final class RotationScenarioTests: XCTestCase {
     private func tick(_ decider: inout AutoSwitchDecider, active: Profile, profiles: [Profile], usingFable: Bool = false,
                       isLoginDead: @escaping (Profile) -> Bool = { _ in false }) -> Tick {
         let decision = decider.decide(current: active, profiles: profiles, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
-        let status = AutoSwitchStatus.build(profiles: profiles, activeId: active.id, usingFable: usingFable, now: now, isLoginDead: isLoginDead)
+        let status = AutoSwitchStatus.build(profiles: profiles, activeId: active.id, usingFable: usingFable, now: now, isLoginDead: isLoginDead,
+                                            handedOffFrom: decider.handedOffFrom(activeId: active.id, now: now))
         return Tick(decision: decision, status: status, nextLine: status.nextLine(timeFormatter: fmt))
     }
 
@@ -317,6 +318,94 @@ final class RotationScenarioTests: XCTestCase {
         var free = littlewing
         free.claudeUsage!.lastUpdated = after
         XCTAssertEqual(decider.decide(current: free, profiles: [free, goose, matt, mad], usingFable: false, now: after), .stay)
+    }
+
+    // MARK: - J. replay: 2026-10-20 9:12 PM — littlewing at its session limit, madmatter 97% weekly is the only room
+
+    /// The incident's readings, in config order. Every other account was at
+    /// 100% weekly; madmatter was at 97% weekly with its session nearly empty.
+    private func incident20261020(littlewingSession: Double) -> (littlewing: Profile, madmatter: Profile, all: [Profile]) {
+        let grasmash = profile("grasmash", session: 0, weekly: 100, weeklyResetIn: 23 * 3600)
+        let littlewing = profile("littlewing", session: littlewingSession, weekly: 43, fable: 8,
+                                 sessionResetIn: 18 * 60, weeklyResetIn: 6 * 86400)
+        let madmatter = profile("madmatter", session: 0, weekly: 97, fable: 56,
+                                sessionResetIn: 3 * 3600, weeklyResetIn: 3 * 86400 + 17 * 3600)
+        let mattg = profile("mattg", session: 0, weekly: 100, weeklyResetIn: 29 * 3600)
+        let goose = profile("goose", session: 0, weekly: 100, weeklyResetIn: 3 * 3600)
+        let mattgg = profile("mattgg", session: 0, weekly: 100, weeklyResetIn: 3 * 86400)
+        let jrand = profile("jrand", session: 0, weekly: 100, weeklyResetIn: 36 * 3600)
+        return (littlewing, madmatter, [grasmash, littlewing, madmatter, mattg, goose, mattgg, jrand])
+    }
+
+    /// Pre-emptive: littlewing climbing through its session window (95% at
+    /// 8:55 PM) hands off to madmatter BEFORE the 100% that killed every
+    /// subagent with a 429. No account was under the 75% target ceiling, so the
+    /// strict hand-off found nothing and the switcher waited for the limit.
+    func testJ_Replay20261020_NearSessionLimitHandsOffToTheOnlyAccountWithRoom() {
+        let s = incident20261020(littlewingSession: 95)
+        var decider = AutoSwitchDecider()
+        let t = tick(&decider, active: s.littlewing, profiles: s.all)
+        XCTAssertEqual(t.decision, .handOff(s.madmatter),
+                       "a session window about to close moves the login to the account with session room, even at 97% weekly")
+        XCTAssertEqual(t.nextLine, "next: madmatter (ready)")
+        assertSafeSwitch(to: s.madmatter)
+        // Once per window: the next tick does not re-fire.
+        XCTAssertEqual(decider.decide(current: s.littlewing, profiles: s.all, usingFable: false, now: now), .stay)
+    }
+
+    /// At the limit itself the 100% path picks madmatter too (97% weekly is not a limit).
+    func testJ_Replay20261020_AtTheSessionLimitSwitchesToMadmatter() {
+        let s = incident20261020(littlewingSession: 100)
+        var decider = AutoSwitchDecider()
+        let t = tick(&decider, active: s.littlewing, profiles: s.all)
+        XCTAssertEqual(t.decision, .switchTo(s.madmatter, withoutFable: false))
+        XCTAssertFalse(t.status.stuck)
+    }
+
+    /// No ping-pong: on madmatter (97% weekly, itself "near") the last resort
+    /// never hands back to littlewing while littlewing's session window is
+    /// still nearly spent; once that window resets, littlewing (43% weekly) is
+    /// a normal, strict hand-off target.
+    func testJ_Replay20261020_NoHandBackUntilLittlewingsWindowResets() {
+        let before = incident20261020(littlewingSession: 96)
+        var decider = AutoSwitchDecider()
+        XCTAssertEqual(decider.decide(current: before.littlewing, profiles: before.all, usingFable: false, now: now), .handOff(before.madmatter))
+        XCTAssertEqual(decider.decide(current: before.madmatter, profiles: before.all, usingFable: false, now: now), .stay,
+                       "littlewing's session is still at 96%: not a target")
+
+        let after = incident20261020(littlewingSession: 0)
+        XCTAssertEqual(decider.decide(current: after.madmatter, profiles: after.all, usingFable: false, now: now), .handOff(after.littlewing))
+    }
+
+    /// The last resort never trades down: a near-limit WEEKLY window does not
+    /// hand off to an account with less weekly room than it has.
+    func testJ_LastResortNeverMovesToLessRoomOnAWeeklyBinding() {
+        var decider = AutoSwitchDecider()
+        let active = profile("a", session: 10, weekly: 90)
+        let worse = profile("b", session: 0, weekly: 97)
+        XCTAssertEqual(decider.decide(current: active, profiles: [active, worse], usingFable: false, now: now), .stay)
+        let better = profile("c", session: 0, weekly: 80)
+        XCTAssertEqual(decider.decide(current: active, profiles: [active, worse, better], usingFable: false, now: now), .handOff(better),
+                       "among last-resort targets, the most headroom wins")
+    }
+
+    /// The exclusion alone decides: A hands off to B (last resort, weekly
+    /// binding), then B's session climbs past the threshold. A (more room)
+    /// is not handed back to inside the window it was left in; C is. The
+    /// status line names the same target as the decider.
+    func testJ_LastResortNeverHandsBackInsideTheOpenWindow_StatusAgrees() {
+        var decider = AutoSwitchDecider()
+        let a = profile("a", session: 10, weekly: 90, weeklyResetIn: 2 * 86400)
+        let b = profile("b", session: 0, weekly: 80)
+        let c = profile("c", session: 0, weekly: 95)
+        XCTAssertEqual(tick(&decider, active: a, profiles: [a, b, c]).decision, .handOff(b))
+        var bHot = b; bHot.claudeUsage = profile("b", session: 86, weekly: 80).claudeUsage
+        let t = tick(&decider, active: bHot, profiles: [a, bHot, c])
+        XCTAssertEqual(t.decision, .handOff(c), "A was left in this window: C, not A")
+        XCTAssertEqual(t.nextLine, "next: c (ready)", "the status line names the decider's target")
+        // Without the hand-off history, A (most headroom) would win: the exclusion is what decided.
+        var fresh = AutoSwitchDecider()
+        XCTAssertEqual(fresh.decide(current: bHot, profiles: [a, bHot, c], usingFable: false, now: now), .handOff(a))
     }
 
     // MARK: - Fixtures
