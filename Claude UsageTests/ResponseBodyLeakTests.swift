@@ -40,47 +40,89 @@ final class ResponseBodyLeakTests: XCTestCase {
     func testNoErrorOrLogPathInterpolatesADecodedResponseBody() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Claude Usage")
-        let sinks = try NSRegularExpression(
-            pattern: #"(technicalDetails:|LoggingService\.shared\.log\w*\(|responsePreview:)[^\n]*\\\((\w+)"#)
         var leaks: [String] = []
         let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)!
             .compactMap { $0 as? URL }.filter { $0.pathExtension == "swift" }
         XCTAssertGreaterThan(files.count, 50, "the scan must see the app sources (\(root.path))")
         for file in files {
-            let text = try String(contentsOf: file, encoding: .utf8)
-            let lines = text.components(separatedBy: "\n")
-            // names bound to a decoded response body anywhere in this file
-            var bodyNames = Set<String>()
-            let decode = try NSRegularExpression(pattern: #"let (\w+) = String\(data: *(data|responseData)\b"#)
-            for line in lines {
-                for m in decode.matches(in: line, range: NSRange(line.startIndex..., in: line)) {
-                    bodyNames.insert(String(line[Range(m.range(at: 1), in: line)!]))
-                }
-            }
-            // and names derived from one (`let truncated = responseString.prefix(500)`)
-            let derive = try NSRegularExpression(pattern: #"let (\w+) = (\w+)\."#)
-            for line in lines {
-                for m in derive.matches(in: line, range: NSRange(line.startIndex..., in: line))
-                where bodyNames.contains(String(line[Range(m.range(at: 2), in: line)!])) {
-                    bodyNames.insert(String(line[Range(m.range(at: 1), in: line)!]))
-                }
-            }
-            for (i, line) in lines.enumerated() {
-                if line.contains("technicalDetails:") && line.contains("String(data:") {
-                    leaks.append("\(file.lastPathComponent):\(i + 1) decodes a body into technicalDetails")
-                }
-                let range = NSRange(line.startIndex..., in: line)
-                for m in sinks.matches(in: line, range: range) {
-                    let name = String(line[Range(m.range(at: 2), in: line)!])
-                    if bodyNames.contains(name) {
-                        leaks.append("\(file.lastPathComponent):\(i + 1) puts the decoded body '\(name)' into a log or error")
-                    }
-                }
-            }
-            if file.lastPathComponent == "NetworkLoggerService.swift", text.contains("String(data: data") {
-                leaks.append("NetworkLoggerService.swift stores decoded body text")
-            }
+            leaks += Self.leaks(in: try String(contentsOf: file, encoding: .utf8), file: file.lastPathComponent)
         }
         XCTAssertEqual(leaks, [], "raw HTTP response bodies reach an error or a log:\n" + leaks.joined(separator: "\n"))
+    }
+
+    /// The scanner must catch the shapes the review named: a body that is not the last interpolation on the line, a
+    /// body decoded from any variable, the print/NSLog/os_log sinks, and a sink call that spans several lines.
+    func testTheScannerCatchesEveryShapeTheReviewNamed() {
+        let notLast = """
+            let preview = String(data: payload, encoding: .utf8) ?? ""
+            LoggingService.shared.log("got \\(preview) for \\(endpoint)")
+            """
+        let printed = """
+            let text = String(decoding: body, as: UTF8.self)
+            print("raw: \\(text)")
+            """
+        let multiLine = """
+            let raw = String(data: responseBytes, encoding: .utf8)
+            throw AppError(
+                code: .unknown,
+                technicalDetails:
+                    "status \\(code) body \\(raw)"
+            )
+            """
+        let derived = """
+            if let s = String(data: d, encoding: .utf8) {
+                let cut = s.prefix(100)
+                NSLog("cut: %@ \\(cut)")
+            }
+            """
+        for (name, source) in [("notLast", notLast), ("printed", printed), ("multiLine", multiLine), ("derived", derived)] {
+            XCTAssertFalse(Self.leaks(in: source, file: name).isEmpty, "the scanner missed the \(name) shape")
+        }
+        XCTAssertEqual(Self.leaks(in: "LoggingService.shared.log(\"\\(ResponseBody.summary(data))\")", file: "ok"), [])
+    }
+
+    private static let sinkRE = try! NSRegularExpression(
+        pattern: #"technicalDetails:|LoggingService\.shared\.log\w*\(|responsePreview:|\bprint\(|\bNSLog\(|\bos_log\(|ErrorLogger\."#)
+    private static let decodeRE = try! NSRegularExpression(pattern: #"(?:let|var) (\w+) = String\((?:data|decoding): *\w+"#)
+    private static let deriveRE = try! NSRegularExpression(pattern: #"(?:let|var) (\w+) = (\w+)\."#)
+    private static let interpRE = try! NSRegularExpression(pattern: #"\\\((\w+)"#)
+
+    private static func groups(_ re: NSRegularExpression, _ line: String) -> [[String]] {
+        re.matches(in: line, range: NSRange(line.startIndex..., in: line)).map { m in
+            (1..<m.numberOfRanges).map { Range(m.range(at: $0), in: line).map { String(line[$0]) } ?? "" }
+        }
+    }
+
+    /// file:line of every place a decoded body (or a name derived from one) reaches a sink in `text`. A sink call is
+    /// read until its parentheses balance (at most 8 lines), so a multi-line call is covered.
+    static func leaks(in text: String, file: String) -> [String] {
+        let lines = text.components(separatedBy: "\n")
+        var bodyNames = Set<String>()
+        for line in lines { groups(decodeRE, line).forEach { bodyNames.insert($0[0]) } }
+        for _ in 0..<3 {   // names derived from a body, a few levels deep
+            for line in lines { groups(deriveRE, line).filter { bodyNames.contains($0[1]) }.forEach { bodyNames.insert($0[0]) } }
+        }
+        var leaks: [String] = []
+        for (i, line) in lines.enumerated()
+        where sinkRE.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
+            var stmt = line
+            var depth = line.filter { $0 == "(" }.count - line.filter { $0 == ")" }.count
+            var j = i + 1
+            while (depth > 0 || stmt.hasSuffix("technicalDetails:")) && j < min(lines.count, i + 8) {
+                stmt += "\n" + lines[j]
+                depth += lines[j].filter { $0 == "(" }.count - lines[j].filter { $0 == ")" }.count
+                j += 1
+            }
+            if stmt.contains("String(data:") || stmt.contains("String(decoding:") {
+                leaks.append("\(file):\(i + 1) decodes a body inside a log or error")
+            }
+            for name in Set(groups(interpRE, stmt).map { $0[0] }) where bodyNames.contains(name) {
+                leaks.append("\(file):\(i + 1) puts the decoded body '\(name)' into a log or error")
+            }
+        }
+        if file == "NetworkLoggerService.swift", text.contains("String(data:") {
+            leaks.append("NetworkLoggerService.swift stores decoded body text")
+        }
+        return leaks
     }
 }
