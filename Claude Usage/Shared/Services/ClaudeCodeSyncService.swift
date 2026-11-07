@@ -1816,8 +1816,9 @@ class ClaudeCodeSyncService {
             LoggingService.shared.log("✓ switchMainLogin: refreshed the stored main login for '\(profileName)' before writing it")
             return updatedJSON
         } catch let ClaudeCodeError.refreshFailed(status, body) {
-            // 4xx bodies carry no tokens, only `{ "error": ... }`, so logging is safe.
-            LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)' (HTTP \(status)) body=\(body)")
+            // Never the body: the system log is public (%{public}@) and a server
+            // may echo the refresh token in its description. Status and code only.
+            LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)' (HTTP \(status)) oauth_error=\(HandoffLog.oauthErrorCode(body))")
             let dead = DeadLoginTracker.isInvalidGrant(status: status, body: body)
             HandoffLog.record(.refreshFailed, from: "tracker", to: profileName, reason: "stored login expired",
                               fields: [("status", String(status)), ("oauth_error", HandoffLog.oauthErrorCode(body)),

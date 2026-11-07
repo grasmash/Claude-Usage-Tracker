@@ -82,11 +82,17 @@ final class LoggingService {
 
     // MARK: - General Logging
 
+    /// Tests only: sees every general/error message as it is sent to the
+    /// system log, so a test can prove a secret never reaches it.
+    static var testSink: ((String) -> Void)?
+
     func log(_ message: String, type: OSLogType = .default) {
+        Self.testSink?(message)
         os_log("%{public}@", log: generalLogger, type: type, message)
     }
 
     func logError(_ message: String, error: Error? = nil) {
+        Self.testSink?(error.map { "\(message): \($0.localizedDescription)" } ?? message)
         if let error = error {
             os_log("❌ %{public}@: %{public}@", log: generalLogger, type: .error, message, error.localizedDescription)
         } else {

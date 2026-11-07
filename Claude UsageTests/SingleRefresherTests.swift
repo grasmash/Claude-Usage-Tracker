@@ -446,6 +446,31 @@ final class SingleRefresherTests: XCTestCase {
         }
     }
 
+    func testARefusedRefreshNeverSendsTheServerBodyToTheSystemLog() async throws {
+        // Review of PR #2: the refused-refresh path wrote the raw OAuth error
+        // body to the system log (os_log %{public}@), and a server may echo the
+        // refresh token in it. Only the status and the error code may go there.
+        let echoed = "refresh-B-echo-\(UUID().uuidString)"
+        var sent: [String] = []
+        LoggingService.testSink = { sent.append($0) }
+        defer { LoggingService.testSink = nil }
+        try await withRefreshLog {
+            sync.tokenRefresher = { _ in
+                throw ClaudeCodeError.refreshFailed(
+                    status: 400, body: #"{"error":"invalid_grant","error_description":"token \#(echoed) was reused"}"#)
+            }
+            keychain[mainService] = login("A", expiresIn: 3600)
+            let b = imported("b@example.com", login("B-\(UUID().uuidString)", expiresIn: -600))
+
+            _ = try? await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+        }
+        let refused = sent.filter { $0.contains("refresh failed") }
+        XCTAssertFalse(refused.isEmpty, "the refused refresh is still logged")
+        XCTAssertTrue(refused.allSatisfy { $0.contains("HTTP 400") && $0.contains("invalid_grant") }, "\(refused)")
+        XCTAssertFalse(sent.contains { $0.contains(echoed) }, "a token echoed in the server body reached the system log")
+        XCTAssertFalse(sent.contains { $0.contains("was reused") }, "the server's description reached the system log")
+    }
+
     func testARefreshHeldBackByALiveCloudRunIsLogged() async throws {
         try await withRefreshLog {
             try startCloudRun(account: "b", email: "b@example.com")
