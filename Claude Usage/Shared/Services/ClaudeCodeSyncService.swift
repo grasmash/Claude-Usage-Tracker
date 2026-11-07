@@ -49,7 +49,7 @@ class ClaudeCodeSyncService {
     /// holds that login.
     var tokenRefresher: (_ refreshToken: String) async throws -> OAuthRefreshResponse = { refreshToken in
         guard !AppEnvironment.isRunningTests else {
-            throw ClaudeCodeError.refreshFailed(status: 0, body: "token refresh disabled while running tests")
+            throw ClaudeCodeError.refreshFailed(status: 0, oauthError: "refresh_disabled_under_tests")
         }
         return try await ClaudeCodeSyncService.postTokenRefresh(refreshToken: refreshToken)
     }
@@ -1356,11 +1356,11 @@ class ClaudeCodeSyncService {
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
-            throw ClaudeCodeError.refreshFailed(status: -1, body: "No HTTP response")
+            throw ClaudeCodeError.refreshFailed(status: -1, oauthError: "no_http_response")
         }
         guard http.statusCode == 200 else {
             let snippet = String(data: data, encoding: .utf8)?.prefix(200) ?? "<binary>"
-            throw ClaudeCodeError.refreshFailed(status: http.statusCode, body: String(snippet))
+            throw ClaudeCodeError.refusedRefresh(status: http.statusCode, body: String(snippet))
         }
         return try JSONDecoder().decode(OAuthRefreshResponse.self, from: data)
     }
@@ -1815,13 +1815,12 @@ class ClaudeCodeSyncService {
             persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
             LoggingService.shared.log("✓ switchMainLogin: refreshed the stored main login for '\(profileName)' before writing it")
             return updatedJSON
-        } catch let ClaudeCodeError.refreshFailed(status, body) {
-            // Never the body: the system log is public (%{public}@) and a server
-            // may echo the refresh token in its description. Status and code only.
-            LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)' (HTTP \(status)) oauth_error=\(HandoffLog.oauthErrorCode(body))")
-            let dead = DeadLoginTracker.isInvalidGrant(status: status, body: body)
+        } catch let ClaudeCodeError.refreshFailed(status, oauthError) {
+            // The error carries no body (a server may echo the refresh token in it): status and code only.
+            LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)' (HTTP \(status)) oauth_error=\(oauthError)")
+            let dead = DeadLoginTracker.isInvalidGrant(.refreshFailed(status: status, oauthError: oauthError))
             HandoffLog.record(.refreshFailed, from: "tracker", to: profileName, reason: "stored login expired",
-                              fields: [("status", String(status)), ("oauth_error", HandoffLog.oauthErrorCode(body)),
+                              fields: [("status", String(status)), ("oauth_error", oauthError),
                                        ("dead", dead ? "yes" : "no")])
             if dead {
                 deadLogins.markDead(refreshToken)
@@ -2133,8 +2132,16 @@ enum ClaudeCodeError: LocalizedError {
     case keychainReadFailed(status: OSStatus)
     case keychainWriteFailed(status: OSStatus)
     case noProfileCredentials
-    case refreshFailed(status: Int, body: String)
+    /// A refused or failed refresh: the HTTP status and the OAuth error code only (`invalid_grant`, ...). Never the
+    /// response body: a server may echo the refresh token in it, and this error is printed by "\(error)",
+    /// AppError.wrap's technicalDetails and the system log (Fable, PR #3).
+    case refreshFailed(status: Int, oauthError: String)
     case loginNotProven(String)
+
+    /// The error for a refresh the OAuth server refused. The body is read for its error code and then dropped.
+    static func refusedRefresh(status: Int, body: String) -> ClaudeCodeError {
+        .refreshFailed(status: status, oauthError: HandoffLog.oauthErrorCode(body))
+    }
 
     var errorDescription: String? {
         switch self {

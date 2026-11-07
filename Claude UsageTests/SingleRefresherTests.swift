@@ -428,7 +428,7 @@ final class SingleRefresherTests: XCTestCase {
     func testARefusedRefreshLogsOnlyTheOAuthErrorCode() async throws {
         try await withRefreshLog {
             sync.tokenRefresher = { _ in
-                throw ClaudeCodeError.refreshFailed(
+                throw ClaudeCodeError.refusedRefresh(
                     status: 400, body: #"{"error":"invalid_grant","error_description":"Refresh token refresh-B already used"}"#)
             }
             keychain[mainService] = login("A", expiresIn: 3600)
@@ -456,7 +456,7 @@ final class SingleRefresherTests: XCTestCase {
         defer { LoggingService.testSink = nil }
         try await withRefreshLog {
             sync.tokenRefresher = { _ in
-                throw ClaudeCodeError.refreshFailed(
+                throw ClaudeCodeError.refusedRefresh(
                     status: 400, body: #"{"error":"invalid_grant","error_description":"token \#(echoed) was reused"}"#)
             }
             keychain[mainService] = login("A", expiresIn: 3600)
@@ -469,6 +469,23 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertTrue(refused.allSatisfy { $0.contains("HTTP 400") && $0.contains("invalid_grant") }, "\(refused)")
         XCTAssertFalse(sent.contains { $0.contains(echoed) }, "a token echoed in the server body reached the system log")
         XCTAssertFalse(sent.contains { $0.contains("was reused") }, "the server's description reached the system log")
+    }
+
+    func testARefusedRefreshErrorCarriesNoServerBody() {
+        // Fable nit on PR #3: the error itself carried the raw body, so "\(error)" or AppError.wrap's
+        // technicalDetails could print a token the server echoed. The error keeps status + OAuth code only.
+        let echoed = "refresh-B-echo-\(UUID().uuidString)"
+        let error = ClaudeCodeError.refusedRefresh(
+            status: 400, body: #"{"error":"invalid_grant","error_description":"token \#(echoed) was reused"}"#)
+        let wrapped = AppError.wrap(error)
+        let texts = ["\(error)", String(describing: error), String(reflecting: error), error.localizedDescription,
+                     error.errorDescription ?? "", wrapped.message, wrapped.technicalDetails ?? ""]
+        for text in texts {
+            XCTAssertFalse(text.contains(echoed), "a server body reached an error description: \(text)")
+            XCTAssertFalse(text.contains("was reused"), "the server's description reached an error text: \(text)")
+        }
+        XCTAssertTrue("\(error)".contains("invalid_grant"), "the OAuth code is kept")
+        XCTAssertTrue(DeadLoginTracker.isInvalidGrant(error), "a refused grant is still recognised as dead")
     }
 
     func testARefreshHeldBackByALiveCloudRunIsLogged() async throws {
@@ -914,7 +931,7 @@ final class SingleRefresherTests: XCTestCase {
         b.claudeUsage = staleFreeUsage()
         sync.tokenRefresher = { [unowned self] _ in
             self.refreshCalls += 1
-            throw ClaudeCodeError.refreshFailed(status: 400, body: #"{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}"#)
+            throw ClaudeCodeError.refusedRefresh(status: 400, body: #"{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}"#)
         }
         XCTAssertEqual(AutoSwitchPolicy.nextAvailableProfile(in: [spentA, b], after: spentA, isLoginDead: sync.isLoginDead(for:))?.id, b.id,
                        "precondition: B is the presumed-free target")
