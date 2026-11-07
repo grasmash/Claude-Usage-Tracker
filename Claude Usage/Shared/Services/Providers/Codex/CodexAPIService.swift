@@ -128,7 +128,7 @@ final class CodexAPIService {
             throw AppError(
                 code: .apiServerError,
                 message: "error.codex_server_error".localized,
-                technicalDetails: "wham/usage returned \(statusCode.map(String.init) ?? "no status"): \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")",
+                technicalDetails: "wham/usage returned \(statusCode.map(String.init) ?? "no status"): \(ResponseBody.summary(data))",
                 isRecoverable: true
             )
         }

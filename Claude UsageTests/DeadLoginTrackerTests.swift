@@ -7,19 +7,19 @@ final class DeadLoginTrackerTests: XCTestCase {
 
     func testInvalidGrantResponseMeansTheRefreshTokenIsDead() {
         let body = #"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#
-        XCTAssertTrue(DeadLoginTracker.isInvalidGrant(status: 400, body: body))
+        XCTAssertTrue(DeadLoginTracker.isInvalidGrant(.refusedRefresh(status: 400, body: body)))
     }
 
     func testServerErrorIsNotADeadRefreshToken() {
-        XCTAssertFalse(DeadLoginTracker.isInvalidGrant(status: 500, body: "invalid_grant"))
+        XCTAssertFalse(DeadLoginTracker.isInvalidGrant(.refusedRefresh(status: 500, body: #"{"error": "invalid_grant"}"#)))
     }
 
     func testOtherClientErrorIsNotADeadRefreshToken() {
-        XCTAssertFalse(DeadLoginTracker.isInvalidGrant(status: 400, body: #"{"error": "invalid_request"}"#))
+        XCTAssertFalse(DeadLoginTracker.isInvalidGrant(.refusedRefresh(status: 400, body: #"{"error": "invalid_request"}"#)))
     }
 
     func testOfflineFailureIsNotADeadRefreshToken() {
-        XCTAssertFalse(DeadLoginTracker.isInvalidGrant(status: 0, body: "The Internet connection appears to be offline."))
+        XCTAssertFalse(DeadLoginTracker.isInvalidGrant(.refreshFailed(status: -1, oauthError: "no_http_response")))
     }
 
     // MARK: - Remembering dead tokens
