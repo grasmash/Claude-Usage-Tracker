@@ -16,8 +16,6 @@ final class NetworkLoggerService: ObservableObject {
     private var timer: Timer?
     private let maxLogs = 500
     private let maxFileSizeBytes = 10 * 1024 * 1024  // 10MB
-    private let requestBodyMaxLength = 2000
-    private let responsePreviewMaxLength = 4000
 
     private var storageURL: URL {
         let appSupport = FileManager.default.urls(
@@ -89,17 +87,10 @@ final class NetworkLoggerService: ObservableObject {
             return
         }
 
-        let requestBodyString = requestBody.flatMap { data in
-            String(data: data, encoding: .utf8)?
-                .prefix(requestBodyMaxLength)
-                .description
-        }
-
-        let responsePreview = responseData.flatMap { data in
-            String(data: data, encoding: .utf8)?
-                .prefix(responsePreviewMaxLength)
-                .description
-        }
+        // Bodies are stored as size + error code only (ResponseBody): this file is shared for debugging, and a
+        // request or response body can carry a credential.
+        let requestBodyString = requestBody.map { ResponseBody.summary($0) }
+        let responsePreview = responseData.map { ResponseBody.summary($0) }
 
         let log = NetworkRequestLog(
             timestamp: Date(),

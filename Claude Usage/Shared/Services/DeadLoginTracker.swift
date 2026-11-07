@@ -38,15 +38,11 @@ final class DeadLoginTracker {
     }
 
     /// True when a failed refresh means the refresh token itself is dead, as
-    /// opposed to a transient failure (offline, 5xx, rate limit).
-    /// True when a refused refresh means its refresh token is dead for good.
+    /// opposed to a transient failure (offline, 5xx, rate limit): HTTP 400/401
+    /// with the OAuth code invalid_grant.
     static func isInvalidGrant(_ error: ClaudeCodeError) -> Bool {
         guard case let .refreshFailed(status, oauthError) = error else { return false }
         return (status == 400 || status == 401) && oauthError == "invalid_grant"
-    }
-
-    static func isInvalidGrant(status: Int, body: String) -> Bool {
-        (status == 400 || status == 401) && body.contains("invalid_grant")
     }
 
     func markDead(_ refreshToken: String) {

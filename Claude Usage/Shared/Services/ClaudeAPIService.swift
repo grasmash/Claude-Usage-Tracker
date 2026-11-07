@@ -616,13 +616,12 @@ class ClaudeAPIService: APIServiceProtocol {
                 && httpResponse.value(forHTTPHeaderField: "anthropic-ratelimit-unified-5h-utilization") != nil
 
             guard httpResponse.statusCode == 200 || has429UsageHeaders else {
-                let responsePreview = String(data: data, encoding: .utf8)?.prefix(200) ?? "Unable to read response"
                 throw AppError(
                     code: httpResponse.statusCode == 429 ? .apiRateLimited : .apiUnauthorized,
                     message: httpResponse.statusCode == 429
                         ? "Rate limited by Claude API"
                         : "OAuth Messages API request failed",
-                    technicalDetails: "Status: \(httpResponse.statusCode)\nResponse: \(responsePreview)",
+                    technicalDetails: "Status: \(httpResponse.statusCode)\nResponse: \(ResponseBody.summary(data))",
                     isRecoverable: true,
                     recoverySuggestion: httpResponse.statusCode == 429
                         ? "Usage is at its limit — data will refresh once the rate limit window resets"
@@ -717,13 +716,9 @@ class ClaudeAPIService: APIServiceProtocol {
             error: nil
         )
 
-        // Log raw response if debug logging is enabled
+        // Debug logging: the body's size and error code only, never its text (ResponseBody)
         if DataStore.shared.loadDebugAPILoggingEnabled() {
-            if let responseString = String(data: data, encoding: .utf8) {
-                // Truncate to first 500 chars to avoid huge logs
-                let truncated = responseString.prefix(500)
-                LoggingService.shared.logDebug("API Response [\(endpoint)]: \(truncated)...")
-            }
+            LoggingService.shared.logDebug("API Response [\(endpoint)]: \(ResponseBody.summary(data))")
         }
 
         switch httpResponse.statusCode {
@@ -731,7 +726,7 @@ class ClaudeAPIService: APIServiceProtocol {
             return data
 
         case 401, 403:
-            // Include response body in error for debugging
+            // Read here only to tell a Cloudflare challenge from an auth verdict; never logged or shown
             let responsePreview = String(data: data, encoding: .utf8)?.prefix(200) ?? "Unable to read response"
 
             // Cloudflare bot challenge, not an actual auth failure — the
@@ -753,7 +748,7 @@ class ClaudeAPIService: APIServiceProtocol {
             throw AppError(
                 code: .apiUnauthorized,
                 message: "Unauthorized. Your session key may have expired.",
-                technicalDetails: "Endpoint: \(endpoint)\nStatus: \(httpResponse.statusCode)\nResponse: \(responsePreview)",
+                technicalDetails: "Endpoint: \(endpoint)\nStatus: \(httpResponse.statusCode)\nResponse: \(ResponseBody.summary(data))",
                 isRecoverable: true,
                 recoverySuggestion: "Please update your session key in Settings"
             )
@@ -768,21 +763,19 @@ class ClaudeAPIService: APIServiceProtocol {
             )
 
         case 500...599:
-            let responsePreview = String(data: data, encoding: .utf8)?.prefix(200) ?? "Unable to read response"
             throw AppError(
                 code: .apiServerError,
                 message: "Claude API server error",
-                technicalDetails: "Endpoint: \(endpoint)\nStatus: \(httpResponse.statusCode)\nResponse: \(responsePreview)",
+                technicalDetails: "Endpoint: \(endpoint)\nStatus: \(httpResponse.statusCode)\nResponse: \(ResponseBody.summary(data))",
                 isRecoverable: true,
                 recoverySuggestion: "Please try again later"
             )
 
         default:
-            let responsePreview = String(data: data, encoding: .utf8)?.prefix(200) ?? "Unable to read response"
             throw AppError(
                 code: .apiGenericError,
                 message: "Unexpected API response",
-                technicalDetails: "Endpoint: \(endpoint)\nStatus: \(httpResponse.statusCode)\nResponse: \(responsePreview)",
+                technicalDetails: "Endpoint: \(endpoint)\nStatus: \(httpResponse.statusCode)\nResponse: \(ResponseBody.summary(data))",
                 isRecoverable: true
             )
         }
@@ -949,9 +942,7 @@ class ClaudeAPIService: APIServiceProtocol {
 
         // Log the actual response for debugging
         if DataStore.shared.loadDebugAPILoggingEnabled() {
-            if let responseString = String(data: data, encoding: .utf8) {
-                LoggingService.shared.logDebug("Failed to parse usage response: \(responseString)")
-            }
+            LoggingService.shared.logDebug("Failed to parse usage response: \(ResponseBody.summary(data))")
         }
 
         throw AppError(

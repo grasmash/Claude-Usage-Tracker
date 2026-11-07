@@ -123,9 +123,8 @@ extension ClaudeAPIService {
                 @unknown default:
                     detail = "unknown: \(decodingError)"
                 }
-                let preview = String(data: data.prefix(2000), encoding: .utf8) ?? "non-utf8"
                 LoggingService.shared.log("fetchUsageCost decode error: \(detail)")
-                LoggingService.shared.log("fetchUsageCost raw response: \(preview)")
+                LoggingService.shared.log("fetchUsageCost response: \(ResponseBody.summary(data))")
                 throw decodingError
             }
         case 401, 403:
