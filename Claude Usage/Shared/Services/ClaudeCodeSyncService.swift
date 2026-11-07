@@ -1786,21 +1786,31 @@ class ClaudeCodeSyncService {
            expiryDate.timeIntervalSinceNow > Self.refreshLeewaySeconds {
             return mainJSON
         }
-        guard let refreshToken = extractRefreshToken(from: mainJSON) else {
-            LoggingService.shared.log("switchMainLogin: stored login for '\(profileName)' has no refresh token")
+        // Every outcome below is one refresh.log line in HandoffLog's file
+        // (profile, time, result; never a token): the record that says whether
+        // the tracker spent a lineage's single-use refresh token (2026-11-07).
+        func skipped(_ why: String) -> String? {
+            HandoffLog.record(.refreshSkipped, from: "tracker", to: profileName, reason: "stored login expired", fields: [("why", why)])
             return nil
         }
-        guard !deadLogins.isDead(refreshToken) else { return nil }
+        guard let refreshToken = extractRefreshToken(from: mainJSON) else {
+            LoggingService.shared.log("switchMainLogin: stored login for '\(profileName)' has no refresh token")
+            return skipped("no refresh token")
+        }
+        guard !deadLogins.isDead(refreshToken) else { return skipped("refresh token already refused (dead login)") }
         // A lineage handed off under working holders may still sit in a
         // session's memory; refreshing it here would be a second use of its
         // single-use refresh token. Wait until every holder has released it.
         if hasLiveCloudRun(profileName: profileName) {
             LoggingService.shared.log("switchMainLogin: '\(profileName)' has a live cloud run; not refreshing its stored login (retried next tick)")
-            return nil
+            return skipped("live cloud run on the account")
         }
         if let fingerprint = systemLoginFingerprint(mainJSON) { forgetHandoff(fingerprint) }
         do {
             let refreshed = try await performTokenRefresh(refreshToken: refreshToken)
+            HandoffLog.record(.refresh, from: "tracker", to: profileName, reason: "stored login expired",
+                              fields: [("result", "ok"), ("expires_in", String(refreshed.expires_in)),
+                                       ("rotated", refreshed.refresh_token == nil ? "no" : "yes")])
             guard let updatedJSON = mergeRefreshedCredentials(into: mainJSON, refreshed: refreshed) else { return nil }
             persistProfileCredentialsJSON(profileId: profileId, json: updatedJSON)
             LoggingService.shared.log("✓ switchMainLogin: refreshed the stored main login for '\(profileName)' before writing it")
@@ -1808,12 +1818,18 @@ class ClaudeCodeSyncService {
         } catch let ClaudeCodeError.refreshFailed(status, body) {
             // 4xx bodies carry no tokens, only `{ "error": ... }`, so logging is safe.
             LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)' (HTTP \(status)) body=\(body)")
-            if DeadLoginTracker.isInvalidGrant(status: status, body: body) {
+            let dead = DeadLoginTracker.isInvalidGrant(status: status, body: body)
+            HandoffLog.record(.refreshFailed, from: "tracker", to: profileName, reason: "stored login expired",
+                              fields: [("status", String(status)), ("oauth_error", HandoffLog.oauthErrorCode(body)),
+                                       ("dead", dead ? "yes" : "no")])
+            if dead {
                 deadLogins.markDead(refreshToken)
                 LoggingService.shared.logError("switchMainLogin: login for '\(profileName)' is dead — not retrying until /login")
             }
         } catch {
             LoggingService.shared.logError("switchMainLogin: refresh failed for '\(profileName)'", error: error)
+            HandoffLog.record(.refreshFailed, from: "tracker", to: profileName, reason: "stored login expired",
+                              fields: [("status", "none"), ("oauth_error", "transport"), ("dead", "no")])
         }
         return nil
     }

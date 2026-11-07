@@ -390,6 +390,78 @@ final class SingleRefresherTests: XCTestCase {
         XCTAssertEqual(keychain[mainService]?.contains("new-refresh"), true, "the rotated login is what was written")
     }
 
+    // MARK: - refresh.log (2026-11-07: two laptop login deaths, and nothing said
+    // whether the tracker had spent the refresh token; every refresh it makes
+    // is now one line naming the profile, the time and the result, never a token)
+
+    // Fixtures here use a fresh "B-<uuid>" tag: `deadLogins` is shared by every
+    // test, and a refused refresh marks its token dead for the rest of the run.
+    private func withRefreshLog(_ body: () async throws -> Void) async rethrows {
+        let saved = HandoffLog.fileURL
+        HandoffLog.fileURL = tempDir.appendingPathComponent("handoff.log")
+        defer { HandoffLog.fileURL = saved }
+        try await body()
+    }
+
+    private func assertNoTokenText(_ file: StaticString = #filePath, line: UInt = #line) {
+        let text = HandoffLog.lines().joined(separator: "\n")
+        for secret in ["refresh-A", "refresh-B", "access-A", "access-B", "new-refresh", "new-access"] {
+            XCTAssertFalse(text.contains(secret), "the log must never carry token text (\(secret))", file: file, line: line)
+        }
+    }
+
+    func testAStoredLoginRefreshIsLoggedByProfileWithNoTokenText() async throws {
+        try await withRefreshLog {
+            keychain[mainService] = login("A", expiresIn: 3600)
+            let b = imported("b@example.com", login("B-\(UUID().uuidString)", expiresIn: -600))
+
+            _ = try await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+            let line = try XCTUnwrap(HandoffLog.lines().first { $0.contains(" REFRESH ") }, "no REFRESH line")
+            XCTAssertTrue(line.contains(#"to="b@example.com""#), line)
+            XCTAssertTrue(line.contains(#"result="ok""#), line)
+            XCTAssertTrue(line.contains("expires_in=\"3600\""), line)
+            assertNoTokenText()
+        }
+    }
+
+    func testARefusedRefreshLogsOnlyTheOAuthErrorCode() async throws {
+        try await withRefreshLog {
+            sync.tokenRefresher = { _ in
+                throw ClaudeCodeError.refreshFailed(
+                    status: 400, body: #"{"error":"invalid_grant","error_description":"Refresh token refresh-B already used"}"#)
+            }
+            keychain[mainService] = login("A", expiresIn: 3600)
+            let b = imported("b@example.com", login("B-\(UUID().uuidString)", expiresIn: -600))
+
+            _ = try? await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+            let line = try XCTUnwrap(HandoffLog.lines().first { $0.contains(" REFRESH-FAILED ") }, "no REFRESH-FAILED line")
+            XCTAssertTrue(line.contains(#"to="b@example.com""#), line)
+            XCTAssertTrue(line.contains(#"status="400""#), line)
+            XCTAssertTrue(line.contains(#"oauth_error="invalid_grant""#), line)
+            XCTAssertTrue(line.contains(#"dead="yes""#), line)
+            XCTAssertFalse(line.contains("already used"), "the error description is not logged, only the code")
+            assertNoTokenText()
+        }
+    }
+
+    func testARefreshHeldBackByALiveCloudRunIsLogged() async throws {
+        try await withRefreshLog {
+            try startCloudRun(account: "b", email: "b@example.com")
+            keychain[mainService] = login("A", expiresIn: 3600)
+            let b = imported("b@example.com", login("B-\(UUID().uuidString)", expiresIn: -600))
+
+            _ = try? await sync.switchMainLogin(to: b, knownLogins: [keychain[mainService]!, b.cliCredentialsJSON!])
+
+            XCTAssertEqual(refreshCalls, 0)
+            let line = try XCTUnwrap(HandoffLog.lines().first { $0.contains(" REFRESH-SKIPPED ") }, "no REFRESH-SKIPPED line")
+            XCTAssertTrue(line.contains(#"to="b@example.com""#), line)
+            XCTAssertTrue(line.contains("live cloud run"), line)
+            assertNoTokenText()
+        }
+    }
+
     func testSwitchLeavesTheKeychainAloneWhenItAlreadyHoldsThatLogin() async throws {
         // Switching back to the account the shared login already is: Claude
         // Code's sessions own that lineage, even if it has expired.
