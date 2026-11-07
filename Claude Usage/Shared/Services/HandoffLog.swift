@@ -25,6 +25,27 @@ enum HandoffLog {
         case refused = "REFUSED"
         /// The switch threw before anything was written; `why=` says why.
         case failed = "FAILED"
+        /// The tracker spent a stored login's refresh token and got a new one
+        /// (`to=` is the profile). A refresh token is single-use: any other
+        /// holder of that lineage is logged out by this, so it is always logged.
+        case refresh = "REFRESH"
+        /// The tracker posted a refresh token and was refused; `status=`,
+        /// `oauth_error=` (the OAuth error code only) and `dead=` say how.
+        case refreshFailed = "REFRESH-FAILED"
+        /// A stored login needed a refresh and the tracker did NOT post it; `why=`.
+        case refreshSkipped = "REFRESH-SKIPPED"
+    }
+
+    /// The OAuth `error` code of a refused refresh (`invalid_grant`, …), or
+    /// "unknown". Only a short lowercase code is ever returned, never the
+    /// description, so nothing a server echoes back reaches the log.
+    static func oauthErrorCode(_ body: String) -> String {
+        guard let data = body.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let code = obj["error"] as? String,
+              code.count <= 40,
+              code.allSatisfy({ ($0 >= "a" && $0 <= "z") || $0 == "_" }) else { return "unknown" }
+        return code
     }
 
     /// Where the lines go. Tests point this at a temporary file; outside tests
