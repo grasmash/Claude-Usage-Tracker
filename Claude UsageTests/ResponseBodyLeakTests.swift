@@ -1,6 +1,24 @@
 import XCTest
 @testable import Claude_Usage
 
+/// Answers the OAuth token endpoint in tests with a fixed status and body; nothing reaches the network.
+final class RefreshStub: URLProtocol {
+    static var reply: (Int, Data)?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        reply != nil && request.url?.host == "platform.claude.com"
+    }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let (status, body) = Self.reply, let url = request.url else { return }
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
 /// No error or log path carries a raw HTTP response body (PR #3, Opus and Fable review, 2026-11-07).
 ///
 /// A server can echo a credential in a response body (an OAuth refresh token in an error description, a session
@@ -30,6 +48,28 @@ final class ResponseBodyLeakTests: XCTestCase {
     func testAnErrorCodeThatIsNotACodeIsDropped() {
         let data = Data(#"{"error":"token sk-ant-ort01-abc was reused, see https://x"}"#.utf8)
         XCTAssertEqual(ResponseBody.summary(data), "\(data.count) bytes")
+    }
+
+    // MARK: - the real refresh path
+
+    /// Fable round 2 on PR #3 (a behaviour bug): postTokenRefresh cut the body to 200 bytes BEFORE parsing it, so a
+    /// long invalid_grant body (a long error_description) became invalid JSON, the code read "unknown", and the dead
+    /// login was never marked dead and kept being retried. Runs the real postTokenRefresh against a stubbed server.
+    func testALongInvalidGrantBodyFromTheServerIsStillADeadLogin() async {
+        let description = String(repeating: "Refresh token not found or invalid. ", count: 12)   // ~430 bytes
+        RefreshStub.reply = (400, Data(#"{"error":"invalid_grant","error_description":"\#(description)"}"#.utf8))
+        XCTAssertGreaterThan(RefreshStub.reply!.1.count, 200)
+        URLProtocol.registerClass(RefreshStub.self)
+        defer { URLProtocol.unregisterClass(RefreshStub.self); RefreshStub.reply = nil }
+        do {
+            _ = try await ClaudeCodeSyncService.postTokenRefresh(refreshToken: "fake-refresh-not-real")
+            XCTFail("a 400 must throw")
+        } catch let error as ClaudeCodeError {
+            XCTAssertTrue(DeadLoginTracker.isInvalidGrant(error), "a long invalid_grant body is still a dead login: \(error)")
+            XCTAssertFalse("\(error)".contains("Refresh token not found"), "and the body text is still not carried")
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
     }
 
     // MARK: - the class: every app source file

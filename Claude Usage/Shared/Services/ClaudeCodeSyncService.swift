@@ -1359,8 +1359,10 @@ class ClaudeCodeSyncService {
             throw ClaudeCodeError.refreshFailed(status: -1, oauthError: "no_http_response")
         }
         guard http.statusCode == 200 else {
-            let snippet = String(data: data, encoding: .utf8)?.prefix(200) ?? "<binary>"
-            throw ClaudeCodeError.refusedRefresh(status: http.statusCode, body: String(snippet))
+            // the code is parsed from the WHOLE body: a cut body is invalid JSON, reads "unknown", and a dead login
+            // would never be marked dead (Fable round 2, PR #3)
+            throw ClaudeCodeError.refreshFailed(status: http.statusCode,
+                                                oauthError: ResponseBody.errorCode(data) ?? "unknown")
         }
         return try JSONDecoder().decode(OAuthRefreshResponse.self, from: data)
     }
